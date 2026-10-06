@@ -39,6 +39,28 @@ make run ARGS="verify --data /tmp/random_v1"             # 含重放校验
 
 make py ARGS="version"                                   # Python 侧入口
 make py ARGS="selfplay --checkpoint runs/x/model.pt --samples 100000 --simulations 64"
+make py ARGS="train --data <数据批> --output <run 目录> --mode value --epochs 20"
+make py ARGS="eval --checkpoint <模型> --track nn_mcts --games 200 --seed 20262052"
+make py ARGS="compare --baseline a.jsonl --candidate b.jsonl"
+make py ARGS="probe --checkpoint <模型>"                  # 打印单局面的网络输出（推理自检）
+```
+
+## 从零跑一轮的最小流程
+
+```bash
+# 1) 跑谱：随机策略数据（约 45 万样本/秒）
+make run ARGS="generate --policy random --samples 1000000 --seed 20261007"
+# 2) 训练价值头（约 22 万样本/秒）
+make py ARGS="train --data $R2048_OUTPUT_DIR/data/<批> --output $R2048_OUTPUT_DIR/runs/value-1 --mode value --epochs 8"
+# 3) 基线评测（纯 C++，同一 seed 才能按局配对）
+make run ARGS="evaluate --policy random --games 200 --seed 20262052 --jsonl $R2048_OUTPUT_DIR/eval/random.jsonl"
+make run ARGS="evaluate --policy mcts --simulations 64 --games 200 --seed 20262052 --jsonl $R2048_OUTPUT_DIR/eval/mcts64.jsonl"
+# 4) 网络评测 + 配对比较
+make py ARGS="eval --checkpoint $R2048_OUTPUT_DIR/runs/value-1/model.pt --track nn_value --games 200 --seed 20262052 --jsonl $R2048_OUTPUT_DIR/eval/nn_value.jsonl"
+make py ARGS="compare --baseline $R2048_OUTPUT_DIR/eval/random.jsonl --candidate $R2048_OUTPUT_DIR/eval/nn_value.jsonl"
+# 5) 策略头：先用 MCTS 数据当教师，再在冻结价值上训策略头
+make run ARGS="generate --policy mcts --simulations 64 --samples 200000 --seed 20261008"
+make py ARGS="train --data $R2048_OUTPUT_DIR/data/<mcts 批> --output $R2048_OUTPUT_DIR/runs/policy-1 --mode policy --freeze-value --init-checkpoint $R2048_OUTPUT_DIR/runs/value-1/model.pt --epochs 15"
 ```
 
 路径可用环境变量覆盖：`make BUILD=/data/build build`、`R2048_OUTPUT_DIR=/data/runs ...`。
@@ -79,12 +101,55 @@ python -m r2048 selfplay ...      # NN 引导的批量自对弈（需要 --check
 | NN 自对弈（随机初始化模型） | 64 次模拟，32 lane，in-flight 4 | 1160 样本/秒，平均每批 439 行，叶子缓存命中 60% |
 | 管线时间分布（同上） | | `evaluate`（GPU 前向）93%，`advance`（C++ 搜索）5%，`submit` 2% |
 
+### 训练与评测（本轮实测）
+
+| 场景 | 参数 | 结果 |
+|---|---|---|
+| 价值头训练 | 100 万条，batch 8192，fp32 | 约 22 万样本/秒（每 epoch 2.4 s / 95 万条） |
+| 同上，bf16 | `--amp bf16` | 约 23 万样本/秒（**只 +5%**，不足以换精度风险） |
+| 同上，`channels_last` | 开/关 | 无差别（±2%） |
+| 同上，`torch.compile` | `--compile` | **慢 28 倍**（单 epoch 35 s）——小网络上是负收益 |
+| 纯网络评测（单次前向） | nn_value / nn_policy | 57 / 97 局每秒 |
+| NN-MCTS-64 评测 | 64 次模拟，64 lane | 2.5 局/秒（每局约 808 步） |
+
+训练循环分阶段计时（batch 8192，单位 ms/批）：
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| 数据解码 | 1.1 | 结构化视图 + 批量转张量，已向量化 |
+| H2D 传输 | 0.9 | 每批约 0.6 MB |
+| D4 增强 | 4.1 | 在 GPU 上做；`--no-augment` 实测不改变总吞吐 |
+| **前向** | **17.9** | 4×4 空间上 3×3 卷积利用率低，是当前主要成本 |
+| **反向** | **20.8** | 同上 |
+
+结论与行动：
+
+* **GPU 计算占每批的 82%**，所以“把数据管道再优化一点”不是重点；
+  真正的杠杆是网络在 4×4 空间上的卷积效率（例如把深层换成 1×1 卷积或 MLP，
+  或减少通道数）——那属于架构决策，需要单独的对照实验，不在这轮范围内。
+* **每个进程有约 7 秒固定开销**：`import torch` 0.8 s，而 `torch.optim.AdamW` 会触发
+  `torch._dynamo` 的惰性导入约 6 s（torch 2.14 的行为，与是否使用 `torch.compile` 无关）。
+  短跑（几百步）会显著被它摊薄，因此**优先把一次运行跑长**，而不是频繁起停。
+* 自对弈/评测侧的批大小才是吞吐关键：`lanes` 与 `in_flight_per_lane` 扫描结果见下。
+
 几条与设计直接相关的读数：
 
 * **每批前向的行数**是这套两阶段协议的生命线。早期实现每个 lane 只允许一条模拟在途，
   批次小到 4 行、吞吐 13 样本/秒；允许在途多条之后每批 400+ 行，吞吐提升约 90 倍。
 * **C++ 搜索只占 5%**：这条读数是“不给 tree 内部加并行”的依据（见 ADR 0003）。
-* 叶子缓存命中率约 47%~60%，直接减少的是跨语言往返次数。
+* 叶子缓存命中率约 40%~60%，直接减少的是跨语言往返次数。
+* **自对弈批处理参数扫描**（64 次模拟，2 万样本，随机初始化模型）：
+
+  | lanes | in_flight | 样本/秒 | 每批行数 | 叶子缓存命中 |
+  |---|---|---|---|---|
+  | 32 | 4 | 1238 | 424 | 58% |
+  | 64 | 4 | 1685 | 784 | 58% |
+  | **64** | **8** | **1943** | **1762** | 40% |
+  | 96 | 8 | 1734 | 2049 | 53% |
+
+  `64/8` 是当前默认；96 lane 反而下降（批更大但缓存命中与调度收益变差）。
+  注意 `in_flight_per_lane` 会改变搜索树上并行推进的模拟数，属于**数据生成协议的一部分**，
+  因此它写进了 manifest（换值就换了数据的语义）。
 
 ## 常见问题
 

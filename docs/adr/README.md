@@ -14,6 +14,9 @@ ADR 解释为什么整体是这个形状。
 | [0006](0006-search-formulation.md) | 搜索形式化：UCT-rollout 与 NN 引导搜索 | 已采纳 |
 | [0007](0007-data-format-and-provenance.md) | 训练数据格式与来源校验 | 已采纳 |
 | [0008](0008-output-layout-and-naming.md) | 输出目录布局与默认命名 | 已采纳 |
+| [0009](0009-dataset-and-split.md) | 训练数据的读取与划分口径 | 已采纳 |
+| [0010](0010-training-recipes-and-gates.md) | 训练配方与门槛 | 已采纳 |
+| [0011](0011-evaluation-protocol.md) | 评测口径与比较方法 | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

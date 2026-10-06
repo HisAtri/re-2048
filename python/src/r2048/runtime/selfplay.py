@@ -30,7 +30,7 @@ class SelfplayConfig:
     seed: int
     model_id: str = ""
     simulations: int = 64
-    lanes: int = 8
+    lanes: int = 64
     # 每个 lane 在途模拟数：决定一次前向能凑出多大的批次。太小会让流水线退化成
     # “算一个叶子等一次 GPU 往返”，太大则同一条搜索里并行推进的模拟互相看不见
     # 对方的访问数（探索变浅）。它是吞吐与搜索质量之间的旋钮。
@@ -40,8 +40,7 @@ class SelfplayConfig:
     temperature_moves: int = 30
     cache_entries: int = 1 << 17
     shard_samples: int = 100000
-    max_batch: int = 8192
-    threads: int = 0
+    max_batch: int = 16384
     progress_every: float = 0.5
 
 
@@ -76,7 +75,6 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
         "cache_entries": config.cache_entries,
         "score_scale": float(r2048_core.SCORE_SCALE),
         "seed": config.seed,
-        "threads": config.threads,
     }
     engine = r2048_core.BatchedEngine(
         engine_config,

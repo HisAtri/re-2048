@@ -54,7 +54,9 @@ r2048::EngineConfig engine_config_from_dict(const py::dict& dict) {
     config.cache_entries = get_uint("cache_entries", config.cache_entries);
     config.score_scale = get_float("score_scale", config.score_scale);
     config.seed = get_uint64("seed", config.seed);
-    config.threads = get_uint("threads", config.threads);
+    config.decision_mode = static_cast<r2048::DecisionMode>(get_uint("decision_mode", 0));
+    config.collect_samples = get_uint("collect_samples", 1) != 0;
+    config.episodes_target = get_uint("episodes_target", 0);
     return config;
 }
 
@@ -76,6 +78,11 @@ PYBIND11_MODULE(r2048_core, m) {
     m.attr("LEFT") = static_cast<int>(r2048::kLeft);
     m.attr("REQUEST_VALUE") = static_cast<int>(r2048::kRequestValue);
     m.attr("REQUEST_POLICY") = static_cast<int>(r2048::kRequestPolicy);
+    // 每步怎么选方向：搜索 / 值贪心 / 策略贪心。评测的三条 track 就靠它区分，
+    // 而规则与对局推进是同一条代码路径，避免三条 track 用不同实现对局逻辑。
+    m.attr("DECISION_SEARCH") = static_cast<int>(r2048::kDecisionSearch);
+    m.attr("DECISION_VALUE_GREEDY") = static_cast<int>(r2048::kDecisionValueGreedy);
+    m.attr("DECISION_POLICY_GREEDY") = static_cast<int>(r2048::kDecisionPolicyGreedy);
 
     // 规则函数：服务跨语言一致性测试与小规模调试。批量自对弈走下面的两阶段接口，
     // 不会逐样本跨语言调用。
@@ -136,6 +143,27 @@ values 是**归一化**价值（分数 / score_scale），C++ 侧换算回原始
             const py::ssize_t rows = static_cast<py::ssize_t>(advance.request_ids.size());
             result["boards"] = py::array_t<uint8_t>({rows, static_cast<py::ssize_t>(r2048::kBoardCells)},
                                                     advance.boards.data());
+            // 已结束的局用并列数组回传：一次评测可能结束上千局，逐局构造 Python 对象
+            // 会把时间花在解释器上。
+            const size_t episode_count = advance.episodes.size();
+            std::vector<uint32_t> episode_ids(episode_count);
+            std::vector<uint32_t> episode_steps(episode_count);
+            std::vector<uint32_t> episode_tiles(episode_count);
+            std::vector<uint64_t> episode_scores(episode_count);
+            for (size_t i = 0; i < episode_count; i++) {
+                episode_ids[i] = advance.episodes[i].episode;
+                episode_steps[i] = advance.episodes[i].steps;
+                episode_tiles[i] = advance.episodes[i].max_exponent;
+                episode_scores[i] = advance.episodes[i].score;
+            }
+            result["episode_ids"] = py::array_t<uint32_t>(static_cast<py::ssize_t>(episode_count),
+                                                         episode_ids.data());
+            result["episode_steps"] = py::array_t<uint32_t>(static_cast<py::ssize_t>(episode_count),
+                                                           episode_steps.data());
+            result["episode_tiles"] = py::array_t<uint32_t>(static_cast<py::ssize_t>(episode_count),
+                                                           episode_tiles.data());
+            result["episode_scores"] = py::array_t<uint64_t>(static_cast<py::ssize_t>(episode_count),
+                                                            episode_scores.data());
             result["done"] = advance.done;
             result["samples_written"] = advance.samples_written;
             result["episodes_written"] = advance.episodes_written;

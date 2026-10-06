@@ -15,6 +15,14 @@ enum RequestKind : uint8_t {
     kRequestPolicy = 1,  // 决策局面 s → 策略头 logits（4 个方向）
 };
 
+// 每步怎么选方向。评测与自对弈必须共用同一套规则与对局推进，只在“选招”这一处分岔，
+// 否则三条评测 track（纯价值贪心 / 纯策略 / NN-MCTS）会因为实现对局逻辑而互相不可比。
+enum DecisionMode : uint8_t {
+    kDecisionSearch = 0,        // 默认：PUCT 树搜索
+    kDecisionValueGreedy = 1,   // 不做树搜索：argmax_a [r(s,a) + A(u_a)]
+    kDecisionPolicyGreedy = 2,  // 不做树搜索：argmax_a π(a|s)（屏蔽非法方向）
+};
+
 struct EngineConfig {
     uint32_t lanes = 8;              // 同时在跑的局数
     uint32_t simulations = 64;       // 每步的模拟次数
@@ -27,10 +35,22 @@ struct EngineConfig {
     float c_puct = 1.5f;             // PUCT 探索系数
     uint32_t temperature_moves = 30; // 开局多少步按访问分布采样
     float temperature = 1.0f;        // 访问数开 1/T 次幂后采样；0 表示直接取最大
-    uint32_t cache_entries = 1 << 17;  // 推理缓存条目数（2 路组相联）
+    uint32_t cache_entries = 1 << 17;  // 推理缓存条目数（开放寻址表容量）
     float score_scale = kScoreScale;
     uint64_t seed = 0;
-    uint32_t threads = 0;            // lane 并行的线程数，0 = 硬件并发数
+    DecisionMode decision_mode = kDecisionSearch;
+    // 评测不需要训练数据：关掉之后引擎只推进对局并回报每局结果，不写任何分片。
+    bool collect_samples = true;
+    // >0 时按“跑满多少局”停止（评测用）；否则按样本目标停止（跑谱用）。
+    uint32_t episodes_target = 0;
+};
+
+// 一局结束的结果。评测只关心它，跑谱时它也用于进度显示。
+struct EpisodeResult {
+    uint32_t episode = 0;
+    uint32_t steps = 0;
+    uint32_t max_exponent = 0;
+    uint64_t score = 0;
 };
 
 struct EngineStats {
@@ -61,15 +81,16 @@ struct EngineStats {
 // 三个必须守住的性质：
 //   * 数据逐字节只由 (种子, 参数, 目标条数) 决定：lane 调度顺序、线程数都不影响写入内容。
 //   * 每个 lane 的随机流由 (episode, step) 派生，因此任何一局都能单独重放。
-//   * 应当并行的部分在 C++ 内并行：advance() 内部用线程池按 lane 并行推进，
-//     调用方释放 GIL 后不会出现“CPU 等 GPU、主线程站着等”的串行形态。
+//   * 并行放在“CPU 搜索 ∥ GPU 推理”这条流水线上：lane 之间顺序推进，但在途多条模拟
+//     保证了每次前向都有几百行的批；实测 advance 只占管线时间约 5%（见 ADR 0003）。
 class BatchedEngine {
 public:
     struct Advance {
         std::vector<uint64_t> request_ids;
         std::vector<uint8_t> request_kinds;
         std::vector<uint8_t> boards;  // N×16 行优先的指数棋盘
-        bool done = false;            // 已产出足够样本，可以收尾
+        std::vector<EpisodeResult> episodes;  // 自上次 advance 以来结束的局
+        bool done = false;            // 已完成目标，可以收尾
         uint64_t samples_written = 0;
         uint32_t episodes_written = 0;
     };

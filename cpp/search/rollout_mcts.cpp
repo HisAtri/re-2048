@@ -206,6 +206,13 @@ RolloutMctsResult RolloutMcts::search(const Board& root, uint64_t episode, uint6
         }
     }
     if (result.action < 0) throw std::runtime_error("搜索没有产生任何合法动作");
+    for (int action = 0; action < kNumActions; action++) {
+        if ((root_mask & (1u << action)) == 0) continue;
+        const uint32_t visits = final_root.edge_visits[action];
+        if (visits > 0) {
+            result.q_mean[action] = final_root.edge_q_sum[action] / static_cast<float>(visits);
+        }
+    }
     result.root_value =
         final_root.visits > 0 ? final_root.value_sum / static_cast<float>(final_root.visits) : 0.0f;
     return result;

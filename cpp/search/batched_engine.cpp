@@ -630,8 +630,26 @@ struct BatchedEngine::Impl {
 
         const MoveOutcome move = apply_move(lane.board, action);
         if (config.collect_samples) {
+            // 候选级监督：为每个合法方向写一条候选目标 A(u_a) = Q̄(a) − r(s,a)。
+            // 引擎每条边的 Q 累加的是 r + A，因此减掉立即得分就是该候选 afterstate 的价值，
+            // 与价值头的预测对象同构。未被搜索访问的边退回一次性估计（它的访问数是 0，
+            // 因此在下游按 sqrt(visits) 加权时权重为 0，不会被当成真的监督信号）。
+            int32_t q_mean[kNumActions] = {0, 0, 0, 0};
+            uint16_t candidate_visits[kNumActions] = {0, 0, 0, 0};
+            for (int candidate = 0; candidate < kNumActions; candidate++) {
+                if ((lane.legal_mask & (1u << candidate)) == 0) continue;
+                const uint32_t candidate_visits_raw = root.edge_visits[candidate];
+                const float q = candidate_visits_raw > 0
+                                    ? root.edge_q_sum[candidate] / static_cast<float>(candidate_visits_raw)
+                                    : root.one_ply[candidate];
+                q_mean[candidate] = static_cast<int32_t>(std::lround(q));
+                candidate_visits[candidate] =
+                    static_cast<uint16_t>(std::min<uint32_t>(candidate_visits_raw, 0xFFFF));
+            }
+            const CandidateTargets candidates =
+                build_candidate_targets(lane.board, lane.legal_mask, q_mean, candidate_visits);
             lane.recorder.add(lane.board, move.board, action, lane.legal_mask,
-                              static_cast<uint32_t>(move.score), visits);
+                              static_cast<uint32_t>(move.score), visits, &candidates);
         }
         lane.total_score += move.score;
         const int exponent = move.board.max_exponent();

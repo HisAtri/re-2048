@@ -20,6 +20,10 @@ struct RolloutMctsResult {
     int action = -1;
     uint16_t visits[kNumActions] = {0, 0, 0, 0};
     float root_value = 0.0f;  // 根节点对 V(s) 的估计（从根局面起的未来得分）
+    // 每条边的平均 Q（原始分数单位，含立即得分）。候选监督要用它算 A(u_a) = Q̄(a) − r(s,a)。
+    // 未访问的边写 0：候选监督按 sqrt(访问数) 加权，权重 0 的候选自然被排除，
+    // 不会把“没有估计”伪装成“估计为 0”。
+    float q_mean[kNumActions] = {0, 0, 0, 0};
 };
 
 // UCT + 随机 rollout 的搜索（不含神经网络），用于冷启动第一批价值数据。

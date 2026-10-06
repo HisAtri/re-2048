@@ -20,6 +20,7 @@ ADR 解释为什么整体是这个形状。
 | [0012](0012-rating-scale-and-iteration-experiment.md) | 评分标度、配对诊断与两轮迭代实验 | 已采纳 |
 | [0013](0013-iteration-results.md) | 两轮迭代实验结果：朴素自举会把价值头训坏 | 已采纳 |
 | [0014](0014-search-health-and-noise-floor.md) | 搜索健康度诊断与噪声底噪 | 已采纳 |
+| [0015](0015-candidate-level-supervision.md) | 候选级监督 | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

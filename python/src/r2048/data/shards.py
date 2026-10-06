@@ -15,12 +15,18 @@ from pathlib import Path
 import numpy as np
 
 # 与 cpp/core/version.h、cpp/dataio/sample.h 对齐的契约常量。
-RECORD_BYTES = 80
-SCHEMA_VERSION = 1
+RECORD_BYTES = 192
+SCHEMA_VERSION = 2
 RULES_VERSION = 1
 # 分数归一化尺度来自规则契约（cpp/core/version.h 的 kScoreScale）。记录里不存它，
 # 因为它是语义常量而不是每条样本的属性；测试里会与 C++ 侧暴露的值做一致性校验。
 SCORE_SCALE = 1024.0
+
+# 候选级监督的标签定义（与 cpp/dataio/sample.h 的注释一致）：
+#   candidate_value[a] = Q̄(a) − r(s,a) = A(u_a) 的估计（原始分数单位）
+# 之所以强调：搜索在每个决策节点查询**全部合法动作**的 afterstate，而主轨迹只记录实际
+# 走过的那个；只报告全局 MAE 会掩盖“在自己被查询的地方没有监督”这件事。
+CANDIDATE_TARGET_DEFINITION = "q_mean_minus_reward"
 
 # 偏移表与 cpp/dataio/sample.h 的注释逐项对应；末尾保留字节以 _padX 命名，
 # 便于将来加字段时只改这里和 C++ 侧（记录长度不变）。
@@ -39,6 +45,13 @@ RECORD_DTYPE = np.dtype(
         ("_pad1", "u1", (8,)),          # 56
         ("visits", "<u2", (4,)),        # 64
         ("_pad2", "u1", (8,)),          # 72
+        # --- v2 候选块：按方向下标对齐，槽位 a 恒对应方向 a ---
+        ("candidate_afterstate", "u1", (4, 16)),  # 80
+        ("candidate_value", "<i4", (4,)),         # 144：A(u_a) = Q̄(a) − r(s,a)，原始分数单位
+        ("candidate_reward", "<u4", (4,)),        # 160：r(s,a)
+        ("candidate_visits", "<u2", (4,)),        # 176：该候选边的根访问数
+        ("candidate_count", "u1"),                # 184：0 = 无候选监督
+        ("_pad3", "u1", (7,)),                    # 185
     ],
     align=False,
 )

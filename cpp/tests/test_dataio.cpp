@@ -6,6 +6,7 @@
 #include "core/fileio.h"
 #include "core/json.h"
 #include "dataio/sample.h"
+#include "game/rules.h"
 #include "dataio/shard.h"
 #include "program/episode.h"
 #include "program/generate.h"
@@ -72,6 +73,15 @@ TEST(dataio_sample_roundtrip) {
     sample.move_score = 4096;
     sample.mc_return = -1234567890123LL;
     for (int action = 0; action < kNumActions; action++) sample.visits[action] = static_cast<uint16_t>(action + 1);
+    sample.candidates.count = 3;
+    for (int action = 0; action < kNumActions; action++) {
+        for (int cell = 0; cell < kBoardCells; cell++) {
+            sample.candidates.afterstate[action].tiles[cell] = static_cast<uint8_t>(action * 10 + cell);
+        }
+        sample.candidates.value[action] = action * 1000 - 500;   // 含负值
+        sample.candidates.reward[action] = static_cast<uint32_t>(action * 7);
+        sample.candidates.visits[action] = static_cast<uint16_t>(action * 3);
+    }
 
     uint8_t encoded[kSampleBytes];
     encode_sample(sample, encoded);
@@ -90,9 +100,22 @@ TEST(dataio_sample_roundtrip) {
         expect_equal_u64(decoded.visits[action], sample.visits[action], "访问数往返一致");
     }
 
+    expect_equal_u64(decoded.candidates.count, 3, "候选数量往返一致");
+    for (int action = 0; action < kNumActions; action++) {
+        expect_true(decoded.candidates.afterstate[action] == sample.candidates.afterstate[action],
+                    "候选 afterstate 往返一致");
+        expect_true(decoded.candidates.value[action] == sample.candidates.value[action],
+                    "候选价值目标往返一致（含负值）");
+        expect_equal_u64(decoded.candidates.reward[action], sample.candidates.reward[action],
+                         "候选立即得分往返一致");
+        expect_equal_u64(decoded.candidates.visits[action], sample.candidates.visits[action],
+                         "候选访问数往返一致");
+    }
+
     // 保留字节必须写 0：否则未来加字段时无法区分“旧数据未使用”与“旧的垃圾值”。
-    for (size_t offset = 72; offset < kSampleBytes; offset++) {
-        expect_equal_u64(encoded[offset], 0, "保留字节为 0");
+    for (size_t offset = 72; offset < 80; offset++) expect_equal_u64(encoded[offset], 0, "保留字节为 0");
+    for (size_t offset = 185; offset < kSampleBytes; offset++) {
+        expect_equal_u64(encoded[offset], 0, "v2 保留字节为 0");
     }
 }
 
@@ -227,6 +250,42 @@ TEST(dataio_generate_refuses_to_overwrite) {
     // 同一个目录再跑一次必须直接失败：跑谱批按“整批要么完整、要么重来”管理。
     expect_contains(catch_message([&] { run_generate(small_config(data_dir, "random", 2)); }), "拒绝覆盖",
                     "拒绝覆盖已有数据批");
+}
+
+TEST(dataio_candidate_targets_arithmetic) {
+    // 候选目标的定义：A(u_a) = Q̄(a) − r(s,a)。这里用给定的 Q̄ 直接核对算术、
+    // afterstate 与立即得分是否都由规则正确补齐。
+    Board decision = Board::empty();
+    decision.at(0, 0) = 1;
+    decision.at(0, 1) = 1;   // 可以合并
+    decision.at(1, 3) = 2;
+    const uint8_t mask = legal_mask(decision);
+
+    int32_t q_mean[kNumActions] = {0, 0, 0, 0};
+    uint16_t visits[kNumActions] = {0, 0, 0, 0};
+    for (int action = 0; action < kNumActions; action++) {
+        if ((mask & (1u << action)) == 0) continue;
+        q_mean[action] = 5000 + 100 * action;   // 故意取与立即得分不同的量级
+        visits[action] = static_cast<uint16_t>(10 + action);
+    }
+    const CandidateTargets targets = build_candidate_targets(decision, mask, q_mean, visits);
+
+    int legal = 0;
+    for (int action = 0; action < kNumActions; action++) {
+        if ((mask & (1u << action)) == 0) {
+            expect_equal_u64(targets.value[action], 0, "非法方向的候选槽保持为空");
+            continue;
+        }
+        legal++;
+        const MoveOutcome outcome = apply_move(decision, action);
+        expect_true(targets.afterstate[action] == outcome.board, "候选 afterstate 由规则补齐");
+        expect_equal_u64(targets.reward[action], outcome.score, "候选立即得分由规则补齐");
+        expect_equal_u64(targets.visits[action], visits[action], "候选访问数原样保留");
+        expect_equal_u64(static_cast<uint64_t>(targets.value[action]),
+                         static_cast<uint64_t>(q_mean[action] - static_cast<int32_t>(outcome.score)),
+                         "候选价值目标 = Q̄(a) − r(s,a)");
+    }
+    expect_equal_u64(targets.count, static_cast<uint64_t>(legal), "候选数量等于合法方向数");
 }
 
 }  // namespace r2048::tests

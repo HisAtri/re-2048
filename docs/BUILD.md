@@ -63,6 +63,23 @@ make run ARGS="generate --policy mcts --simulations 64 --samples 200000 --seed 2
 make py ARGS="train --data $R2048_OUTPUT_DIR/data/<mcts 批> --output $R2048_OUTPUT_DIR/runs/policy-1 --mode policy --freeze-value --init-checkpoint $R2048_OUTPUT_DIR/runs/value-1/model.pt --epochs 15"
 ```
 
+### 候选级监督（推荐路线，见 ADR 0015）
+
+搜索产出的数据自带候选块，训练时价值头默认训练在**搜索实际查询过的全部合法候选**上：
+
+```bash
+# 搜索产出的批次都带候选（纯 MCTS 与 NN-MCTS 都有）；策略目标取自同一批数据的根访问分布
+make py ARGS="train --data $R2048_OUTPUT_DIR/data/<搜索批> --output $R2048_OUTPUT_DIR/runs/value-cand --mode value --epochs 8"
+# 价值头与策略头一起训（joint / dual），价值用候选目标、策略用访问分布，一次前向覆盖两种行
+make py ARGS="train --data <搜索批> --output <run> --mode dual --epochs 8"
+# 只要主轨迹口径（复现旧结果或数据没有候选时）
+make py ARGS="train --data <批> --output <run> --mode value --value-target trajectory"
+```
+
+训练日志里价值头的指标是**候选 MAE / 同根成对排序一致率 / 最优候选命中率 / 后悔值**，
+checkpoint 的挑选也按“最优候选命中率”而不是全局 MAE——全局 MAE 无法替代同根候选排序。
+数据里没有候选（随机策略批次）时自动退回主轨迹 MC 回报口径。
+
 路径可用环境变量覆盖：`make BUILD=/data/build build`、`R2048_OUTPUT_DIR=/data/runs ...`。
 
 ## C++ CLI 一览

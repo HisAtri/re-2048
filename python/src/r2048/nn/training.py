@@ -31,8 +31,11 @@ from torch.nn import functional as F
 import r2048_core
 
 from r2048.data.dataset import Batch, BatchStream, batch_manifest_summary, open_batch
+from r2048.data.shards import CANDIDATE_TARGET_DEFINITION
 from r2048.nn.augment import augment_joint, augment_policy, augment_value
-from r2048.nn.encode import encode_boards
+import r2048_core
+
+from r2048.nn.encode import BOARD_CELLS, encode_boards
 from r2048.nn.model import (
     DUAL_TOWER_ARCHITECTURE,
     SHARED_ARCHITECTURE,
@@ -68,6 +71,9 @@ class TrainConfig:
     grad_clip: float = 1.0
     value_loss: str = "huber"
     value_weight: float = 1.0
+    # auto：有候选监督就用候选目标（推荐），否则退回主轨迹 MC 回报；
+    # candidate：强制候选；trajectory：强制主轨迹（用于复现旧结果）。
+    value_target: str = "auto"
     policy_weight: float = 1.0
     val_fraction: float = 0.05
     split_seed: int = 0
@@ -93,6 +99,10 @@ class EpochMetrics:
     val_policy_ce: float
     val_policy_agreement: float
     val_policy_records: int
+    val_candidate_mae: float
+    val_candidate_pair_agreement: float
+    val_candidate_best_hit: float
+    val_candidate_regret: float
     samples: int
     seconds: float
 
@@ -179,6 +189,14 @@ class _Metrics:
         self._policy_ce_sum = 0.0
         self._policy_agreement_sum = 0.0
         self.policy_count = 0
+        # 候选级监督的指标：加权误差 + 同根成对排序一致率 + 最优候选命中 + 后悔值
+        self.candidate_weight = torch.zeros((), dtype=torch.float64, device=device)
+        self.candidate_abs_error = torch.zeros((), dtype=torch.float64, device=device)
+        self.concordant = torch.zeros((), dtype=torch.float64, device=device)
+        self.discordant = torch.zeros((), dtype=torch.float64, device=device)
+        self.best_hit = torch.zeros((), dtype=torch.float64, device=device)
+        self.best_total = torch.zeros((), dtype=torch.float64, device=device)
+        self.regret = torch.zeros((), dtype=torch.float64, device=device)
 
     def add_value(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
         self.value_abs += (prediction.double() - target.double()).abs().sum()
@@ -188,6 +206,52 @@ class _Metrics:
         self._policy_ce_sum += float(stats.loss.detach()) * stats.records
         self._policy_agreement_sum += stats.agreement * stats.records
         self.policy_count += stats.records
+
+    def add_candidates(self, prediction: torch.Tensor, target: torch.Tensor, weight: torch.Tensor) -> None:
+        """候选预测与搜索给出的候选目标对比。
+
+        排序指标用“同根成对一致率”而不是 Spearman：每个根只有 2~4 个候选，
+        成对一致率等价于 Kendall tau 的分子，且在候选数少时更稳定、更容易解释。
+        """
+        valid = weight > 0
+        self.candidate_weight += weight.double().sum()
+        self.candidate_abs_error += ((prediction - target).double().abs() * weight.double()).sum()
+
+        for first, second in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
+            pair_valid = valid[:, first] & valid[:, second] & (target[:, first] != target[:, second])
+            if not bool(pair_valid.any()):
+                continue
+            agree = (prediction[:, first] - prediction[:, second]).sign() == (
+                target[:, first] - target[:, second]
+            ).sign()
+            self.concordant += (agree & pair_valid).double().sum()
+            self.discordant += (~agree & pair_valid).double().sum()
+
+        has_two = valid.sum(dim=1) >= 2
+        if bool(has_two.any()):
+            masked_prediction = prediction.masked_fill(~valid, float("-inf"))
+            masked_target = target.masked_fill(~valid, float("-inf"))
+            picked = masked_prediction.argmax(dim=1)
+            best = masked_target.argmax(dim=1)
+            self.best_hit += (picked[has_two] == best[has_two]).double().sum()
+            self.best_total += has_two.double().sum()
+            picked_value = target.gather(1, picked[:, None]).squeeze(1)
+            self.regret += (masked_target.max(dim=1).values[has_two] - picked_value[has_two]).double().sum()
+
+    def candidate_mae(self) -> float:
+        if float(self.candidate_weight) <= 0:
+            return float("nan")
+        return float((self.candidate_abs_error / self.candidate_weight).item() * self.score_scale)
+
+    def pair_agreement(self) -> float:
+        total = float(self.concordant + self.discordant)
+        return float(self.concordant) / total if total > 0 else float("nan")
+
+    def best_candidate_hit(self) -> float:
+        return float(self.best_hit / self.best_total) if float(self.best_total) > 0 else float("nan")
+
+    def candidate_regret(self) -> float:
+        return float(self.regret / self.best_total * self.score_scale) if float(self.best_total) > 0 else float("nan")
 
     def value_mae(self) -> float:
         return float(self.value_abs.item() / self.value_count * self.score_scale) if self.value_count else float("nan")
@@ -214,6 +278,41 @@ def _forward(
         with torch.autocast(device_type=encoded.device.type, dtype=amp_dtype):
             return model(encoded)
     return model(encoded)
+
+
+def _value_loss(
+    predictions: torch.Tensor,
+    batch: Batch,
+    use_candidates: bool,
+    config: TrainConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """价值损失。
+
+    候选模式：在**全部合法候选**上回归搜索给出的 A(u_a)，按 sqrt(访问数) 加权——
+    搜索在每个决策节点都会查询这些候选，而主轨迹只记录实际走过的那个。
+    主轨迹模式：退回 afterstate 的 MC 回报（无候选监督的数据，例如随机策略批次）。
+    返回 (loss, 用于指标的预测张量)；候选模式下后者已 reshape 成 (B, 4)。
+    """
+    if not use_candidates:
+        prediction = predictions.reshape(-1)
+        target = batch.value_target
+        loss = (
+            F.huber_loss(prediction, target)
+            if config.value_loss == "huber"
+            else F.mse_loss(prediction, target)
+        )
+        return loss, prediction.detach()
+
+    count = batch.decision.shape[0]
+    prediction = predictions.reshape(count, int(r2048_core.NUM_ACTIONS))
+    weight = batch.candidate_weight
+    per_candidate = (
+        F.huber_loss(prediction, batch.candidate_value, reduction="none")
+        if config.value_loss == "huber"
+        else (prediction - batch.candidate_value) ** 2
+    )
+    total_weight = weight.sum().clamp_min(1e-9)
+    return (per_candidate * weight).sum() / total_weight, prediction.detach()
 
 
 def _run_epoch(
@@ -258,40 +357,57 @@ def _run_epoch(
 
         with torch.set_grad_enabled(training):
             loss = torch.zeros((), dtype=torch.float32, device=device)
+            # 候选级监督：价值头训练在**搜索实际查询过的全部合法候选**上，而不是只训练实际
+            # 走过的那个动作。权重 sqrt(访问数) 让搜索更看重的候选获得更高权重，
+            # 未访问过的候选权重为 0（它们没有估计，不能当成“估计为 0”）。
+            use_candidates = want_value and config.value_target != "trajectory" and batch.has_candidates
+            if config.value_target == "candidate" and want_value and not batch.has_candidates:
+                raise ValueError("要求候选目标，但这一批数据没有候选监督（检查数据是否由搜索产出）")
+            count = batch.decision.shape[0]
+
             if config.mode in JOINT_MODES:
-                # 一次前向覆盖两种行：决策局面喂策略头、afterstate 喂价值头。
-                split = batch.decision.shape[0]
-                rows = torch.cat([batch.decision, batch.afterstate], dim=0)
+                # 一次前向覆盖两种行：决策局面喂策略头、候选 afterstate 喂价值头。
+                if use_candidates:
+                    candidate_rows = batch.candidate_afterstate.reshape(-1, BOARD_CELLS)
+                    rows = torch.cat([batch.decision, candidate_rows], dim=0)
+                else:
+                    rows = torch.cat([batch.decision, batch.afterstate], dim=0)
                 values, logits = _forward(model, rows, amp_dtype, config.channels_last)
                 values = values.float()
                 logits = logits.float()
                 if want_value:
-                    value_pred = values[split:]
-                    value_loss = (
-                        F.huber_loss(value_pred, batch.value_target)
-                        if config.value_loss == "huber"
-                        else F.mse_loss(value_pred, batch.value_target)
+                    value_loss, value_pred = _value_loss(
+                        values[count:], batch, use_candidates, config
                     )
                     loss = loss + config.value_weight * value_loss
-                    metrics.add_value(value_pred.detach(), batch.value_target)
+                    if use_candidates:
+                        metrics.add_candidates(
+                            value_pred, batch.candidate_value, batch.candidate_weight
+                        )
+                    else:
+                        metrics.add_value(value_pred, batch.value_target)
                 if want_policy:
-                    stats = policy_loss(logits[:split], batch)
+                    stats = policy_loss(logits[:count], batch)
                     if stats is not None:
                         loss = loss + config.policy_weight * stats.loss
                         metrics.add_policy(stats)
             else:
-                boards = batch.afterstate if want_value else batch.decision
+                if want_value and use_candidates:
+                    boards = batch.candidate_afterstate.reshape(-1, BOARD_CELLS)
+                else:
+                    boards = batch.afterstate if want_value else batch.decision
                 values, logits = _forward(model, boards, amp_dtype, config.channels_last)
                 values = values.float()
                 logits = logits.float()
                 if want_value:
-                    value_loss = (
-                        F.huber_loss(values, batch.value_target)
-                        if config.value_loss == "huber"
-                        else F.mse_loss(values, batch.value_target)
-                    )
+                    value_loss, value_pred = _value_loss(values, batch, use_candidates, config)
                     loss = loss + config.value_weight * value_loss
-                    metrics.add_value(values.detach(), batch.value_target)
+                    if use_candidates:
+                        metrics.add_candidates(
+                            value_pred, batch.candidate_value, batch.candidate_weight
+                        )
+                    else:
+                        metrics.add_value(value_pred, batch.value_target)
                 if want_policy:
                     stats = policy_loss(logits, batch)
                     if stats is not None:
@@ -401,6 +517,8 @@ def run_training(config: TrainConfig) -> TrainResult:
         scheduler.load_state_dict(state["scheduler"])
         start_epoch = int(state["epoch"]) + 1
         history = [EpochMetrics(**entry) for entry in state.get("history", [])]
+        # 续训时不让旧的最佳干扰新一轮挑选（历史里可能来自另一套指标口径）。
+        best_metric = None
         print(f"续训：从第 {start_epoch + 1} 轮继续（已有 {len(history)} 轮记录）")
 
     print(reader.manifest.describe())
@@ -410,14 +528,17 @@ def run_training(config: TrainConfig) -> TrainResult:
         f"冻结张量 {len(frozen)}，批 {config.batch_size}，设备 {device}{' bf16' if amp_dtype else ''}"
     )
 
-    best_metric = float("inf")
+    # 主指标的方向取决于“这一轮用没用候选监督”，只有进入循环才知道，因此用 None 起步。
+    best_metric: float | None = None
     best_checkpoint = ""
     for epoch in range(start_epoch, config.epochs):
         train_loss, train_metrics, train_seconds = _run_epoch(
             model, train_stream, optimizer, scheduler, config, device, amp_dtype, score_scale, rng, epoch,
             label="训练",
         )
-        val_loss, val_mae, val_ce, val_agreement, val_records = float("nan"), float("nan"), float("nan"), float("nan"), 0
+        nan = float("nan")
+        val_loss, val_mae, val_ce, val_agreement, val_records = nan, nan, nan, nan, 0
+        candidate_mae, pair_agreement, best_hit, regret = nan, nan, nan, nan
         if val_stream is not None:
             val_loss, val_metrics, _ = _run_epoch(
                 model, val_stream, None, scheduler, config, device, amp_dtype, score_scale, rng, epoch,
@@ -429,6 +550,10 @@ def run_training(config: TrainConfig) -> TrainResult:
                 val_metrics.agreement(),
                 val_metrics.policy_count,
             )
+            candidate_mae = val_metrics.candidate_mae()
+            pair_agreement = val_metrics.pair_agreement()
+            best_hit = val_metrics.best_candidate_hit()
+            regret = val_metrics.candidate_regret()
 
         entry = EpochMetrics(
             epoch=epoch,
@@ -440,17 +565,29 @@ def run_training(config: TrainConfig) -> TrainResult:
             val_policy_ce=val_ce,
             val_policy_agreement=val_agreement,
             val_policy_records=val_records,
+            val_candidate_mae=candidate_mae,
+            val_candidate_pair_agreement=pair_agreement,
+            val_candidate_best_hit=best_hit,
+            val_candidate_regret=regret,
             samples=int(train_indices.size),
             seconds=train_seconds,
         )
         history.append(entry)
-        # 主指标按模式选：价值看 MAE，策略/联合看交叉熵。它只用于挑 checkpoint，
-        # 真正的验收是同 seed 对局（离线指标测不出架构差别，见 ADR 0011）。
-        primary = val_mae if config.mode in VALUE_MODES else val_ce
+        # 主指标：**供应给搜索的价值头必须用同根候选排序来挑，而不是全局 MAE**
+        # （旧版的结论：全局 MAE 无法替代同根候选排序，架构差别就藏在后者里）。
+        # 有候选监督时用“最优候选命中率”，否则退回价值 MAE；策略模式看交叉熵。
+        if config.mode == "policy":
+            primary, maximize = val_ce, False
+        elif best_hit == best_hit:  # 非 NaN 说明用了候选监督
+            primary, maximize = best_hit, True
+        else:
+            primary, maximize = val_mae, False
         print(
             f"第 {epoch + 1}/{config.epochs} 轮：训练损失 {train_loss:.4f}，验证损失 {val_loss:.4f} | "
-            f"value MAE {val_mae:.1f} 分 | policy CE {val_ce:.4f}（一致率 {val_agreement * 100:.1f}%，"
-            f"{val_records} 条） | {train_seconds:.1f}s（{entry.samples_per_second:.0f} 样本/秒）"
+            f"候选 MAE {candidate_mae:.1f} 分，成对排序一致率 {pair_agreement * 100:.1f}%，"
+            f"最优候选命中 {best_hit * 100:.1f}%，后悔 {regret:.1f} 分 | "
+            f"策略 CE {val_ce:.4f}（一致率 {val_agreement * 100:.1f}%） | "
+            f"{train_seconds:.1f}s（{entry.samples_per_second:.0f} 样本/秒）"
         )
 
         model_state = _unwrap(model).state_dict()
@@ -465,7 +602,10 @@ def run_training(config: TrainConfig) -> TrainResult:
             },
             run_dir / "last.pt",
         )
-        if primary == primary and primary < best_metric:  # 非 NaN 且更优
+        improved = primary == primary and (
+            best_metric is None or (primary > best_metric if maximize else primary < best_metric)
+        )
+        if improved:
             best_metric = primary
             best_checkpoint = str(run_dir / "model.pt")
             meta = _unwrap(model).metadata(
@@ -480,8 +620,17 @@ def run_training(config: TrainConfig) -> TrainResult:
                     "batch_id": reader.manifest.data.get("batch_id", ""),
                     "data_build_id": reader.manifest.build_id,
                     "config_digest": config_digest(config),
+                    "value_target": (
+                        "candidate" if entry.val_candidate_best_hit == entry.val_candidate_best_hit
+                        else "trajectory"
+                    ),
+                    "candidate_target_definition": CANDIDATE_TARGET_DEFINITION,
                     "metrics": {
                         "value_mae": entry.val_value_mae,
+                        "candidate_mae": entry.val_candidate_mae,
+                        "candidate_pair_agreement": entry.val_candidate_pair_agreement,
+                        "candidate_best_hit": entry.val_candidate_best_hit,
+                        "candidate_regret": entry.val_candidate_regret,
                         "policy_ce": entry.val_policy_ce,
                         "policy_agreement": entry.val_policy_agreement,
                     },

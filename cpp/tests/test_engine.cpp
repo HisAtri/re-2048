@@ -4,7 +4,9 @@
 #include <vector>
 
 #include "core/fileio.h"
+#include "dataio/sample.h"
 #include "dataio/shard.h"
+#include "game/rules.h"
 #include "search/batched_engine.h"
 #include "test_util.h"
 
@@ -45,6 +47,19 @@ struct SyntheticDriver {
         return false;
     }
 };
+
+std::vector<uint8_t> read_binary_for_test(const std::string& path) {
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) throw std::runtime_error("无法打开 " + path);
+    std::vector<uint8_t> data;
+    uint8_t buffer[1 << 16];
+    size_t read = 0;
+    while ((read = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        data.insert(data.end(), buffer, buffer + read);
+    }
+    std::fclose(file);
+    return data;
+}
 
 class TempDir {
 public:
@@ -211,6 +226,48 @@ TEST(engine_search_mode_is_unaffected_by_eval_switch) {
     expect_equal_u64(stats.samples, 0, "没有写入任何样本");
     expect_true(stats.simulations == steps * config.simulations,
                 "搜索模式下模拟次数 = 步数 × 每步模拟次数");
+}
+
+TEST(engine_records_candidate_targets) {
+    // 候选级监督的口径：为每个合法方向都写一条 A(u_a) = Q̄(a) − r(s,a)。
+    // 合成网络的价值恒为 0，因此 Q̄(a) = r(s,a)，候选价值目标必须恒为 0——
+    // 这条恒等式同时验证了“候选块被写入”“Q̄ 来自正确的边”“减的是这条边的立即得分”。
+    TempDir dir("candidates");
+    EngineConfig config;
+    config.lanes = 2;
+    config.simulations = 8;
+    config.in_flight_per_lane = 2;
+    config.cache_entries = 1 << 12;
+    config.seed = 4242;
+
+    BatchedEngine engine(config, dir.sub("batch"), "candidates", "synthetic", 400, 400);
+    SyntheticDriver driver{engine};
+    expect_true(driver.run_until_done(), "应当正常结束");
+    engine.finish();
+
+    const BatchManifest manifest = read_manifest(dir.sub("batch"));
+    const std::vector<uint8_t> raw = read_binary_for_test(dir.sub("batch") + "/" + manifest.shards.front().path);
+    int checked = 0;
+    for (size_t offset = 0; offset + kSampleBytes <= raw.size(); offset += kSampleBytes) {
+        const Sample sample = decode_sample(raw.data() + offset);
+        int legal = 0;
+        for (int action = 0; action < kNumActions; action++) legal += (sample.legal_mask >> action) & 1;
+        expect_equal_u64(sample.candidates.count, static_cast<uint64_t>(legal),
+                         "候选数量等于合法方向数");
+        for (int action = 0; action < kNumActions; action++) {
+            if (((sample.legal_mask >> action) & 1) == 0) continue;
+            const MoveOutcome outcome = apply_move(sample.decision, action);
+            expect_true(sample.candidates.afterstate[action] == outcome.board,
+                        "候选 afterstate 与规则一致");
+            expect_equal_u64(sample.candidates.reward[action], outcome.score, "候选立即得分与规则一致");
+            // 候选访问数与主记录的根访问数必须一致：两者独立写入，交叉核对能发现
+            // “候选块按错的边填”这类错位。
+            expect_equal_u64(sample.candidates.visits[action], sample.visits[action],
+                             "候选访问数与根访问数一致");
+            checked++;
+        }
+    }
+    expect_true(checked > 0, "至少要检查到一条候选");
 }
 
 }  // namespace r2048::tests

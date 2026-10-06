@@ -1,5 +1,7 @@
 #include "program/episode.h"
 
+#include <cmath>
+
 #include <stdexcept>
 
 #include "core/rng.h"
@@ -25,8 +27,9 @@ int pick_uniform_legal(uint8_t mask, Rng& rng) {
 }  // namespace
 
 int RandomSelector::select(const Board& board, uint8_t legal_mask, uint64_t episode, uint64_t step,
-                           uint16_t visits_out[kNumActions]) {
+                           uint16_t visits_out[kNumActions], CandidateTargets* candidates_out) {
     (void)board;
+    (void)candidates_out;  // 非搜索策略没有候选估计
     for (int action = 0; action < kNumActions; action++) visits_out[action] = 0;
     Rng rng(derive_seed(base_seed_, kSaltAction, episode, step, 0));
     return pick_uniform_legal(legal_mask, rng);
@@ -39,9 +42,16 @@ MctsSelector::MctsSelector(uint64_t base_seed, const RolloutMctsConfig& config, 
       search_(config, base_seed) {}
 
 int MctsSelector::select(const Board& board, uint8_t legal_mask, uint64_t episode, uint64_t step,
-                         uint16_t visits_out[kNumActions]) {
+                         uint16_t visits_out[kNumActions], CandidateTargets* candidates_out) {
     const RolloutMctsResult result = search_.search(board, episode, step);
     for (int action = 0; action < kNumActions; action++) visits_out[action] = result.visits[action];
+    if (candidates_out != nullptr) {
+        int32_t q_mean[kNumActions] = {0, 0, 0, 0};
+        for (int action = 0; action < kNumActions; action++) {
+            q_mean[action] = static_cast<int32_t>(std::lround(result.q_mean[action]));
+        }
+        *candidates_out = build_candidate_targets(board, legal_mask, q_mean, result.visits);
+    }
 
     // 开局若干步按根访问分布采样而不是直接取最大值：自对弈数据需要多样性，
     // 全程 argmax 会让同一批数据高度重复。第 temperature_moves 步之后转为确定性地
@@ -92,13 +102,15 @@ EpisodeOutcome play_episode(uint64_t base_seed, uint32_t episode, MoveSelector& 
         if (mask == 0) break;
 
         uint16_t visits[kNumActions] = {0, 0, 0, 0};
-        const int action = selector.select(board, mask, episode, step, visits);
+        CandidateTargets candidates;
+        const int action = selector.select(board, mask, episode, step, visits, &candidates);
         const MoveOutcome move = apply_move(board, action);
         if (!move.valid) {
             throw std::runtime_error("决策器返回了非法方向 " + std::to_string(action));
         }
         if (recorder != nullptr) {
-            recorder->add(board, move.board, action, mask, static_cast<uint32_t>(move.score), visits);
+            recorder->add(board, move.board, action, mask, static_cast<uint32_t>(move.score), visits,
+                          &candidates);
         }
         outcome.total_score += move.score;
         board = move.board;

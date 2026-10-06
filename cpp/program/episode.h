@@ -23,8 +23,11 @@ struct EpisodeOutcome {
 class MoveSelector {
 public:
     virtual ~MoveSelector() = default;
+    // candidates_out 非空时，决策器应当写入该局面的候选目标（候选级监督用）。
+    // 非搜索策略（随机）没有候选目标，可以留空。
     virtual int select(const Board& board, uint8_t legal_mask, uint64_t episode, uint64_t step,
-                       uint16_t visits_out[kNumActions]) = 0;
+                       uint16_t visits_out[kNumActions],
+                       CandidateTargets* candidates_out = nullptr) = 0;
     virtual uint16_t simulations() const { return 0; }
     virtual const char* name() const = 0;
 };
@@ -34,7 +37,7 @@ class RandomSelector : public MoveSelector {
 public:
     explicit RandomSelector(uint64_t base_seed) : base_seed_(base_seed) {}
     int select(const Board& board, uint8_t legal_mask, uint64_t episode, uint64_t step,
-               uint16_t visits_out[kNumActions]) override;
+               uint16_t visits_out[kNumActions], CandidateTargets* candidates_out = nullptr) override;
     const char* name() const override { return "random"; }
 
 private:
@@ -47,7 +50,7 @@ public:
     MctsSelector(uint64_t base_seed, const RolloutMctsConfig& config, uint32_t temperature_moves);
 
     int select(const Board& board, uint8_t legal_mask, uint64_t episode, uint64_t step,
-               uint16_t visits_out[kNumActions]) override;
+               uint16_t visits_out[kNumActions], CandidateTargets* candidates_out = nullptr) override;
     uint16_t simulations() const override { return static_cast<uint16_t>(config_.simulations); }
     const char* name() const override { return "mcts"; }
 

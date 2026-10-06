@@ -55,6 +55,12 @@ def _model() -> torch.nn.Module:
     return model
 
 
+def _record_bytes() -> int:
+    from r2048.data.shards import RECORD_BYTES
+
+    return RECORD_BYTES
+
+
 def _verify(data_dir: Path) -> dict:
     binary = os.environ.get("R2048_TEST_BINARY")
     if not binary:
@@ -78,7 +84,9 @@ def test_selfplay_produces_verifiable_batch(tmp_path: Path) -> None:
     manifest = json.loads((data_dir / "manifest.json").read_text())
     assert manifest["policy"] == "nn"
     assert manifest["simulations"] == SMALL["simulations"]
-    assert manifest["record_bytes"] == 80
+    # 记录长度由 schema 版本决定（v2 起含候选块）；这里不写死数字，
+    # 只要求与本地布局一致，避免每次升 schema 都要改这条断言。
+    assert manifest["record_bytes"] == int(r2048_core.NUM_ACTIONS) * 0 + _record_bytes()
     # 批处理协议的意义就在这里：平均每批请求行数必须远大于 1。
     assert result.rows_per_forward > 20, f"平均每批只有 {result.rows_per_forward:.1f} 行，批处理失效"
     # 叶子缓存命中率：同一局面在搜索中被反复查询，命中率过低说明缓存没起作用。

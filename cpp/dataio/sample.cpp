@@ -1,5 +1,7 @@
 #include "dataio/sample.h"
 
+#include "game/rules.h"
+
 #include <array>
 #include <cstring>
 
@@ -50,6 +52,15 @@ void encode_sample(const Sample& sample, uint8_t out[kSampleBytes]) {
     write_u32(out + 42, sample.move_score);
     write_u64(out + 48, static_cast<uint64_t>(sample.mc_return));
     for (int action = 0; action < kNumActions; action++) write_u16(out + 64 + 2 * action, sample.visits[action]);
+
+    // v2 候选块
+    for (int action = 0; action < kNumActions; action++) {
+        std::memcpy(out + 80 + 16 * action, sample.candidates.afterstate[action].tiles, 16);
+        write_u32(out + 144 + 4 * action, static_cast<uint32_t>(sample.candidates.value[action]));
+        write_u32(out + 160 + 4 * action, sample.candidates.reward[action]);
+        write_u16(out + 176 + 2 * action, sample.candidates.visits[action]);
+    }
+    out[184] = sample.candidates.count;
 }
 
 Sample decode_sample(const uint8_t in[kSampleBytes]) {
@@ -64,14 +75,38 @@ Sample decode_sample(const uint8_t in[kSampleBytes]) {
     sample.move_score = read_u32(in + 42);
     sample.mc_return = static_cast<int64_t>(read_u64(in + 48));
     for (int action = 0; action < kNumActions; action++) sample.visits[action] = read_u16(in + 64 + 2 * action);
+    for (int action = 0; action < kNumActions; action++) {
+        std::memcpy(sample.candidates.afterstate[action].tiles, in + 80 + 16 * action, 16);
+        sample.candidates.value[action] = static_cast<int32_t>(read_u32(in + 144 + 4 * action));
+        sample.candidates.reward[action] = read_u32(in + 160 + 4 * action);
+        sample.candidates.visits[action] = read_u16(in + 176 + 2 * action);
+    }
+    sample.candidates.count = in[184];
     return sample;
+}
+
+CandidateTargets build_candidate_targets(const Board& decision, uint8_t legal_mask,
+                                         const int32_t q_mean_raw[kNumActions],
+                                         const uint16_t visits[kNumActions]) {
+    CandidateTargets targets;
+    for (int action = 0; action < kNumActions; action++) {
+        if ((legal_mask & (1u << action)) == 0) continue;
+        const MoveOutcome outcome = apply_move(decision, action);
+        targets.afterstate[action] = outcome.board;
+        targets.reward[action] = static_cast<uint32_t>(outcome.score);
+        targets.value[action] = q_mean_raw[action] - static_cast<int32_t>(outcome.score);
+        targets.visits[action] = visits[action];
+        targets.count++;
+    }
+    return targets;
 }
 
 EpisodeRecorder::EpisodeRecorder(uint32_t episode, uint16_t simulations)
     : episode_(episode), simulations_(simulations) {}
 
 void EpisodeRecorder::add(const Board& decision, const Board& afterstate, int action, uint8_t legal_mask,
-                          uint32_t move_score, const uint16_t visits[kNumActions]) {
+                          uint32_t move_score, const uint16_t visits[kNumActions],
+                          const CandidateTargets* candidates) {
     decision_.push_back(decision);
     afterstate_.push_back(afterstate);
     action_.push_back(static_cast<uint8_t>(action));
@@ -80,6 +115,7 @@ void EpisodeRecorder::add(const Board& decision, const Board& afterstate, int ac
     std::array<uint16_t, kNumActions> copy{};
     for (int i = 0; i < kNumActions; i++) copy[i] = visits[i];
     visits_.push_back(copy);
+    candidates_.push_back(candidates != nullptr ? *candidates : CandidateTargets{});
 }
 
 std::vector<Sample> EpisodeRecorder::finish() {
@@ -107,6 +143,7 @@ std::vector<Sample> EpisodeRecorder::finish() {
         sample.move_score = move_score_[index];
         sample.mc_return = labels[index];
         for (int action = 0; action < kNumActions; action++) sample.visits[action] = visits_[index][action];
+        sample.candidates = candidates_[index];
         samples.push_back(sample);
     }
     return samples;

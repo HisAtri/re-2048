@@ -69,6 +69,11 @@ class Batch:
     value_target: torch.Tensor  # (B,) float32：归一化回报（分数 / score_scale）
     move_score: torch.Tensor    # (B,) float32：归一化立即得分
     episode: torch.Tensor       # (B,) int64
+    # --- 候选级监督（schema v2）：每个合法方向一条，按方向下标对齐 ---
+    candidate_afterstate: torch.Tensor  # (B, 4, 16) uint8
+    candidate_value: torch.Tensor       # (B, 4) float32：A(u_a) = Q̄(a) − r(s,a)（已归一化）
+    candidate_visits: torch.Tensor      # (B, 4) float32：该候选边的根访问数
+    candidate_weight: torch.Tensor      # (B, 4) float32：sqrt(访问数)，非法/未访达/无候选处为 0
 
     def __len__(self) -> int:
         return int(self.decision.shape[0])
@@ -84,7 +89,16 @@ class Batch:
             value_target=self.value_target.to(device),
             move_score=self.move_score.to(device),
             episode=self.episode.to(device),
+            candidate_afterstate=self.candidate_afterstate.to(device),
+            candidate_value=self.candidate_value.to(device),
+            candidate_visits=self.candidate_visits.to(device),
+            candidate_weight=self.candidate_weight.to(device),
         )
+
+    @property
+    def has_candidates(self) -> bool:
+        """这批数据是否带候选级监督（随机策略产出的批次没有）。"""
+        return bool(self.candidate_weight.sum() > 0)
 
 
 class BatchStream:
@@ -161,6 +175,22 @@ class BatchStream:
                 (records["move_score"].astype(np.float32) / self.score_scale).copy()
             ),
             episode=torch.from_numpy(records["episode"].astype(np.int64)),
+            candidate_afterstate=torch.from_numpy(
+                np.ascontiguousarray(records["candidate_afterstate"])
+            ),
+            candidate_value=torch.from_numpy(
+                (records["candidate_value"].astype(np.float32) / self.score_scale).copy()
+            ),
+            candidate_visits=torch.from_numpy(records["candidate_visits"].astype(np.float32).copy()),
+            # 权重 = sqrt(访问数) × 合法性（见 ADR 0015）。未访问过的候选权重为 0，
+            # 因此“搜索没有估计过它”与“估计为 0”不会被混为一谈。
+            candidate_weight=torch.from_numpy(
+                (
+                    np.sqrt(records["candidate_visits"].astype(np.float32))
+                    * legal_mask
+                    * (records["candidate_count"] > 0)[:, None]
+                ).astype(np.float32)
+            ),
         )
 
 

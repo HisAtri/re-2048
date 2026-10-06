@@ -18,7 +18,7 @@ import torch
 
 import r2048_core
 
-from r2048.data.dataset import BatchStream, make_split, open_batch
+from r2048.data.dataset import Batch, BatchStream, make_split, open_batch
 from r2048.data.shards import RECORD_BYTES, BatchReader, read_manifest
 from r2048.nn.augment import apply_boards, augment_policy, transform_policy_targets
 from r2048.nn.training import TrainConfig, policy_loss, run_training
@@ -197,6 +197,93 @@ def test_policy_target_is_a_distribution(search_batch_dir: Path) -> None:
     # 访问数之和不可能超过模拟次数（根求值那次不落在边上）。
     assert bool((batch.visits.sum(dim=-1) <= batch.visits.new_tensor(8.0) + 1e-6).all())
     assert policy_loss(torch.randn(int(has_search.sum()), 4), batch) is not None
+
+
+def test_candidate_block_matches_rules_and_main_fields(search_batch_dir: Path) -> None:
+    """候选块的每个字段都要能用规则或主记录的字段交叉核对。
+
+    候选监督的全部风险都在“写对了没有”：槽位错位、减错立即得分、把未访问的边当成 0，
+    这些都不会让训练报错，只会安静地把价值头引到错误的候选上。
+    """
+    reader = BatchReader(search_batch_dir)
+    records = reader.gather(np.arange(reader.samples))
+    checked = 0
+    for record in records:
+        decision = record["decision"]
+        action = int(record["action"])
+        mask = int(record["legal_mask"])
+        assert int(record["candidate_count"]) == bin(mask).count("1"), "候选数量必须等于合法方向数"
+        for candidate in range(4):
+            if not (mask >> candidate) & 1:
+                assert int(record["candidate_value"][candidate]) == 0, "非法方向的槽位应保持为空"
+                assert int(record["candidate_visits"][candidate]) == 0
+                continue
+            moved, score, _ = _apply(decision, candidate)
+            assert np.array_equal(
+                np.asarray(record["candidate_afterstate"][candidate], dtype=np.uint8), moved
+            ), "候选 afterstate 必须与规则一致"
+            assert int(record["candidate_reward"][candidate]) == score, "候选立即得分必须与规则一致"
+            checked += 1
+        # 实际执行动作对应的候选槽，必须与主记录的 afterstate 一致（两处独立写入的交叉核对）。
+        assert np.array_equal(
+            np.asarray(record["candidate_afterstate"][action], dtype=np.uint8),
+            np.asarray(record["afterstate"], dtype=np.uint8),
+        ), "动作所在候选槽的 afterstate 必须等于主记录的 afterstate"
+    assert checked > 0
+
+    split = make_split(reader, val_fraction=0.0)
+    batch = next(iter(BatchStream(reader, split.train, batch_size=256, shuffle=False)))
+    assert batch.has_candidates, "搜索批次应当带候选监督"
+    legal = batch.legal_mask.bool()
+    expected_weight = torch.sqrt(batch.candidate_visits) * legal
+    assert torch.allclose(batch.candidate_weight, expected_weight, atol=1e-5), (
+        "候选权重必须是 sqrt(访问数) 且非法方向为 0"
+    )
+
+
+def test_candidate_value_loss_and_metrics() -> None:
+    """候选损失与排序指标：完美预测必须给出 0 损失、100% 命中、0 后悔。"""
+    from r2048.nn.training import TrainConfig, _Metrics, _value_loss
+
+    torch.manual_seed(0)
+    count = 32
+    target = torch.randn(count, 4)
+    weight = torch.rand(count, 4) * 3.0
+    weight[torch.rand(count, 4) < 0.3] = 0.0  # 未访问/非法的候选权重为 0
+    batch = Batch(
+        decision=torch.zeros(count, 16, dtype=torch.uint8),
+        afterstate=torch.zeros(count, 16, dtype=torch.uint8),
+        action=torch.zeros(count, dtype=torch.int64),
+        legal_mask=(weight > 0).float(),
+        visits=weight,
+        policy_target=torch.zeros(count, 4),
+        value_target=torch.zeros(count),
+        move_score=torch.zeros(count),
+        episode=torch.zeros(count, dtype=torch.int64),
+        candidate_afterstate=torch.zeros(count, 4, 16, dtype=torch.uint8),
+        candidate_value=target,
+        candidate_visits=weight,
+        candidate_weight=weight,
+    )
+    config = TrainConfig(data="x", output="y", mode="value", value_loss="huber")
+
+    perfect = target.reshape(-1)
+    loss, prediction = _value_loss(perfect, batch, use_candidates=True, config=config)
+    assert float(loss) == pytest.approx(0.0, abs=1e-6), "完美预测的加权 Huber 损失必须是 0"
+
+    metrics = _Metrics(torch.device("cpu"), 1024.0)
+    metrics.add_candidates(prediction, target, weight)
+    assert metrics.candidate_mae() == pytest.approx(0.0, abs=1e-3)
+    assert metrics.pair_agreement() == pytest.approx(1.0, abs=1e-6), "完美预测的成对排序一致率为 1"
+    assert metrics.best_candidate_hit() == pytest.approx(1.0, abs=1e-6), "完美预测必然命中最优候选"
+    assert metrics.candidate_regret() == pytest.approx(0.0, abs=1e-3), "完美预测的后悔值为 0"
+
+    noisy = target.reshape(-1) + 5.0 * torch.randn(count * 4)
+    noisy_loss, noisy_prediction = _value_loss(noisy, batch, use_candidates=True, config=config)
+    assert float(noisy_loss) > float(loss), "带噪声的预测损失必须更大"
+    noisy_metrics = _Metrics(torch.device("cpu"), 1024.0)
+    noisy_metrics.add_candidates(noisy_prediction, target, weight)
+    assert noisy_metrics.best_candidate_hit() < 1.0, "带噪声时不可能命中所有最优候选"
 
 
 @pytest.mark.parametrize("rotation", range(4))

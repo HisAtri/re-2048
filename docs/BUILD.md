@@ -132,6 +132,32 @@ python -m r2048 selfplay ...      # NN 引导的批量自对弈（需要 --check
   短跑（几百步）会显著被它摊薄，因此**优先把一次运行跑长**，而不是频繁起停。
 * 自对弈/评测侧的批大小才是吞吐关键：`lanes` 与 `in_flight_per_lane` 扫描结果见下。
 
+### 搜索健康度与噪声底噪（做架构对照前的量尺）
+
+```bash
+# 根访问分布诊断：直接读数据里的 visits 与 legal_mask 列
+uv run python - <<'EOF'
+from r2048.data.shards import BatchReader
+import numpy as np
+reader = BatchReader("$R2048_OUTPUT_DIR/data/<批>")
+rec = reader.gather(np.arange(min(200000, reader.samples)))
+visits = rec["visits"].astype(np.int64)
+legal = np.stack([(rec["legal_mask"].astype(np.int64) >> a) & 1 for a in range(4)], axis=1)
+multi = legal.sum(1) >= 2
+print("只访问一条根边:", float(((visits > 0).sum(1)[multi] == 1).mean()) * 100, "%")
+print("平均访问边数:", float((visits > 0).sum(1)[multi].mean()))
+print("根访问和 == 模拟次数:", float((visits.sum(1) == rec["simulations"]).mean()) * 100, "%")
+print("非法方向访问数:", int((visits * (1 - legal)).sum()))
+EOF
+```
+
+实测：只访问一条根边 **0.000%**，平均访问 3.5 条边（旧版修复前是 99.687%）；
+根访问数之和 = 模拟次数 − 1（那一次用于求值根节点本身）。
+
+**噪声底噪**（同配方同数据、只换训练种子、评测 400 局）：训练 1σ ≈ 10~18 评分点，
+400 局评测 1σ ≈ 12 点 → **单 seed 对照的可辨识下限约 40~50 分**。
+架构对照因此需要参数匹配 + 同数据同初始化 + ≥3 个 seed。
+
 几条与设计直接相关的读数：
 
 * **每批前向的行数**是这套两阶段协议的生命线。早期实现每个 lane 只允许一条模拟在途，

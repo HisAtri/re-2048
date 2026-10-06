@@ -721,7 +721,13 @@ struct BatchedEngine::Impl {
                         progressed = true;
                         continue;
                     }
+                    // 根节点还没被求值时只允许一条在途模拟：否则第一轮会把 in_flight 条
+                    // 模拟全派到同一个新鲜根上，它们都停在根上求值、一条边都没走过——
+                    // 这些模拟既没参与搜索，也让根访问数之和少于模拟次数（实测
+                    // in_flight=8 时只有 56/64，等于每个决策步浪费 12.5% 的预算）。
+                    const bool root_unexpanded = !lane.nodes.empty() && lane.nodes[0].state != kEvaluated;
                     if (lane.pending.size() >= config.in_flight_per_lane ||
+                        (root_unexpanded && !lane.pending.empty()) ||
                         lane.pending.size() >= effective_simulations() - lane.simulations_done) {
                         // 在途已满。这里必须处理一种会死锁的情形：缓存把某个挂起模拟
                         // 需要的结果挤掉了，于是它永远不会就绪，而 lane 又因为“在途已满”

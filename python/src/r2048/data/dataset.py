@@ -137,11 +137,13 @@ class BatchStream:
 
     def decode(self, chunk: np.ndarray) -> Batch:
         records = self.reader.gather(np.asarray(chunk, dtype=np.int64))
-        simulations = records["simulations"].astype(np.float32)
         visits = records["visits"].astype(np.float32)
-        # 按每条记录自己的模拟次数归一化：同一批数据里可能混着不同搜索预算的样本。
-        denominator = np.where(simulations > 0, simulations, 1.0)
-        policy_target = visits / denominator[:, None]
+        # 策略目标按**访问数之和**归一化，而不是按模拟次数：根节点的求值本身会消耗一次
+        # 模拟但不落到任何边上（实测根访问数之和 = 模拟次数 − 1；修复 in-flight 浪费前
+        # in_flight=8 时只有 56/64）。用模拟次数做分母会让目标权重只有 0.96，等于把引擎的
+        # 记账细节写进了训练标签；按访问和归一化后目标恒为概率分布，且与 in_flight 无关。
+        visit_sum = visits.sum(axis=1, keepdims=True)
+        policy_target = np.divide(visits, visit_sum, out=np.zeros_like(visits), where=visit_sum > 0)
         # 位域展开成 (B,4)：D4 变换要按方向重排掩码与访问分布，位域形式没法直接变换。
         raw_mask = records["legal_mask"].astype(np.uint8)[:, None]
         legal_mask = ((raw_mask >> np.arange(4, dtype=np.uint8)[None, :]) & 1).astype(np.float32)

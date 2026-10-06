@@ -37,6 +37,35 @@ def _r2048_binary() -> str:
 
 
 @pytest.fixture(scope="module")
+def search_batch_dir(tmp_path_factory) -> Path:
+    """带搜索记录的批次：用于检验策略目标的口径（随机策略批次里 visits 全 0）。"""
+    target = tmp_path_factory.mktemp("data") / "mcts"
+    subprocess.run(
+        [
+            _r2048_binary(),
+            "generate",
+            "--policy",
+            "mcts",
+            "--simulations",
+            "8",
+            "--samples",
+            "4000",
+            "--seed",
+            "20261013",
+            "--shard-samples",
+            "4000",
+            "--out",
+            str(target),
+            "--quiet",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return target
+
+
+@pytest.fixture(scope="module")
 def batch_dir(tmp_path_factory) -> Path:
     """现场生成一个小数据批：顺带验证 C++ 生成 → Python 读取这条跨语言路径。"""
     target = tmp_path_factory.mktemp("data") / "random"
@@ -147,6 +176,27 @@ def test_batch_stream_normalises_targets(batch_dir: Path) -> None:
     # 归一化后的价值目标应当量纲合理（分数 / 1024）。
     assert float(batch.value_target.abs().max()) < 100.0
     assert policy_loss(torch.zeros(128, 4), batch) is None, "无搜索记录时不应产生策略损失"
+
+
+def test_policy_target_is_a_distribution(search_batch_dir: Path) -> None:
+    """策略目标必须是概率分布，且与 in_flight / 根求值开销无关。
+
+    引擎里根节点自身的求值会消耗一次模拟但不落到任何边上，因此“按模拟次数归一化”
+    会让目标权重小于 1（实测 56/64~63/64）。这里守住按访问和归一化的口径。
+    """
+    reader = BatchReader(search_batch_dir)
+    split = make_split(reader, val_fraction=0.0)
+    stream = BatchStream(reader, split.train, batch_size=512, shuffle=False)
+    batch = next(iter(stream))
+    has_search = batch.visits.sum(dim=-1) > 0
+    assert bool(has_search.any()), "搜索批次里应当有带访问数的记录"
+    sums = batch.policy_target[has_search].sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), "策略目标必须归一化到 1"
+    if bool((~has_search).any()):
+        assert bool(batch.policy_target[~has_search].abs().max() == 0), "无搜索记录的目标必须为 0"
+    # 访问数之和不可能超过模拟次数（根求值那次不落在边上）。
+    assert bool((batch.visits.sum(dim=-1) <= batch.visits.new_tensor(8.0) + 1e-6).all())
+    assert policy_loss(torch.randn(int(has_search.sum()), 4), batch) is not None
 
 
 @pytest.mark.parametrize("rotation", range(4))

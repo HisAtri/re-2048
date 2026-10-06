@@ -1,0 +1,19 @@
+# 与仓库现有代码一致的极简风格：4 空格缩进、110 列、函数体不强制换行。
+# 只固定真正影响可读性的几条，避免格式化噪音淹没 diff。
+BasedOnStyle: Google
+Language: Cpp
+Standard: c++20
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 110
+AccessModifierOffset: -3
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: true
+AllowShortLoopsOnASingleLine: true
+AllowShortCaseLabelsOnASingleLine: true
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Preserve
+SortIncludes: CaseSensitive
+SpaceAfterTemplateKeyword: false

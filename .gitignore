@@ -99,7 +99,7 @@ ipython_config.py
 #   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
 #   This is especially recommended for binary packages to ensure reproducibility, and is more
 #   commonly ignored for libraries.
-uv.lock
+# uv.lock 必须入库：Python 依赖靠锁文件复现，C++ 侧靠 Makefile 复现构建。
 
 # poetry
 #   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
@@ -221,3 +221,17 @@ __marimo__/
 
 .reference/
 Agents.md
+
+# 本项目自己的产物约定：构建、虚拟环境、输出根默认都在仓库之外（见 docs/adr/0002）。
+# 这里只兜底覆盖“有人把环境变量指回仓库内”的情况。
+/Output/
+output/
+build/
+compile_commands.json
+*.tmp
+
+# 本地机器画像与临时脚本
+benchmarks/machines.json
+
+# ZCode 会话目录（工具本地状态，不属于项目）
+.zcode/

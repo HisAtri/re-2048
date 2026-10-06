@@ -1,0 +1,45 @@
+[project]
+name = "r2048"
+version = "0.1.0"
+description = "2048 自对弈强化学习：C++ 负责规则/搜索/跑谱，PyTorch 负责推理与训练"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.2,<3",
+    "pyyaml>=6.0,<7",
+    "torch>=2.12",
+]
+
+[dependency-groups]
+dev = [
+    "pybind11>=2.13",
+    "pytest>=8.3,<9",
+    "ruff>=0.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["python/src/r2048"]
+
+# torch 固定走 CUDA 13.0 wheel 索引：本机是 WSL2 + 直通 GPU，CUDA toolkit 只用于
+# 诊断，运行期真正用到的是 wheel 自带的 CUDA 运行时。
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[tool.pytest.ini_options]
+# testpaths 必须显式钉住：.reference/ 下是完整的 KataGo 与旧版 2048ai 检出，
+# 从仓库根裸跑 pytest 会去收集它们各自的测试树。
+testpaths = ["python/tests"]
+norecursedirs = [".reference", "build", ".venv", "output", ".git"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 110
+src = ["python/src", "python/tests"]

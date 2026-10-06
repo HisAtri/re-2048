@@ -1,0 +1,6 @@
+# 仓库位于 Windows 盘（9p 挂载），工作区文件可能被写成 CRLF，导致只有行尾变化的假 diff。
+# 统一按 LF 存取：源码与文档都是 LF，二进制产物不入库（数据/构建目录都在仓库之外）。
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.so binary

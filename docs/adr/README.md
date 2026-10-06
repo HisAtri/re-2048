@@ -17,6 +17,8 @@ ADR 解释为什么整体是这个形状。
 | [0009](0009-dataset-and-split.md) | 训练数据的读取与划分口径 | 已采纳 |
 | [0010](0010-training-recipes-and-gates.md) | 训练配方与门槛 | 已采纳 |
 | [0011](0011-evaluation-protocol.md) | 评测口径与比较方法 | 已采纳 |
+| [0012](0012-rating-scale-and-iteration-experiment.md) | 评分标度、配对诊断与两轮迭代实验 | 已采纳 |
+| [0013](0013-iteration-results.md) | 两轮迭代实验结果：朴素自举会把价值头训坏 | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

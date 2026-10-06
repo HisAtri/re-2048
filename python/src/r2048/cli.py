@@ -13,6 +13,8 @@ from pathlib import Path
 
 from r2048 import __version__, paths
 
+RATING_LAMBDA = 230.0
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m r2048", description="2048 自博弈 Python 侧入口")
@@ -64,6 +66,16 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--device", default="cuda")
     evaluate.add_argument("--label", default="")
     evaluate.add_argument("--jsonl", default="", help="逐局记录输出路径")
+
+    rating = sub.add_parser("rating", help="评分池：按旧版口径算评分（对数标度 + 锚点）")
+    rating.add_argument("--pool", default="", help="评分池（append-only JSONL），默认 $R2048_OUTPUT_DIR/rating/pool.jsonl")
+    rating.add_argument("--anchors", default="", help="锚点文件，默认 $R2048_OUTPUT_DIR/rating/anchors.json")
+    rating.add_argument("--ingest", nargs="*", default=[], help="把评测 JSONL 追加进评分池（自动去重）")
+    rating.add_argument("--anchor", action="append", default=[], help="指定锚点，形如 track=model_id")
+    rating.add_argument("--pair-a", default="", help="配对诊断的基准模型")
+    rating.add_argument("--pair-b", default="", help="配对诊断的对照模型")
+    rating.add_argument("--pair-track", default="search", choices=["search", "pure"])
+    rating.add_argument("--json", default="", help="把评分结果写到文件")
 
     compare = sub.add_parser("compare", help="两组逐局记录做按局配对 bootstrap")
     compare.add_argument("--baseline", required=True)
@@ -200,6 +212,104 @@ def _command_eval(args: argparse.Namespace) -> int:
         + (f"，达到 {tiles}" if tiles else "")
     )
     print(json.dumps(summary, ensure_ascii=False))
+    return 0
+
+
+def _command_rating(args: argparse.Namespace) -> int:
+    """评分池：追加评测、定锚点、全盘重算，并打印评分表与配对诊断。
+
+    池是 append-only 的：新增对局后全盘重算，评分因此可以随数据增长变准，也能事后追溯。
+    """
+    from r2048.workflows import rating as rating_module
+
+    root = paths.output_root() / "rating"
+    pool_path = Path(args.pool) if args.pool else root / "pool.jsonl"
+    anchors_path = Path(args.anchors) if args.anchors else root / "anchors.json"
+
+    if args.ingest:
+        added = rating_module.ingest_jsonl(pool_path, args.ingest)
+        print(f"新增 {added} 局到评分池 {pool_path}")
+
+    rows = rating_module.load_pool(pool_path)
+    if not rows:
+        raise SystemExit(f"评分池为空：{pool_path}")
+
+    if args.anchor:
+        spec = {}
+        for entry in args.anchor:
+            track, _, model_id = entry.partition("=")
+            spec[track] = model_id
+        rating_module.save_anchors(anchors_path, rows, spec)
+        print(f"锚点已写入 {anchors_path}: {spec}")
+
+    anchors = rating_module.load_anchors(anchors_path)
+    ratings = rating_module.compute_ratings(rows, anchors)
+    openings = rating_module.count_openings()
+    print(f"开局：{openings['distinct_boards']} 种（D4 简并后 {openings['d4_orbits']} 种）——"
+          "这就是“同 seed 对齐开局”能提供的全部信息")
+
+    report = {"openings": openings, "tracks": {}}
+    for track, block in ratings.items():
+        anchor = block["anchor"]
+        print(f"\n[{track}] 锚点 {anchor['model_id']}（{anchor['n_ref']} 局）= 1000，"
+              f"协议 {block['protocol_hash']}")
+        print(f"{'模型':<22}{'评分':>10}{'±95%':>8}{'局数':>7}{'对数均值':>10}{'均分':>10}"
+              f"{'中位':>9}{'平均步数':>9}  每万局到达 2048/4096")
+        ordered = sorted(block["models"].items(), key=lambda item: -item[1]["rating"])
+        for model_id, stats in ordered:
+            tiles = stats["tile_reach_per_10k"]
+            print(
+                f"{model_id:<22}{stats['rating']:>10.1f}{stats['ci95']:>8.1f}{stats['n']:>7}"
+                f"{stats['L']:>10.3f}{stats['mean_score']:>10.0f}{stats['median_score']:>9.0f}"
+                f"{stats['mean_steps']:>9.0f}  {tiles.get('2048', 0):>5.1f} / {tiles.get('4096', 0):>5.1f}"
+            )
+        report["tracks"][track] = {
+            "anchor": anchor["model_id"],
+            "protocol_hash": block["protocol_hash"],
+            "models": {
+                model_id: {
+                    "rating": stats["rating"],
+                    "ci95": stats["ci95"],
+                    "n": stats["n"],
+                    "L": stats["L"],
+                    "mean_score": stats["mean_score"],
+                    "median_score": stats["median_score"],
+                    "tile_reach_per_10k": stats["tile_reach_per_10k"],
+                }
+                for model_id, stats in block["models"].items()
+            },
+        }
+
+    # 模型间差异：同时给“评分口径（独立两样本）”与“同 seed 配对差分”，
+    # 后者用来量化配对到底省了多少方差，而不是默认它有效。
+    if args.pair_a and args.pair_b:
+        diagnostic = rating_module.pairing_diagnostic(rows, args.pair_a, args.pair_b, args.pair_track)
+        paired = diagnostic["paired"]
+        independent = diagnostic["independent"]
+        print(
+            f"\n配对诊断 [{diagnostic['track']}] {args.pair_b} − {args.pair_a}，"
+            f"{diagnostic['games']} 个共同局号（同 eval_seed）"
+        )
+        print(
+            f"  评分口径（独立两样本）：{independent['rating_difference']:+.1f}，"
+            f"95% CI [{independent['rating_ci95'][0]:+.1f}, {independent['rating_ci95'][1]:+.1f}]，"
+            f"标准误 {independent['se']:.4f} log2"
+        )
+        print(
+            f"  同 seed 配对差分        ：{paired['rating_difference']:+.1f}，"
+            f"95% CI [{paired['rating_ci95'][0]:+.1f}, {paired['rating_ci95'][1]:+.1f}]，"
+            f"标准误 {paired['se']:.4f} log2"
+        )
+        print(
+            f"  逐局 log2 得分相关系数 {diagnostic['log2_correlation']:+.3f} → "
+            f"配对把标准误压低了 {diagnostic['variance_reduction'] * 100:+.1f}%"
+        )
+        report["pairing"] = diagnostic
+
+    if args.json:
+        Path(args.json).write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        print(f"\n评分结果写入 {args.json}")
+    print(json.dumps(report, ensure_ascii=False))
     return 0
 
 
@@ -361,6 +471,8 @@ def main(argv: list[str] | None = None) -> int:
         return _command_train(args)
     if args.command == "eval":
         return _command_eval(args)
+    if args.command == "rating":
+        return _command_rating(args)
     if args.command == "compare":
         return _command_compare(args)
     if args.command == "probe":

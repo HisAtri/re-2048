@@ -94,6 +94,11 @@ def merge_halves(
 
     value_id = str(value_meta.get("model_id", "")) or value_path.parent.name
     policy_id = str(policy_meta.get("model_id", "")) or policy_path.parent.name
+    # 两半各自的训练目标要在改动合并件之前读出来：`metadata` 就是 value_meta 这个对象，
+    # 先写 training_target="dual" 会把价值那一半的原始目标冲掉，于是来源记录里会说
+    # "价值半是 dual 训出来的"——正是这条记录要回答的问题（首次按新规范实跑时踩到）。
+    value_target = str(value_meta.get("training_target", ""))
+    policy_target = str(policy_meta.get("training_target", ""))
     metadata = value_meta
     metadata["model_id"] = f"{value_id}+{policy_id}"
     # 合并后的模型**两个头都训过**，所以 `training_target` 是 `dual`（评测侧的闸门用它判断
@@ -105,13 +110,13 @@ def merge_halves(
         "value": {
             "path": str(value_path),
             "model_id": value_id,
-            "training_target": value_meta.get("training_target", ""),
+            "training_target": value_target,
             "config_digest": value_meta.get("config_digest", ""),
         },
         "policy": {
             "path": str(policy_path),
             "model_id": policy_id,
-            "training_target": policy_meta.get("training_target", ""),
+            "training_target": policy_target,
             "config_digest": policy_meta.get("config_digest", ""),
         },
         "note": note,

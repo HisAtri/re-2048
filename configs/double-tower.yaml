@@ -1,0 +1,21 @@
+# 双塔线（dt）的训练配置。迭代编排把它当作"已有的池子"，再把这一轮新产出的数据按
+# --data-weight 追加进去（ADR 0021/0023）；所以第二轮起要把上一轮的批次列进 datasets。
+#
+# 架构写在 train 小节里（它是 TrainConfig 的字段）：名字只用于查表，体量由参数决定——
+# dt-s3p3v3c64 = 共享 3 块 + 策略塔 3 块 + 价值塔 3 块 + 64 通道（ADR 0026）。
+train:
+  architecture: dt-s3p3v3c64
+  architecture_params:
+    channels: 64
+    shared_blocks: 3
+    tower_blocks: 3
+  # mode 由迭代的 train 步骤决定（价值 run → 策略 run 冻结价值），这里只是单独跑 train 时的兜底。
+  mode: value
+  epochs: 8
+  batch_size: 4096
+  lr: 3.0e-4
+  val_fraction: 0.05
+  seed: 20261007
+  device: cuda
+  log_every: 200
+# datasets: 首轮留空——只有这一轮新产出的数据。

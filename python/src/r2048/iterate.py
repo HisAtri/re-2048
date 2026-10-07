@@ -195,7 +195,9 @@ def _step_selfplay(config: IterateConfig, written: dict, job: JobDir) -> dict:
         raise RuntimeError(f"跑谱没有产出清单：stdout 末行是 {command.last_line!r}")
     summary = json.loads(manifest_path.read_text())
     return {
-        "batch_id": batch_dir.name,
+        # 批次号以清单里的为准：目录名是我们起的，清单才是写出方的记录（`generate` 自己
+        # 决定 batch_id，从目录名反推会得到两个不同的说法）。
+        "batch_id": str(summary["batch_id"]),
         "data_dir": str(batch_dir),
         "manifest": str(manifest_path),
         "teacher": f"cpp-mcts{config.simulations}",

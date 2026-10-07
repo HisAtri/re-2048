@@ -27,7 +27,14 @@ from r2048.iterate import (
 from r2048.workflows.merge import merge_halves
 
 
-def fake_checkpoint(path, *, model_id: str, policy_scale: float = 1.0, rules_version: int | None = None):
+def fake_checkpoint(
+    path,
+    *,
+    model_id: str,
+    policy_scale: float = 1.0,
+    rules_version: int | None = None,
+    training_target: str = "value",
+):
     """造一个"半模型"：只需要参数名与元数据，合并逻辑不关心网络结构本身。"""
     model = {
         "stem.weight": torch.full((2, 2), 0.5),
@@ -39,6 +46,7 @@ def fake_checkpoint(path, *, model_id: str, policy_scale: float = 1.0, rules_ver
         "rules_version": int(r2048_core.RULES_VERSION) if rules_version is None else rules_version,
         "input_encoding": "v1",
         "architecture": "dual_head_resnet_v1",
+        "training_target": training_target,
     }
     torch.save({"checkpoint_version": 1, "model": model, "metadata": metadata}, path)
     return path, model
@@ -47,7 +55,9 @@ def fake_checkpoint(path, *, model_id: str, policy_scale: float = 1.0, rules_ver
 def test_merge_takes_each_half_by_prefix(tmp_path: Path) -> None:
     """价值侧提供非策略张量、策略侧提供策略张量，两边的取值都不串。"""
     value_path, value_model = fake_checkpoint(tmp_path / "value.pt", model_id="v1")
-    policy_path, policy_model = fake_checkpoint(tmp_path / "policy.pt", model_id="p1", policy_scale=0.9)
+    policy_path, policy_model = fake_checkpoint(
+        tmp_path / "policy.pt", model_id="p1", policy_scale=0.9, training_target="policy"
+    )
 
     result = merge_halves(value_path, policy_path, tmp_path / "merged.pt", note="测试")
     payload = torch.load(result.path, weights_only=False)
@@ -65,6 +75,11 @@ def test_merge_takes_each_half_by_prefix(tmp_path: Path) -> None:
     assert metadata["training_target"] == "dual"
     assert metadata["merged_from"]["value"]["model_id"] == "v1"
     assert metadata["merged_from"]["policy"]["model_id"] == "p1"
+    # 两半**各自**的训练目标要如实记录：合并会把合并件自己标成 dual，
+    # 但"价值半原来是 value、策略半原来是 policy"这条来源信息不能被它冲掉
+    # （`metadata` 与 `value_meta` 是同一个对象，写顺序错了就会记成两个 dual）。
+    assert metadata["merged_from"]["value"]["training_target"] == "value"
+    assert metadata["merged_from"]["policy"]["training_target"] == "policy"
     assert metadata["merged_from"]["note"] == "测试"
 
 

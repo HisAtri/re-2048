@@ -289,7 +289,7 @@ TEST(engine_two_engines_share_one_sink) {
 
 TEST(engine_records_search_threads_and_conserves_requests) {
     // 引擎**内部不再并行**推进 lane（试过，实测负收益，见 ADR 0027）：并行走 K 个各自持有
-    // 叶子缓存的引擎 + 一个合并推理线程（ADR 0029）。这里守的是与之配套的两件事：
+    // 叶子缓存的引擎 + 一个合并推理线程（ADR 0028）。这里守的是与之配套的两件事：
     // 请求数守恒（一条都不能丢、不能重复回填）与清单如实记下搜索线程数（它改变调度，
     // 所以是协议参数）。
     TempDir dir("threads");

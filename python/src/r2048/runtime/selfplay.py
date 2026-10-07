@@ -146,7 +146,7 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
         "provenance": {"device": device.type, "max_batch": str(config.max_batch)},
     }
     if config.search_threads > 1:
-        # K 个搜索引擎 + 合并推理线程（ADR 0029）。单线程路径保持原样：默认行为不变。
+        # K 个搜索引擎 + 合并推理线程（ADR 0028）。单线程路径保持原样：默认行为不变。
         from r2048.runtime.parallel_search import run_parallel_selfplay
 
         return run_parallel_selfplay(config, model, device)

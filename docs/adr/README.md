@@ -33,8 +33,7 @@ ADR 解释为什么整体是这个形状。
 | [0025](0025-inference-precision.md) | 推理精度的现状与暂不引入降精度开关 | 已采纳 |
 | [0026](0026-model-naming-and-tiers.md) | 模型命名分层与版本层级（测试版 / 正式版） | 已采纳 |
 | [0027](0027-inference-pipeline-utilisation.md) | 推理管线的性能诊断与引擎优化方向 | 已采纳 |
-| [0028](0028-training-config-layering.md) | — | 未使用（编号留给训练配置分层，暂缺） |
-| [0029](0029-multi-threaded-search.md) | 多线程搜索（K 个引擎共享写入侧 + 合并推理线程） | 已采纳（缩容方案待做） |
+| [0028](0028-multi-threaded-search.md) | 多线程搜索（K 个引擎共享写入侧 + 合并推理线程） | 已采纳（缩容方案待做） |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

@@ -122,7 +122,7 @@ struct BatchedEngine::Impl {
         meta.simulations = config.decision_mode == kDecisionSearch ? config.simulations : 0;
         meta.temperature_moves = config.temperature_moves;
         meta.seed = config.seed;
-        // 并发对局数记**整批**的值：多线程搜索时它 = 各引擎 lanes 之和（见 ADR 0003/0029）。
+        // 并发对局数记**整批**的值：多线程搜索时它 = 各引擎 lanes 之和（见 ADR 0003/0028）。
         meta.workers = config.lanes_total > 0 ? config.lanes_total : config.lanes;
         meta.samples_target = samples_target;
         meta.model_id = model_id;
@@ -758,7 +758,7 @@ struct BatchedEngine::Impl {
     // **这里刻意不并行**：试过把 lane 分到多个线程，实测每加一倍线程吞吐就掉一截
     // （197k → 172k → 154k → 137k 模拟/秒）——每次叶子查找都要拿一次全局 cache_mutex，
     // 而一条 lane 的一步搜索只有几微秒，锁争用吃掉了并行收益（见 ADR 0027）。
-    // 并行的正确做法是 K 个**各自持有叶子缓存**的引擎 + 一个合并推理线程（ADR 0029），
+    // 并行的正确做法是 K 个**各自持有叶子缓存**的引擎 + 一个合并推理线程（ADR 0028），
     // 那种并行在 Python 侧驱动，不由这里承担。
     void pump_lane_range(size_t begin, size_t stop, uint32_t max_requests,
                          std::atomic<bool>& progressed_flag) {

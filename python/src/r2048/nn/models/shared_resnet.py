@@ -1,4 +1,4 @@
-"""版本 `dual_head_resnet_v1`：全共享主干 + 两个头。
+"""定义 `sh-s6c64`（全共享 6 块共享主干，宽度 c64）：主干 + 两个头。
 
 为什么保留这一版（它已经不是默认的推荐结构，但删不得）：ADR 0012 里它是与双塔对照的
 那一臂，历史产物（`runs/c1-*`、`c2-*` 等 20 个 checkpoint）要用它才能重新加载。
@@ -14,11 +14,16 @@ from r2048.nn.encode import INPUT_CHANNELS
 from r2048.nn.models.blocks import ResidualBlock, check_groups
 from r2048.nn.models.contract import definition_metadata
 
-VERSION_ID = "dual_head_resnet_v1"
+# 正式版别名：形状代号（sh = 全共享主干，s6 = 6 个共享块，c64 = 64 通道）。
+# **它只是名字**：代码不解析它、也不据此推导结构（ADR 0026）。
+VERSION_ID = "sh-s6c64"
+# 历史名字：全部 20 个既有 checkpoint 记的是 `dual_head_resnet_v1`（当时还没有分层命名）。
+ALIASES = ("dual_head_resnet_v1",)
 
 
 class DualHeadResNet(nn.Module):
     VERSION_ID = VERSION_ID
+    ALIASES = ALIASES
 
     def __init__(self, channels: int = 64, blocks: int = 6, head_width: int = 256, groups: int = 8) -> None:
         super().__init__()

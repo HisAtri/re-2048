@@ -1,15 +1,20 @@
 """网络定义的注册表。
 
-**版本 ID 是索引，不是规格。** 它只回答"这份权重要用哪个定义来构造"，
-**不用来反推结构或超参**：超参一律从 checkpoint metadata 的 `architecture_params` 读，
-ID 只是给人一眼看出"这是哪一族网络"的名字。这条分界很重要：
+**名字与结构分开：名字只是索引，超参一律从 metadata 读。** 具体是两条互不重叠的职责：
 
-* 把结构写进 ID（旧版那种 `s3p3v3-c64`）看起来信息量更大，但它逼着 ID 随着任何宽度/深度
-  调整一起改名——每换一次宽度，ID、代码分派、产物目录、评分表都要跟着动，而"这具权重
-  当初是什么结构"仍然只能靠 ID 反推，算错就静默建成另一个网络（旧版 `create_model()`
-  忽略 `shared_blocks/tower_blocks`、永远按 3/3 建网，就是这个坑，写在它自己的注释里）。
-* 把超参放在 metadata、把名字留给 ID，则"改宽度/改深度"是**纯配置行为**（改一处参数），
-  ID 只在一个**新拓扑形状**出现时才新增。
+* **名字**（`VERSION_ID` 与它的别名）**只用于"按名字找定义"这一处查表**，以及给人看。
+  代码不解析名字、不据它推导结构——**这条是硬线**：名字写错只是找不到定义（报错），
+  绝不会静默建成另一个网络。
+* **超参**（`architecture_params`）是构造网络的全部依据，所以"改宽度/改深度"是**纯配置行为**，
+  不需要新名字；只有出现**新的拓扑形状**时才新增一个定义。
+
+名字要**对人可读**：发布用的名字是形状代号（`dt-s3p3v3c64` = 共享 3 块 + 策略塔 3 块 +
+价值塔 3 块 + 64 通道），一眼能估出体量。换宽度本来就是一个新模型、就该有新名字，
+所以"改宽度要改名"不是代价，而是正确行为（ADR 0026 记录命名分层与发布文件名语法）。
+
+**同一份定义可以有多个名字**：正式别名（canonical）与历史 ID（`ALIASES`）。
+历史产物记着旧名字，改不了也不该改，所以旧名字必须继续解析；而**新产物只写 canonical**。
+测试版时期用日期流水号（`20261006001`）当名字，转正后 canonical 换成正式别名、日期号进别名表。
 
 **读到不支持的 ID 就退出**：这是加载闸门的一部分（与 `input_encoding` / `score_scale` /
 `rules_version` 同处判定）。理由与 ADR 0018 的"缺字段必须报错"一致——用一个不认识的定义
@@ -18,7 +23,7 @@ ID 只是给人一眼看出"这是哪一族网络"的名字。这条分界很重
 
 **一个定义模块必须提供**（一版一个模块，见 `docs/adr/0024`）：
 
-1. `VERSION_ID`：唯一版本 ID，写进 metadata，**一旦有产物依赖它就不再改名**；
+1. `VERSION_ID`（正式别名）+ `ALIASES`（历史名字）：名字只用于查表，代码不解析它；
 2. 一个 `nn.Module` 子类，满足 `contract.py` 里的三条约定（超参在签名里、存成同名属性、
    metadata 由 `definition_metadata()` 生成），并且：
    * `forward(encoded) -> (value, logits)`：输入是 `encode_boards` 的输出 `(N, 25, 4, 4)`，
@@ -33,6 +38,7 @@ from torch import nn
 
 from r2048.nn.models.contract import (  # noqa: F401 - 对外转发契约工具
     SCORE_SCALE,
+    WEIGHTS_DTYPE,
     default_params,
     definition_metadata,
     instance_params,
@@ -47,31 +53,46 @@ class UnknownModelDefinition(ValueError):
     """checkpoint 的版本 ID 在本版本里没有对应的定义。"""
 
 
-# ID → 定义类。这张表就是"本版本支持哪些网络定义"的唯一清单：
-# 加一个新版本在这里加一行；改宽度/深度**不需要**动它。
+# canonical 名字 → 定义类。这张表就是"本版本支持哪些网络定义"的唯一清单：
+# 加一个新定义在这里加一行；改宽度/深度**不需要**动它。
 REGISTRY: dict[str, type[nn.Module]] = {
     DualHeadResNet.VERSION_ID: DualHeadResNet,
     DualTowerResNet.VERSION_ID: DualTowerResNet,
 }
+# 别名（旧 ID / 测试版日期号）→ canonical。查表用，不影响任何计算。
+ALIAS_INDEX: dict[str, str] = {}
 
 
 def supported_ids() -> tuple[str, ...]:
+    """canonical 名字（对外展示与索引优先用它们）。"""
     return tuple(REGISTRY)
 
 
-def resolve(version_id: str) -> type[nn.Module]:
-    definition = REGISTRY.get(version_id)
-    if definition is None:
+def known_names() -> dict[str, str]:
+    """别名 → canonical 的全表（给人看"还有哪些旧名字能用"）。"""
+    return dict(ALIAS_INDEX)
+
+
+def canonical_id(name: str) -> str:
+    """把任何被接受的名字（canonical 或别名）规约成 canonical。"""
+    if name in REGISTRY:
+        return name
+    canonical = ALIAS_INDEX.get(name)
+    if canonical is None:
         raise UnknownModelDefinition(
-            f"不认识的模型版本 ID {version_id!r}：本版本支持 {list(supported_ids())}。"
-            "这份权重通常来自更新的代码或另一条分支——要么用产出它的版本加载它，"
-            "要么把那个定义搬进 nn/models/ 并在 REGISTRY 里登记。"
+            f"不认识的模型定义名 {name!r}：本版本支持 {list(supported_ids())}"
+            f"（别名：{sorted(ALIAS_INDEX)}）。这份权重通常来自更新的代码或另一条分支——"
+            "要么用产出它的版本加载它，要么把那个定义搬进 nn/models/ 并在 REGISTRY 里登记。"
         )
-    return definition
+    return canonical
+
+
+def resolve(version_id: str) -> type[nn.Module]:
+    return REGISTRY[canonical_id(version_id)]
 
 
 def build(version_id: str, params: dict | None = None) -> nn.Module:
-    """按 ID 选定义、按参数构造。参数里的未知键直接报错（拼错的名字不该被忽略）。"""
+    """按名字选定义、按参数构造。参数里的未知键直接报错（拼错的名字不该被忽略）。"""
     return resolve(version_id)(**(params or {}))
 
 
@@ -87,10 +108,19 @@ def _check_registry() -> None:
             raise RuntimeError(f"{definition.__name__} 的 VERSION_ID 为空")
         if definition.VERSION_ID != module_id:
             raise RuntimeError(
-                f"{definition.__name__} 的类 ID {definition.VERSION_ID!r} 与模块 ID {module_id!r} 不一致"
+                f"{definition.__name__} 的类名 {definition.VERSION_ID!r} 与模块声明的 {module_id!r} 不一致"
             )
     if len(REGISTRY) != len(pairs):
-        raise RuntimeError(f"REGISTRY 里有重复的版本 ID：{sorted(REGISTRY)}")
+        raise RuntimeError(f"REGISTRY 里有重复的 canonical 名字：{sorted(REGISTRY)}")
+    # 别名必须唯一，且不能与任何 canonical 名字撞车：两个名字指同一份定义是允许的，
+    # 一个名字指两份定义则是灾难（调度会随书写顺序变）。
+    for _module_id, definition in pairs:
+        for alias in definition.ALIASES:
+            if alias in REGISTRY:
+                raise RuntimeError(f"别名 {alias!r} 与 canonical 名字撞车")
+            if ALIAS_INDEX.get(alias, definition.VERSION_ID) != definition.VERSION_ID:
+                raise RuntimeError(f"别名 {alias!r} 同时指向两份定义")
+            ALIAS_INDEX[alias] = definition.VERSION_ID
 
 
 _check_registry()

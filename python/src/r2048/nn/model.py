@@ -26,9 +26,12 @@ from r2048.fileio import save_torch_atomic
 from r2048.nn.encode import INPUT_ENCODING, encode_boards
 from r2048.nn.models import (  # noqa: F401 - 转出注册表 API 与常量，保持既有 import 路径可用
     SCORE_SCALE,
+    WEIGHTS_DTYPE,
     UnknownModelDefinition,
     build,
+    canonical_id,
     default_params,
+    known_names,
     resolve,
     supported_ids,
 )
@@ -63,8 +66,12 @@ def architecture_conflict(version_id: str, params: dict | None, metadata: dict) 
     只有真的不同才算冲突；旧 checkpoint 缺 `head_width`/`groups` 这类字段时补默认值再比。
     """
     stored_version = str(metadata.get("architecture") or "")
-    if version_id and version_id != stored_version:
-        return f"architecture={version_id}（这份权重用的是 {stored_version}）"
+    # 按 canonical 比较：历史产物记的是旧名字（`dual_tower_v1`），而配置里可能写正式别名
+    # （`dt-s3p3v3c64`）——同一份定义的两个名字，不是"改了结构"。只有指向不同定义才算冲突。
+    if version_id and canonical_id(version_id) != canonical_id(stored_version):
+        return (
+            f"architecture={version_id}（这份权重用的是 {stored_version}，即 {canonical_id(stored_version)}）"
+        )
     if not params:
         return None
     definition = resolve(stored_version)
@@ -144,6 +151,16 @@ def load_checkpoint(path: str, device: torch.device) -> tuple[nn.Module, dict[st
     scale = float(metadata.get("score_scale", SCORE_SCALE))
     if abs(scale - float(r2048_core.SCORE_SCALE)) > 1e-6:
         raise ValueError(f"checkpoint 的分数尺度 {scale} 与内核 {r2048_core.SCORE_SCALE} 不一致")
+    # 权重精度：缺失当 float32（历史文件都没这个键），认得出别的值就拒绝。
+    # 不拒的话 `load_state_dict` 会把量化过的权重**静默**转成 float32，于是"这份权重被降过精度"
+    # 这件事在评测里看不出任何痕迹（ADR 0026）。
+    weights_dtype = str(metadata.get("weights_dtype", WEIGHTS_DTYPE))
+    if weights_dtype != WEIGHTS_DTYPE:
+        raise ValueError(
+            f"checkpoint 的权重精度是 {weights_dtype!r}，本版本只会按 {WEIGHTS_DTYPE} 加载："
+            "量化对齐过的权重需要它自己的加载路径（以及一条说明「这份权重与原件不等价」的记录），"
+            "直接转精度加载会让评测结论归到原件名下。"
+        )
 
     model = create_model(metadata)
     model.load_state_dict(payload["model"])

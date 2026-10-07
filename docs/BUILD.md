@@ -186,8 +186,8 @@ ID 只是索引，**架构超参一律从 checkpoint metadata 的 `architecture_
 
 ```yaml
 train:
-  architecture: dual_tower_v1        # 版本 ID：用哪个定义
-  architecture_params:               # 超参：不由 ID 反推，改宽度/深度就是改这里
+  architecture: dt-s3p3v3c64         # 正式别名：用哪个定义（旧名 dual_tower_v1 仍可解析）
+  architecture_params:               # 超参：名字只用于查表，改宽度/深度就是改这里
     channels: 96
     shared_blocks: 2
     tower_blocks: 4
@@ -195,6 +195,13 @@ train:
 
 几条要点：
 
+* **名字分两层**（ADR 0026）：研判期用日期流水号（`20261006001`），转正后给形状代号
+  （`dt-s3p3v3c64` = 共享 3 + 策略塔 3 + 价值塔 3 + 64 通道），正式别名优先用于索引与 metadata。
+  同一份定义的历史名字进 `ALIASES` 继续可解析，**新产物只写正式别名**。
+  发布件命名：`<正式别名>-<发布日期流水号>-s<训练样本数>.pt`，例如
+  `dt-s3p3v3c64-20261007001-s1000000.pt`——**文件名只作展示**，加载靠 metadata。
+* **名字只用于查表**：不解析形状代号、不据它推导结构；`dt-s9p9v9c999` 这种语法正确但
+  未登记的代号会被直接拒绝（测试钉住这条）。
 * **加一个新版本** = 在 `nn/models/` 新增一个模块（类里把每个超参写成同名属性、
   `forward(encoded) -> (value, logits)`）+ 在 `REGISTRY` 加一行；训练、跑谱、评测、评分、
   C++ 都不用动。

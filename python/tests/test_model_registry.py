@@ -124,6 +124,54 @@ def test_registry_self_check_guards_copy_paste() -> None:
     assert len(set(REGISTRY)) == len(REGISTRY) == 2, "两个已发布定义必须都在册且 ID 唯一"
 
 
+def test_names_are_only_lookup_keys(tmp_path: Path) -> None:
+    """名字只用于查表：**不解析、不据它推导结构**（这是 ADR 0026 的硬线）。
+
+    判据取"形状代号长得再像结构也不认"：`dt-s9p9v9c999` 是一个语法完全正确的代号，
+    但注册表里没有这份定义 → 必须报错。反过来，只要有定义，任何名字（含测试版日期号、
+    旧 ID、正式别名）都指向同一份定义。
+    """
+    from r2048.nn.models import canonical_id, known_names, resolve
+
+    with pytest.raises(UnknownModelDefinition):
+        create_model({"architecture": "dt-s9p9v9c999"})
+
+    for alias, canonical in known_names().items():
+        assert canonical_id(alias) == canonical
+        assert resolve(alias) is resolve(canonical), "同一份定义的所有名字必须指向同一个类"
+    assert "20261006001" in known_names(), "测试版日期号必须能被解析（研判期的产物记着它）"
+    assert set(supported_ids()) == {"sh-s6c64", "dt-s3p3v3c64"}
+
+    # 新产物写 canonical；旧名字只是能读，不会被写回去。
+    model = build(known_names()["dual_tower_v1"], {"channels": 32})
+    assert model.metadata("m")["architecture"] == "dt-s3p3v3c64"
+
+
+def test_weights_dtype_is_recorded_and_other_values_refused(tmp_path: Path) -> None:
+    """权重精度现在就记下来（`float32`），且**认得出别的值就拒绝**。
+
+    理由：`load_state_dict` 会把量化过的权重静默转成 float32，于是"这份权重被降过精度"
+    在评测里留不下任何痕迹。记录字段是唯一能事后判断的凭据，所以它现在就要写；
+    而拒收别的值保证加载侧不会把量化权重当成原件（ADR 0025/0026）。
+    """
+    weights_dtype = build(SHARED_ARCHITECTURE).metadata("m")["weights_dtype"]
+    assert weights_dtype == "float32"
+
+    path = tmp_path / "quantized.pt"
+    model = build(SHARED_ARCHITECTURE)
+    metadata = model.metadata("m")
+    metadata["weights_dtype"] = "int8-g128"  # 未来量化对齐版本会这么写
+    torch.save({"checkpoint_version": 1, "model": model.state_dict(), "metadata": metadata}, path)
+    with pytest.raises(ValueError, match="int8-g128"):
+        load_checkpoint(str(path), torch.device("cpu"))
+
+    # 历史文件没有这个键：按 float32 处理，而不是拒绝。
+    legacy = model.metadata("m")
+    legacy.pop("weights_dtype")
+    torch.save({"checkpoint_version": 1, "model": model.state_dict(), "metadata": legacy}, path)
+    load_checkpoint(str(path), torch.device("cpu"))
+
+
 def test_architecture_conflict_is_precise() -> None:
     """从 checkpoint 初始化时的结构检查：只拦**真的不同**的，同一条线的配置照常带上。
 
@@ -150,6 +198,14 @@ def test_architecture_conflict_is_precise() -> None:
     legacy["architecture_params"] = {"channels": 64, "blocks": 6}
     assert architecture_conflict("", {"channels": 64, "blocks": 6}, legacy) is None
     assert architecture_conflict("", {"head_width": 128}, legacy) is not None
+
+    # 同一份定义的两个名字（历史产物记旧名、配置里写正式别名）不是冲突——这是改名之后
+    # 最容易误报的一处：字符串不同但指向同一个类。
+    from r2048.nn.models import known_names
+
+    old_name = next(name for name, canonical in known_names().items() if canonical == SHARED_ARCHITECTURE)
+    assert architecture_conflict(SHARED_ARCHITECTURE, {}, {"architecture": old_name}) is None
+    assert architecture_conflict(old_name, {}, {"architecture": SHARED_ARCHITECTURE}) is None
 
 
 def test_architecture_params_reach_the_model_from_config(tmp_path: Path) -> None:

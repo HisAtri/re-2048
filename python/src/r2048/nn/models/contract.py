@@ -22,6 +22,12 @@ from r2048.nn.encode import INPUT_ENCODING
 # 与 cpp/core/version.h 的 kScoreScale 同源：写进 metadata 并在加载时校验。
 SCORE_SCALE = 1024.0
 
+# 权重在文件里的精度。**现在就记下来**（不是等用到才加）：一旦出现量化对齐过的产物，
+# "这份权重是不是被降精度过"只能靠记录判断，而事后补记对已有文件是不可能的（ADR 0026）。
+# 目前恒为 float32；加载侧把缺失当 float32（历史文件全都没这个键），
+# 但**认得出别的值就拒绝**——`load_state_dict` 会静默转换 dtype，静默比报错贵得多。
+WEIGHTS_DTYPE = "float32"
+
 
 def default_params(definition: type[nn.Module]) -> dict[str, Any]:
     """从 `__init__` 签名读超参默认值：超参只在签名里写一次，metadata 与重建都从这里来。"""
@@ -51,6 +57,7 @@ def definition_metadata(module: nn.Module, version_id: str, model_id: str, paren
     return {
         "architecture": version_id,
         "architecture_params": instance_params(module),
+        "weights_dtype": WEIGHTS_DTYPE,
         "input_encoding": INPUT_ENCODING,
         "score_scale": SCORE_SCALE,
         "model_id": model_id,

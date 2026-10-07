@@ -1,4 +1,4 @@
-"""版本 `dual_tower_v1`：浅层共享 + 每个头各一座塔。
+"""定义 `dt-s3p3v3c64`（浅层共享 s3 + 策略塔 p3 + 价值塔 v3，宽度 c64）：每个头各一座塔。
 
 旧版同数据同配方的对照里它以配对差 +5,367 分（95% CI [+3,560, +7,186]）胜出，
 到达 4096 的局数 103/400 vs 41/400，代价在 batch 128 上只有 1.07–1.14×（ADR 0012）。
@@ -22,11 +22,17 @@ from r2048.nn.encode import INPUT_CHANNELS
 from r2048.nn.models.blocks import ResidualBlock, check_groups
 from r2048.nn.models.contract import definition_metadata
 
-VERSION_ID = "dual_tower_v1"
+# 正式版别名：形状代号，人一眼能看出体量（s 共享块 / p 策略塔 / v 价值塔 / c 通道）。
+# **它只是名字**：代码不解析它、也不据此推导结构（结构只在 architecture_params 里，ADR 0026）。
+VERSION_ID = "dt-s3p3v3c64"
+# 同一份定义的历史名字：20 个既有 checkpoint 记着 `dual_tower_v1`，测试版时期用过日期流水号。
+# 别名只影响"按名字找定义"，故列出即可；**新产物只写 VERSION_ID**。
+ALIASES = ("dual_tower_v1", "20261006001")
 
 
 class DualTowerResNet(nn.Module):
     VERSION_ID = VERSION_ID
+    ALIASES = ALIASES
 
     def __init__(
         self,

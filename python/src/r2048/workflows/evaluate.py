@@ -51,6 +51,7 @@ class EvalConfig:
     in_flight: int = 4
     c_puct: float = 1.5
     cache_entries: int = 1 << 17
+    search_threads: int = 1  # 见 SelfplayConfig：会改变调度 → 协议参数
     max_batch: int = 8192
     device: str = "cuda"
     label: str = ""
@@ -146,6 +147,7 @@ def build_eval_protocol(config: EvalConfig, lanes: int, device: torch.device, mo
             "in_flight": config.in_flight,
             "max_batch": config.max_batch,
             "cache_entries": config.cache_entries,
+            "search_threads": config.search_threads,
             "device": device.type,
         }
     )
@@ -187,6 +189,7 @@ def run_evaluation(config: EvalConfig) -> EvalResult:
         "temperature": 0.0,  # 评测必须确定性选招，不引入采样噪声
         "temperature_moves": 0,
         "cache_entries": config.cache_entries,
+        "search_threads": config.search_threads,
         "score_scale": float(r2048_core.SCORE_SCALE),
         "seed": config.seed,
         "decision_mode": TRACKS[config.track],

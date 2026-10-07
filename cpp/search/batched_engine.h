@@ -37,6 +37,10 @@ struct EngineConfig {
     float c_puct = 1.5f;             // PUCT 探索系数
     uint32_t temperature_moves = 30; // 开局多少步按访问分布采样
     float temperature = 1.0f;        // 访问数开 1/T 次幂后采样；0 表示直接取最大
+    // `advance` 里推进 lane 用的线程数。**默认 1 = 与并行化之前完全一致**：lane 的处理
+    // 顺序、每批请求的组成都不变，所以旧数据、既有对照都不受影响。>1 时按 lane 分块并行，
+    // 批组成会随调度变化（ADR 0017 的批组成依赖），因此它是一个协议参数。
+    uint32_t search_threads = 1;
     uint32_t cache_entries = 1 << 17;  // 推理缓存条目数（开放寻址表容量）
     float score_scale = kScoreScale;
     uint64_t seed = 0;

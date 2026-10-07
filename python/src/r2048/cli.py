@@ -112,6 +112,7 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--in-flight", type=int, default=4)
     evaluate.add_argument("--c-puct", type=float, default=1.5)
     evaluate.add_argument("--cache-entries", type=int, default=1 << 17)
+    evaluate.add_argument("--search-threads", type=int, default=1, help="推进 lane 的线程数")
     evaluate.add_argument("--max-batch", type=int, default=8192)
     evaluate.add_argument("--device", default="cuda")
     evaluate.add_argument("--label", default="")
@@ -170,6 +171,12 @@ def _build_parser() -> argparse.ArgumentParser:
     selfplay.add_argument("--temperature", type=float, default=1.0)
     selfplay.add_argument("--temperature-moves", type=int, default=30)
     selfplay.add_argument("--cache-entries", type=int, default=1 << 17)
+    selfplay.add_argument(
+        "--search-threads",
+        type=int,
+        default=1,
+        help="推进 lane 的线程数（1 = 单线程；>1 会改变调度，属协议参数）",
+    )
     selfplay.add_argument("--shard-samples", type=int, default=100000)
     selfplay.add_argument("--max-batch", type=int, default=16384)
     selfplay.add_argument("--device", default="cuda", help="cuda / cpu（默认 cuda）")
@@ -226,6 +233,7 @@ def _build_parser() -> argparse.ArgumentParser:
     iterate.add_argument("--simulations", type=int, default=64, help="跑谱/评测共用的模拟数")
     iterate.add_argument("--lanes", type=int, default=64)
     iterate.add_argument("--in-flight", type=int, default=8)
+    iterate.add_argument("--search-threads", type=int, default=1, help="推进 lane 的线程数（协议参数）")
     iterate.add_argument("--c-puct", type=float, default=1.5)
     iterate.add_argument("--device", default="cuda")
     iterate.add_argument("--eval-games", type=int, default=400)
@@ -312,6 +320,7 @@ def _command_eval(args: argparse.Namespace) -> int:
         in_flight=args.in_flight,
         c_puct=args.c_puct,
         cache_entries=args.cache_entries,
+        search_threads=args.search_threads,
         max_batch=args.max_batch,
         device=args.device,
         label=args.label,
@@ -541,6 +550,7 @@ def _command_selfplay(args: argparse.Namespace) -> int:
         temperature=args.temperature,
         temperature_moves=args.temperature_moves,
         cache_entries=args.cache_entries,
+        search_threads=args.search_threads,
         shard_samples=args.shard_samples,
         max_batch=args.max_batch,
         control_path=args.control or "",
@@ -622,6 +632,7 @@ def _command_iterate(args: argparse.Namespace) -> int:
         simulations=args.simulations,
         lanes=args.lanes,
         in_flight=args.in_flight,
+        search_threads=args.search_threads,
         c_puct=args.c_puct,
         device=args.device,
         eval_games=args.eval_games,

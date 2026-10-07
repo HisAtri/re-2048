@@ -63,6 +63,7 @@ class IterateConfig:
     simulations: int = 64
     lanes: int = 64
     in_flight: int = 8
+    search_threads: int = 1
     c_puct: float = 1.5
     device: str = "cuda"
     eval_games: int = 400
@@ -156,6 +157,7 @@ def _step_selfplay(config: IterateConfig, written: dict, job: JobDir) -> dict:
                 simulations=config.simulations,
                 lanes=config.lanes,
                 in_flight_per_lane=config.in_flight,
+                search_threads=config.search_threads,
                 c_puct=config.c_puct,
             ),
             model,
@@ -301,6 +303,7 @@ def _step_evaluate(config: IterateConfig, written: dict, job: JobDir) -> dict:
                 simulations=config.simulations,
                 lanes=config.lanes,
                 in_flight=config.in_flight,
+                search_threads=config.search_threads,
                 c_puct=config.c_puct,
                 device=config.device,
                 label=label,
@@ -368,6 +371,7 @@ def _protocol(config: IterateConfig) -> dict:
         "simulations": config.simulations,
         "lanes": config.lanes,
         "in_flight_per_lane": config.in_flight,
+        "search_threads": config.search_threads,
         "c_puct": config.c_puct,
         "device": config.device,
         "games": config.eval_games,

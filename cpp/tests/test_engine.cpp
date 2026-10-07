@@ -231,6 +231,50 @@ TEST(engine_advance_waits_when_budget_is_full) {
     engine.finish();
 }
 
+TEST(engine_parallel_search_threads_keep_invariants) {
+    // 多线程推进 lane 时必须守住的不变量：请求数守恒（一条都不能丢、不能重复回填）、
+    // 样本数恰好等于目标、局号连续。**不要求逐字节相同**——lane 的处理顺序会变，
+    // 请求因此被分进不同的前向批次，而批组成本来就会改变叶值（ADR 0017）。
+    TempDir dir("threads");
+    EngineConfig config;
+    config.lanes = 16;
+    config.simulations = 8;
+    config.in_flight_per_lane = 4;
+    config.search_threads = 4;
+    config.cache_entries = 1 << 12;
+    config.seed = 31337;
+
+    BatchedEngine engine(config, dir.sub("batch"), "threads-test", "synthetic", 4000, 1000);
+    uint64_t rounds = 0;
+    bool done = false;
+    while (rounds < 200000 && !done) {
+        rounds++;
+        const BatchedEngine::Advance advance = engine.advance(4096);
+        if (!advance.request_ids.empty()) {
+            std::vector<float> values(advance.request_ids.size(), 0.0f);
+            std::vector<float> logits(advance.request_ids.size() * kNumActions, 0.0f);
+            engine.submit(advance.request_ids.data(), values.data(), logits.data(),
+                          advance.request_ids.size());
+        } else if (advance.done) {
+            done = true;
+        }
+    }
+    expect_true(done, "多线程推进也必须能跑到收尾");
+    const EngineStats stats = engine.stats();
+    expect_equal_u64(stats.requests_issued, stats.requests_submitted, "请求数必须守恒（线程不丢不重）");
+    engine.finish();
+    const BatchManifest manifest = read_manifest(dir.sub("batch"));
+    expect_equal_u64(manifest.samples, 4000, "样本数仍然恰好等于目标");
+    expect_true(manifest.episodes > 0, "必须真的产出局（局号连续性由写入侧的检查保证）");
+    // 协议参数里必须记下线程数：它改变调度，因此和 lanes / in_flight 一样进清单。
+    std::string recorded;
+    for (const auto& entry : manifest.meta.params) {
+        if (entry.first == "search_threads") recorded = entry.second;
+    }
+    expect_true(!recorded.empty(), "清单里必须记录 search_threads（它改变调度，属协议参数）");
+    expect_true(recorded == "4", "记录的线程数必须与实际一致");
+}
+
 TEST(engine_greedy_modes_skip_search_and_report_outcomes) {
     // 评测模式：关闭样本收集、按局数停止，并且每局结束都回报结果。
     // 合成结果（价值恒 0、logits 恒 0）让三种模式的行为可以精确推断。

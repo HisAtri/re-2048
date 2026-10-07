@@ -159,6 +159,7 @@ SOURCE_KEY_PARAMS = (
     "cache_entries",
     "max_batch",
     "device",
+    "search_threads",
 )
 
 

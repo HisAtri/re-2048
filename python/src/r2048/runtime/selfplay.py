@@ -53,6 +53,9 @@ class SelfplayConfig:
     cache_entries: int = 1 << 17
     shard_samples: int = 100000
     max_batch: int = 16384
+    # 推进 lane 的线程数（1 = 与并行化之前完全一致）。>1 会改变 lane 的处理顺序 →
+    # 改变每批请求的组成 → 改变逐局结果，因此它是协议参数（进清单、进来源身份，ADR 0027）。
+    search_threads: int = 1
     progress_every: float = 0.5
     # 控制文件路径；空则用 <数据批目录>/control。内容是 pause 或 stop，一次性消费。
     control_path: str = ""
@@ -127,6 +130,7 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
         "temperature": config.temperature,
         "temperature_moves": config.temperature_moves,
         "cache_entries": config.cache_entries,
+        "search_threads": config.search_threads,
         "score_scale": float(r2048_core.SCORE_SCALE),
         "seed": config.seed,
         "control_path": config.control_path or str(Path(config.data_dir) / "control"),

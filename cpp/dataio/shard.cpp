@@ -48,6 +48,9 @@ const std::string* find_param(const std::vector<std::pair<std::string, std::stri
 // 它们只是“当时是怎么敲的命令行”的记录。
 const char* const kProtocolParams[] = {
     "c_puct", "lanes", "in_flight_per_lane", "temperature", "cache_entries", "max_batch", "device",
+    // 搜索线程数会改变 lane 的调度顺序 → 改变每批请求的组成 → 改变逐局结果（ADR 0017），
+    // 所以和 lanes / in_flight 一样属于协议参数，进清单、也进数据来源身份（ADR 0021）。
+    "search_threads",
 };
 
 void compare_protocol_params(const BatchMeta& existing, const BatchMeta& requested) {

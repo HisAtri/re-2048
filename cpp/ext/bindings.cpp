@@ -48,6 +48,7 @@ r2048::EngineConfig engine_config_from_dict(const py::dict& dict) {
     config.lanes = get_uint("lanes", config.lanes);
     config.simulations = get_uint("simulations", config.simulations);
     config.in_flight_per_lane = get_uint("in_flight_per_lane", config.in_flight_per_lane);
+    config.search_threads = get_uint("search_threads", config.search_threads);
     config.c_puct = get_float("c_puct", config.c_puct);
     config.temperature_moves = get_uint("temperature_moves", config.temperature_moves);
     config.temperature = get_float("temperature", config.temperature);

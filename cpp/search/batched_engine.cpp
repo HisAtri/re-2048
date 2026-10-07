@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 
 #include "core/control.h"
 #include "core/fileio.h"
@@ -134,6 +135,7 @@ struct BatchedEngine::Impl {
         meta.params.emplace_back("c_puct", std::to_string(config.c_puct));
         meta.params.emplace_back("lanes", std::to_string(config.lanes));
         meta.params.emplace_back("in_flight_per_lane", std::to_string(config.in_flight_per_lane));
+        meta.params.emplace_back("search_threads", std::to_string(config.search_threads));
         meta.params.emplace_back("temperature", std::to_string(config.temperature));
         meta.params.emplace_back("cache_entries", std::to_string(config.cache_entries));
         // Python 侧透传的产出环境参数（device / max_batch）：它们同样改变逐局结果。
@@ -336,6 +338,13 @@ struct BatchedEngine::Impl {
     // 否则 pump（cache → bookkeeping）与 submit（bookkeeping → cache）会构成死锁环，
     // 表现为整个引擎随机卡死。
     void issue_requests(Lane& lane, uint32_t lane_index, uint32_t node_index) {
+        // 硬闸：本轮请求预算已满就不再发。并行推进时多条 lane 会同时想发请求，
+        // 只靠循环外的检查会让批次超出 max_requests——批大小成了线程数的函数，
+        // 而它是会进协议、进数据来源身份的东西，不能随线程数漂移。
+        {
+            std::lock_guard<std::mutex> lock(bookkeeping_mutex);
+            if (requests.size() + in_flight.size() >= request_limit) return;
+        }
         const uint8_t kind = lane.nodes[node_index].kind;
         const uint8_t mask = lane.nodes[node_index].legal_mask;
 
@@ -765,11 +774,47 @@ struct BatchedEngine::Impl {
     }
 
     void pump_all(uint32_t max_requests) {
+        std::atomic<bool> progressed_flag{false};
+        const uint32_t threads = std::max(
+            1u, std::min<uint32_t>(config.search_threads, static_cast<uint32_t>(lanes.size())));
         for (int round = 0; round < kMaxPumpRounds; round++) {
+            progressed_flag.store(false);
+            if (threads <= 1) {
+                pump_lane_range(0, lanes.size(), max_requests, progressed_flag);
+            } else {
+                // 按 lane 分块并行。**批大小与线程数无关**：每条 lane 的在途预算由
+                // in_flight_per_lane 决定，谁先被处理都不会多发一条请求；变的只是请求的
+                // 排列顺序，也就是它们被分到哪一批前向里（批组成依赖，见 ADR 0017）。
+                // 线程按轮创建：一轮是个位数毫秒，创建几个线程的开销可忽略，
+                // 换来的是不用维护线程池与它的生命周期。
+                const size_t chunk = (lanes.size() + threads - 1) / threads;
+                std::vector<std::thread> pool;
+                pool.reserve(threads - 1);
+                for (uint32_t worker = 1; worker < threads; worker++) {
+                    const size_t begin = std::min(lanes.size(), static_cast<size_t>(worker) * chunk);
+                    const size_t stop = std::min(lanes.size(), begin + chunk);
+                    if (begin >= stop) break;
+                    pool.emplace_back([this, begin, stop, max_requests, &progressed_flag] {
+                        pump_lane_range(begin, stop, max_requests, progressed_flag);
+                    });
+                }
+                pump_lane_range(0, std::min(lanes.size(), chunk), max_requests, progressed_flag);
+                for (std::thread& worker : pool) worker.join();
+            }
+            if (pending_request_count() >= max_requests) break;
+            if (!progressed_flag.load()) break;
+        }
+    }
+
+    // 推进 [begin, stop) 这段 lane。**这是唯一被并行化的地方**：lane 之间互相独立
+    // （各自的树与搜索状态），共享的只有叶子缓存、请求队列与统计计数，它们在上面这些
+    // 访问点上都已在锁或原子之下。
+    void pump_lane_range(size_t begin, size_t stop, uint32_t max_requests,
+                         std::atomic<bool>& progressed_flag) {
+        for (size_t lane_index = begin; lane_index < stop; lane_index++) {
+            Lane& lane = lanes[lane_index];
+            if (lane.finished) continue;
             bool progressed = false;
-            for (uint32_t lane_index = 0; lane_index < lanes.size(); lane_index++) {
-                Lane& lane = lanes[lane_index];
-                if (lane.finished) continue;
                 while (!lane.finished) {
                     if (lane.needs_new_episode) {
                         // 换局处才是合法的停车点：目标达成后不再开新局，
@@ -826,9 +871,8 @@ struct BatchedEngine::Impl {
                     start_simulation(lane, lane_index);
                     progressed = true;
                 }
-            }
-            if (pending_request_count() >= max_requests) break;
-            if (!progressed) break;
+            if (progressed) progressed_flag.store(true);
+            if (pending_request_count() >= max_requests) break;  // 预算用完就停手（与线程数无关）
         }
     }
 
@@ -885,6 +929,7 @@ struct BatchedEngine::Impl {
     std::map<uint32_t, std::vector<Sample>> completed;
     std::vector<EpisodeResult> finished_outcomes;  // 待回传给 Python 的已结束局
     uint64_t next_request_id = 1;
+    uint64_t request_limit = 0;  // 本轮 advance 的请求预算上限（见 issue_requests 的硬闸）
     uint64_t samples_produced = 0;
     std::atomic<bool> stop_all{false};
     Control control;
@@ -921,6 +966,10 @@ BatchedEngine::Advance BatchedEngine::advance(uint32_t max_requests) {
     Impl& impl = *impl_;
     Advance out;
     if (max_requests == 0) throw std::runtime_error("max_requests 必须大于 0");
+    {
+        std::lock_guard<std::mutex> lock(impl.bookkeeping_mutex);
+        impl.request_limit = max_requests;
+    }
     {
         // 上一轮回填的答案到这里为止：还没被用掉的需求会被补发，因此丢弃是安全的。
         std::lock_guard<std::mutex> lock(impl.cache_mutex);

@@ -46,6 +46,7 @@ from r2048.nn.encode import BOARD_CELLS, encode_boards
 from r2048.nn.model import (
     DUAL_TOWER_ARCHITECTURE,
     SHARED_ARCHITECTURE,
+    architecture_conflict,
     create_model,
     freeze_value_path,
 )
@@ -81,7 +82,10 @@ class TrainConfig:
     output: str = ""
     mode: str = "value"
     init_checkpoint: str = ""
+    # 版本 ID（= 用哪个网络定义）。超参走 architecture_params，**不由 ID 反推**（ADR 0024）：
+    # 于是"改宽度/改深度"是改这里的数字，ID 只在出现新拓扑形状时才新增。
     architecture: str = ""
+    architecture_params: dict = field(default_factory=dict)
     freeze_value: bool = False
     epochs: int = 20
     batch_size: int = 4096
@@ -655,11 +659,23 @@ def run_training(config: TrainConfig) -> TrainResult:
     if config.init_checkpoint:
         source = torch.load(config.init_checkpoint, map_location="cpu", weights_only=False)
         source_metadata = dict(source.get("metadata", {}))
+        # 从 checkpoint 初始化时，结构由这份权重自己决定：请求里如果写了**不同的**架构或超参，
+        # 它们会被静默忽略（"我明明改了宽度"是最难查的一类困惑），所以直接拒绝。
+        # 与 checkpoint 完全一致的写法是允许的——同一条训练线的 YAML 会被反复带上。
+        conflict = architecture_conflict(config.architecture, config.architecture_params, source_metadata)
+        if conflict is not None:
+            raise ValueError(
+                f"从 checkpoint 初始化时不能改结构：{conflict}。"
+                f"这份权重是 {source_metadata.get('architecture')} / "
+                f"{source_metadata.get('architecture_params')}；要换结构就新起一条训练线。"
+            )
         model = create_model(source_metadata)
         model.load_state_dict(source["model"])
     else:
         architecture = config.architecture or default_architecture(config.mode)
-        model = create_model({"architecture": architecture})
+        model = create_model(
+            {"architecture": architecture, "architecture_params": config.architecture_params}
+        )
     model = model.to(device)
     if config.channels_last:
         model = model.to(memory_format=torch.channels_last)

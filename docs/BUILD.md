@@ -179,6 +179,34 @@ make py ARGS="train --config train.yaml --data $R2048_OUTPUT_DIR/data/new --outp
 * 训练日志逐来源报出训练/验证局数；`train.json` 与 checkpoint 元数据逐来源记身份与权重；
   **验证集为空直接报错**（除非显式 `val_fraction=0`）。
 
+### 换模型结构
+
+模型定义一版一个模块（`python/src/r2048/nn/models/`），注册表把**版本 ID → 定义**一一映射；
+ID 只是索引，**架构超参一律从 checkpoint metadata 的 `architecture_params` 读**（ADR 0024）：
+
+```yaml
+train:
+  architecture: dual_tower_v1        # 版本 ID：用哪个定义
+  architecture_params:               # 超参：不由 ID 反推，改宽度/深度就是改这里
+    channels: 96
+    shared_blocks: 2
+    tower_blocks: 4
+```
+
+几条要点：
+
+* **加一个新版本** = 在 `nn/models/` 新增一个模块（类里把每个超参写成同名属性、
+  `forward(encoded) -> (value, logits)`）+ 在 `REGISTRY` 加一行；训练、跑谱、评测、评分、
+  C++ 都不用动。
+* **位置编码、注意力、塔的非对称都在定义内部实现**，外部传参不变（输入仍是
+  `encode_boards` 的输出，输出仍是双头）。
+* **已发布的定义不能改语义**（改形状/改归一化会让旧权重"加载成功但不再等价"）：要不同语义
+  就新增一个 ID。现有两个 ID 已被 20 个 checkpoint 记住，只增不改。
+* **不认识的 ID 直接拒绝**（消息里列出本版本支持的定义），缺失 ID 同样拒绝——用一个不认识的
+  定义去解释权重，最坏情况是形状碰巧装上、结果安静地错。
+* **换结构 = 换一条训练线**：`--init-checkpoint` 的权重决定结构，因此不能再同时指定架构或
+  超参（会被拒绝，而不是静默忽略）。
+
 ### 训练断点续跑
 
 训练默认每约 10 分钟（或每 `--save-every-steps N` 步）在运行目录里原子写一次 `last.pt`，

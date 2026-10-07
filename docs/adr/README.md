@@ -29,6 +29,7 @@ ADR 解释为什么整体是这个形状。
 | [0021](0021-multi-source-identity-and-training-config.md) | 多来源数据身份与训练配置（YAML） | 已采纳 |
 | [0022](0022-training-resume-checkpoints.md) | 训练断点续跑（批级 checkpoint 与随机数状态） | 已采纳 |
 | [0023](0023-iteration-orchestration.md) | 迭代编排（薄驱动、步骤标记与半模型合并） | 已采纳 |
+| [0024](0024-model-definition-registry.md) | 模型定义的注册表与版本 ID | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

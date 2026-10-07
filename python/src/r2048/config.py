@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import fields
+from dataclasses import MISSING, fields
 from pathlib import Path
 
 import yaml
@@ -119,6 +119,15 @@ def train_section_payload(path: str | Path, section: dict) -> dict:
             # 数据集有专门的小节（要写权重与上限），写在 train 里只会被当成原始 dict 传下去。
             raise ValueError(f"{path}: 数据集请写在顶层 {DATASETS_SECTION} 小节，不要放在 {TRAIN_SECTION} 里")
         default = field.default
+        if default is MISSING:
+            # 有 default_factory 的字段（即 dict/list：architecture_params）。容器类型在这里
+            # 挡一下，内容交给构造函数——TrainConfig 会逐个关键字校验，未知键会直接报错。
+            if not isinstance(value, (dict, list)):
+                raise TypeError(
+                    f"{path} 的 {field.name} 应当是映射或列表，收到 {type(value).__name__} {value!r}"
+                )
+            payload[field.name] = value
+            continue
         if default is None:  # 运行期字段（回调），已由 check_train_section 拦下
             continue
         if isinstance(value, bool) and type(default) is not bool:

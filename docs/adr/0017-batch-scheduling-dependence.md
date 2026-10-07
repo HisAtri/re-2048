@@ -68,6 +68,11 @@ ADR 0016 决策 5 记录了一个实测：NN 路径下只改 `lanes` 就得到�
    * `in_flight_per_lane` 与 `max_batch`：前者已由本 ADR 直接证明；后者同时改变前向批大小
      （数值通道）与泵循环的截断（调度通道），两条通道都在，所以必须进协议。
    仍在协议外：`eval_seed`、`games`、纯 C++ 线的 `workers`（无浮点、无在途，3 与 16 线程逐字节一致）。
+   **已实施**（[ADR 0018](0018-protocol-variable-registry.md)）：清单落到 `r2048.protocol`，
+   逐局记录平铺声明这 13 项，评分侧按同一份清单校验并哈希；缺字段拒收，
+   `null` 表示“该策略没有这个变量”。纯 C++ 线因此只声明
+   `track / rules_version / protocol_version / simulations / temperature_moves`，
+   其余为 `null`，而不是给它们填 0。
 
 3. **在途流水线有实质的强度代价，且不是记账损失。**
    `s32`、`lanes 8`、`seed 20262053`、64 局：

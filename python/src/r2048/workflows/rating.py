@@ -11,17 +11,21 @@
 
 评分 = 1000 + 230 × (模型的对数均值 − 锚点的对数均值)，锚点按 track 固定。
 没有锚点的 track 不产出评分：宁可缺，也不要给没有尺度的数字。
+
+“同一 track 才可比”这一条由**协议变量**落实：清单与校验在 `r2048.protocol`，
+本模块只负责按 (track, protocol_hash) 分组。分组不是判“能不能比”，而是判
+“比的是同一件事”：曲线上的每个模拟数都是不同的协议，它们都放在同一个锚点的尺子上。
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+from r2048.protocol import build_protocol, protocol_diff, protocol_hash
 
 # 分数下界保护：理论上单局至少发生一次合并，+1 只是避免 score=0 的极端局把 log 拉到负无穷。
 SCORE_EPSILON = 1.0
@@ -35,29 +39,22 @@ Z95 = 1.96
 #   search ：同一次模拟预算下的搜索（锚点 = 纯 MCTS-rollout）
 TRACKS = ("pure", "search")
 
+# 哪些策略属于搜索线。这是从策略名到评分线的映射表，不是猜测：
+# 旧实现靠 `row.get("policy") == "mcts"` 推断，而 C++ 评测那时根本不写 track，
+# 推断错一次就会把纯 MCTS 的基准锚点从搜索线上挪走。
+SEARCH_TRACKS = frozenset({"mcts", "nn_mcts"})
+
+# 锚点文件格式版本。v2 起记录锚点自身的协议本体（v1 只有哈希，读不懂尺子是什么）。
+ANCHORS_SCHEMA_VERSION = 2
+
 
 def score_to_log(score: float) -> float:
     return math.log2(float(score) + SCORE_EPSILON)
 
 
-def protocol_hash(protocol: dict) -> str:
-    payload = json.dumps(protocol, sort_keys=True, ensure_ascii=False).encode()
-    return hashlib.sha256(payload).hexdigest()[:16]
-
-
-def track_of(row: dict) -> str:
-    """把每次评测归到评分线上。
-
-    pure   ：单次前向、无搜索（纯价值贪心 / 纯策略 / 随机策略）
-    search ：同一次模拟预算下的搜索（NN 引导搜索 / 纯 MCTS-rollout）
-
-    C++ 评测写出的记录没有 track 字段，只有 policy ∈ {random, mcts}，因此需要推断：
-    把纯 MCTS 误归到 pure 会让“搜索强度”这条线上少掉基准锚点。
-    """
-    track = row.get("track")
-    if track:
-        return "search" if track == "nn_mcts" else "pure"
-    return "search" if row.get("policy") == "mcts" else "pure"
+def track_of(protocol: dict) -> str:
+    """按协议里声明的策略归到评分线上。"""
+    return "search" if protocol["track"] in SEARCH_TRACKS else "pure"
 
 
 def normalize_row(row: dict) -> dict:
@@ -65,24 +62,25 @@ def normalize_row(row: dict) -> dict:
 
     做这一层是为了让评分模块与评测模块的字段命名解耦：评测关心“这局怎么打的”，
     评分关心“这局值多少分、属于哪条协议”。
+
+    协议变量由 `r2048.protocol` 统一校验：缺字段会在这里失败，而不是被默认值填上。
     """
+    protocol = build_protocol(row)
     # 评分身份用 label：同一个 checkpoint 可能被以不同协议评测多次，
     # 而 label 是那次评测的命名（C++ 评测没有 model_id，只有 label）。
     identity = str(row.get("label") or row.get("model_id") or "unknown")
     return {
         "model_id": identity,
         "checkpoint_model_id": str(row.get("model_id", "")),
-        "track": track_of(row),
-        "source_track": str(row.get("track", "")),
-        "protocol_hash": protocol_hash(
-            {
-                "track": track_of(row),
-                "rules_version": int(row.get("rules_version", 1)),
-                "simulations": int(row.get("simulations", 0)) if track_of(row) == "search" else 0,
-                "eval_seed": int(row.get("seed", 0)),
-            }
-        ),
-        "eval_seed": int(row.get("seed", 0)),
+        "track": track_of(protocol),
+        "source_track": protocol["track"],
+        # 协议本体与它的哈希一起落盘：只有哈希的池子读不懂，也无法事后解释
+        # “这两个 16 进制串为什么不同”。
+        "protocol": protocol,
+        "protocol_hash": protocol_hash(protocol),
+        # eval_seed 不进协议（协议是“怎么测的”，seed 是“测了哪几局”），
+        # 但它是去重键的一部分：同一协议下不同 seed 的局不能算重复。
+        "eval_seed": int(row["seed"]),
         "episode_id": int(row["episode"]),
         "score": int(row["score"]),
         "max_exp": int(row.get("max_exponent", 0)),
@@ -160,21 +158,41 @@ def tile_reach_per_10k(rows: list[dict], exponents: tuple[int, ...] = (11, 12, 1
 def load_anchors(path: str | Path) -> dict:
     path = Path(path)
     if not path.exists():
-        return {"schema_version": 1, "tracks": {}}
-    return json.loads(path.read_text(encoding="utf-8"))
+        return {"schema_version": ANCHORS_SCHEMA_VERSION, "tracks": {}}
+    anchors = json.loads(path.read_text(encoding="utf-8"))
+    if int(anchors.get("schema_version", 0)) != ANCHORS_SCHEMA_VERSION:
+        raise ValueError(
+            f"锚点文件 {path} 的 schema_version={anchors.get('schema_version')}，"
+            f"本实现要求 {ANCHORS_SCHEMA_VERSION}（旧版锚点没有记录协议本体，"
+            "无法判断它固定的尺子是什么，只能重定锚点）"
+        )
+    return anchors
 
 
 def save_anchors(path: str | Path, rows: list[dict], spec: dict[str, str]) -> dict:
-    """按 track 指定锚点模型并落盘。锚点必须在同一 track 的同一协议下评测过。"""
-    anchors = {"schema_version": 1, "tracks": {}}
+    """按 track 指定锚点模型并落盘。锚点必须在同一 track 的同一协议下评测过。
+
+    锚点就是“尺子”：它固定下来的协议是往后所有对比的量纲。所以这里要求锚点的
+    所有记录协议完全一致——一个锚点混了两个协议，等于一把尺子有两个刻度。
+    """
+    anchors = {"schema_version": ANCHORS_SCHEMA_VERSION, "tracks": {}}
     for track, model_id in spec.items():
         matched = [row for row in rows if row["track"] == track and row["model_id"] == model_id]
         if not matched:
             raise ValueError(f"锚点 {model_id} 在 track {track} 下没有评测记录")
+        protocols = {
+            json.dumps(row.get("protocol"), sort_keys=True, ensure_ascii=False) for row in matched
+        }
+        if len(protocols) != 1:
+            raise ValueError(
+                f"锚点 {model_id} 在 track {track} 下的记录跨了 {len(protocols)} 个协议，"
+                "锚点必须唯一确定一把尺子"
+            )
         stats = summarize(matched)
         anchors["tracks"][track] = {
             "model_id": model_id,
             "protocol_hash": matched[0]["protocol_hash"],
+            "protocol": matched[0].get("protocol"),
             "L_ref": stats["L"],
             "sigma_ref": stats["sigma"],
             "n_ref": stats["n"],
@@ -183,17 +201,26 @@ def save_anchors(path: str | Path, rows: list[dict], spec: dict[str, str]) -> di
     return anchors
 
 
-def compute_ratings(rows: list[dict], anchors: dict, lam: float = RATING_LAMBDA) -> dict:
-    """按 (track, protocol_hash) 分组重算全部评分。"""
+def compute_ratings(rows: list[dict], anchors: dict, lam: float = RATING_LAMBDA) -> dict[str, list[dict]]:
+    """按 track 归组、组内再按协议分组重算全部评分，返回 `{track: [协议组, ...]}`。
+
+    **一个 track 可以有多组**，而且通常就是如此：曲线上的每个模拟数都是不同的协议。
+    分组不是判“能不能比”，而是判“比的是同一件事”——所有组都放在该 track 锚点的
+    尺子上（这正是“模拟数 → 评分曲线”的做法），但每组都会带上它与锚点协议真正不同的
+    字段（`differs_from_anchor`），让“这条线是在什么测量条件下得到”变成可读的事实。
+
+    组内按 (模拟数, 协议哈希) 排序：模拟数是曲线的横轴，按它排出来的表格才像曲线。
+    """
     groups: dict[tuple[str, str], list[dict]] = {}
     for row in rows:
         groups.setdefault((row["track"], row["protocol_hash"]), []).append(row)
 
-    result: dict[str, dict] = {}
+    result: dict[str, list[dict]] = {}
     for (track, proto_hash), group in sorted(groups.items()):
         anchor = anchors.get("tracks", {}).get(track)
         if anchor is None:
             continue
+        protocol = group[0].get("protocol")
         by_model: dict[str, list[dict]] = {}
         for row in group:
             by_model.setdefault(row["model_id"], []).append(row)
@@ -215,7 +242,19 @@ def compute_ratings(rows: list[dict], anchors: dict, lam: float = RATING_LAMBDA)
                 "source_tracks": sorted({row["source_track"] for row in model_rows}),
                 "tile_reach_per_10k": tile_reach_per_10k(model_rows),
             }
-        result[track] = {"protocol_hash": proto_hash, "anchor": anchor, "models": models}
+        result.setdefault(track, []).append(
+            {
+                "protocol_hash": proto_hash,
+                "protocol": protocol,
+                "differs_from_anchor": protocol_diff(anchor.get("protocol"), protocol or {})
+                if anchor.get("protocol")
+                else {},
+                "anchor": anchor,
+                "models": models,
+            }
+        )
+    for blocks in result.values():
+        blocks.sort(key=lambda block: ((block["protocol"] or {}).get("simulations") or 0, block["protocol_hash"]))
     return result
 
 

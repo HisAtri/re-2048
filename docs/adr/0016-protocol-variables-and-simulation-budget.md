@@ -1,6 +1,6 @@
 # ADR 0016：评测协议的隐蔽变量，与模拟预算、探索系数的实际影响
 
-- 状态：已采纳（其中“批组成进协议”与“评测 seed 不进协议”两条**尚未实施**，见决策 5/6）
+- 状态：已采纳（决策 5/6 的口径修正**已实施**，实现见 [ADR 0018](0018-protocol-variable-registry.md)；决策 4 的缺口 A/C 仍未补）
 - 日期：2026-10-06
 
 ## 背景
@@ -107,12 +107,15 @@
      并且 NN 引擎写数据 manifest 时已把 `c_puct/lanes/in_flight_per_lane/temperature/
      cache_entries` 记为 `params`（数据侧 provenance 完整）。
    * 缺口 A：C++ CLI（`r2048 evaluate` / `r2048 generate`）没有 `--c-puct`，
-     所以纯 rollout 那条线根本扫不了它自己的探索系数。
+     所以纯 rollout 那条线根本扫不了它自己的探索系数。**仍未补**。
    * 缺口 B：评测逐局记录不写 `c_puct`，评分模块的 protocol_hash 也看不见它
      ——两个 c_puct 的评测会落进**同一条评分线**，正是旧版把 `exploration_scale`
-     写进协议所要防的事。
+     写进协议所要防的事。**已补**：逐局记录声明全部协议变量，缺字段会被评分池拒收；
+     清单与校验见 [ADR 0018](0018-protocol-variable-registry.md)。
    * 缺口 C：纯 rollout 搜索用的是**另一个常数** `RolloutMctsConfig::exploration`（默认 1.0），
      它没有暴露在任何入口（CLI / pybind / manifest 都没有）。“设置 c_puct”根本到不了 rollout 教师。
+     **改为由 `protocol_version` 承担**（ADR 0018 决策 5）：改动这类没有入口的实现常量
+     必须抬高 `kProtocolVersion`，因此它至少是可归因的；把它做成可扫的旋钮仍是独立的改动。
 5. **批组成（lanes / in-flight / max-batch / 缓存容量）属于 NN 路径的评测协议。**
    实测：同一检查点、同一 seed、同一参数重复跑逐局一致（400/400、24/24）；
    **但只改 lane 数就得到完全不同的轨迹**（24 vs 6：0/24 一致；64 vs 32：+20.1 分）。
@@ -130,6 +133,8 @@
    ——这与“池子随数据增长而变准”的设计目的直接冲突（ADR 0012）。
    seed 属于**同一协议下的重复抽样**，它的位置是 `game_key`（已经在里面了），不是协议。
    修正后同一模型跑 2 个 seed 的总 CI 应按 n=800 收缩（约 1/√2）；现在是各算各的 n=400。
+   **已实施**（ADR 0018 决策 3），代价是旧池按新定义会劈线，因此旧池整批放弃
+   （ADR 0018 决策 8），没有写迁移工具——猜出来的字段就是伪造的协议身份。
 7. **推荐的协议变量清单**（决策 5/6 实施时一并处理）：
    属于指纹：`track`、`rules_version`、`simulations`、`c_puct`、`temperature_moves`、
    `temperature`、`inference_precision`、`device`，以及 NN 路径的
@@ -137,6 +142,10 @@
    不属于指纹：`eval_seed`、`games`、`workers`（纯 C++ 线）。
    其中 `cache_entries` 与 `device` 是 ADR 0017 补进来的——两者都被实测证明能单独
    改变逐局结果，而此前一个只写在跑谱 manifest 的 `params` 里、另一个没进过任何清单。
+   **已实施**，且清单落到代码里（`r2048.protocol`），比本条的文档清单多一项：
+   `protocol_version`——用来承担没有单独入口的实现常量（决策 4 缺口 C）。
+   逐字段的适用性、`null` 与“缺字段”的区别、以及写出方与评分侧共用同一份清单的做法，
+   见 [ADR 0018](0018-protocol-variable-registry.md)。
 
 ## 理由
 

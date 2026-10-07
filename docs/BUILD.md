@@ -233,6 +233,26 @@ NN 线 64/128/256 为 800 局、512/1024 为 400 局）。跑法：
 所以 NN 评测必须冻结并记入协议的变量是
 `lanes / in_flight / max_batch / cache_entries / device`（外加 `simulations / c_puct`）。
 
+**协议变量怎么落地**（[ADR 0018](adr/0018-protocol-variable-registry.md)）：清单只有一份，
+在 `python/src/r2048/protocol.py` 的 `PROTOCOL_FIELDS`；评测写出方（`evaluate.py` 与
+C++ `r2048 evaluate`）按它声明**全部**字段，评分侧按同一份清单校验并哈希。
+两条规则决定了它的行为：**缺字段直接拒收**（不再用 `row.get(k, 默认值)` 兜底——
+默认值把“没记录”说成“记录了默认值”，两个真正不同的协议就此静默合并），
+**`null` 表示该策略没有这个变量**（随机策略没有 `c_puct`，纯网络 track 没有搜索预算）。
+逐局记录里因此平铺着 13 个协议字段 + `protocol_hash` 进池时重算，例如 c2 臂的一行：
+
+```json
+{"track":"nn_mcts","rules_version":1,"protocol_version":1,"simulations":64,"c_puct":1.5,
+ "temperature":0.0,"temperature_moves":0,"inference_precision":"float32","lanes":64,
+ "in_flight":4,"max_batch":8192,"cache_entries":131072,"device":"cuda"}
+```
+
+`protocol_version` 承担那些**没有单独入口**的实现常量（纯 rollout 的探索常数、
+rollout 策略本身、批调度形式）：它们同样改变逐局结果，改动时必须抬高该版本号。
+`eval_seed`、`games`、纯 C++ 线的 `workers` **不属于**协议：
+seed 是同一协议下的重复抽样（它只进池子的去重键），`games` 只影响区间宽度
+（同 seed 加大局数时前 N 局逐局不变），`workers` 实测逐字节一致。
+
 **跨设备**（同一 seed、同一参数，400 局 × 2）：逐局只有 3/400 局得分相同，但 `ΔL = +0.0053`
 （两侧独立 1.96σ 合并 ±0.1161，**区间含 0**）= **+1.2 分（95% CI ±26.7）**，
 中位 7112 vs 7100、步数 561 vs 559。逐局 `log2(得分+1)` 相关系数仅 **r = +0.098**，

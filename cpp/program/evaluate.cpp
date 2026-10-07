@@ -9,6 +9,7 @@
 #include "core/fileio.h"
 #include "core/json.h"
 #include "core/logging.h"
+#include "core/version.h"
 #include "program/episode.h"
 
 namespace r2048 {
@@ -99,6 +100,15 @@ EvaluateResult run_evaluate(const EvaluateConfig& config) {
     }
 
     if (!config.jsonl_path.empty()) {
+        // 纯 C++ 轨道的协议变量只有这几项，其余全部写 null（“该策略没有这个变量”）。
+        // 依据：本路径是整数运算，workers 实测逐字节一致（只是性能参数），没有浮点、
+        // 没有批推理缓存，所以 lanes / in_flight / max_batch / cache_entries / device
+        // 在这里不是“没记录”，而是根本不存在。清单与校验在 python 侧的 r2048.protocol，
+        // 两边的字段必须一一对应——对不上时评分池会直接拒收这条记录，这是有意的。
+        //
+        // 没有单独入口的实现常量（rollout 探索常数 `RolloutMctsConfig::exploration`、
+        // rollout 策略本身）挂在 protocol_version 上：改它们就要抬高该版本号。
+        const bool search = config.policy == "mcts";
         ensure_parent_dir(config.jsonl_path);
         std::string text;
         for (const GameOutcome& game : result.games) {
@@ -106,11 +116,24 @@ EvaluateResult run_evaluate(const EvaluateConfig& config) {
             record.set("episode", Json::integer(game.episode));
             record.set("label", Json::str(config.label.empty() ? config.policy : config.label));
             record.set("policy", Json::str(config.policy));
-            record.set("simulations", Json::integer(config.simulations));
             record.set("seed", Json::integer(static_cast<int64_t>(config.seed)));
             record.set("score", Json::integer(static_cast<int64_t>(game.score)));
             record.set("max_exponent", Json::integer(game.max_exponent));
             record.set("steps", Json::integer(game.steps));
+            record.set("track", Json::str(config.policy));
+            record.set("rules_version", Json::integer(kRulesVersion));
+            record.set("protocol_version", Json::integer(kProtocolVersion));
+            record.set("simulations", search ? Json::integer(config.simulations) : Json());
+            record.set("temperature_moves",
+                       search ? Json::integer(config.temperature_moves) : Json());
+            record.set("c_puct", Json());
+            record.set("temperature", Json());
+            record.set("inference_precision", Json());
+            record.set("lanes", Json());
+            record.set("in_flight", Json());
+            record.set("max_batch", Json());
+            record.set("cache_entries", Json());
+            record.set("device", Json());
             text += record.dump(0);
             text += "\n";
         }

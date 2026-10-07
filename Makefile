@@ -22,6 +22,9 @@ BIN   := $(BUILD)/bin/r2048
 export UV_PROJECT_ENVIRONMENT := $(VENV)
 export R2048_OUTPUT_DIR       := $(OUTPUT)
 export R2048_TEST_BINARY      := $(BUILD)/bin/r2048_tests
+# CLI 单独导出：有些测试要跑真实子命令（例如“C++ 写出的逐局记录必须满足 Python 侧的
+# 协议清单”），不能靠从 R2048_TEST_BINARY 反推路径。
+export R2048_CLI              := $(BIN)
 
 .DEFAULT_GOAL := help
 

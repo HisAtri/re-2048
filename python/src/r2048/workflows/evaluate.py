@@ -10,6 +10,9 @@
   离线指标几乎完全重合（MAE 65.5 vs 63.9），差别只在同 seed 对局里显现（+5,367 分）。
 * **纯网络 track 需要对应的头**：策略头只在策略/联合训练里被训练过，拿一个只训过价值的
   checkpoint 跑 `nn_policy` 得到的只是随机先验。元数据里的 `training_target` 就是这道闸门。
+* **逐局记录必须自证协议**：每行平铺声明全部协议变量（`r2048.protocol` 的清单），
+  记录的是**实测生效值**（`lanes` 被局数夹过、`device` 可能回退到 cpu）。
+  评分池按行 ingest，所以协议不能放在文件头；缺字段会被拒收，而不是用默认值补齐。
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import torch
 import r2048_core
 
 from r2048.nn.model import load_checkpoint
+from r2048.protocol import build_protocol, protocol_hash
 from r2048.runtime.inference import BatchedEvaluator
 
 TRACKS = {
@@ -70,6 +74,7 @@ class EvalResult:
     model_id: str = ""
     simulations: int = 0
     jsonl: str = ""
+    protocol: dict = field(default_factory=dict)
 
     @property
     def mean_score(self) -> float:
@@ -96,6 +101,8 @@ class EvalResult:
             "track": self.track,
             "model_id": self.model_id,
             "simulations": self.simulations,
+            "protocol": self.protocol,
+            "protocol_hash": protocol_hash(self.protocol) if self.protocol else "",
             "games": len(self.games),
             "mean_score": self.mean_score,
             "median_score": self.median_score,
@@ -107,6 +114,37 @@ class EvalResult:
             "games_per_second": len(self.games) / self.seconds if self.seconds > 0 else 0.0,
             "jsonl": self.jsonl,
         }
+
+
+def build_eval_protocol(config: EvalConfig, lanes: int, device: torch.device, model) -> dict:
+    """本次评测的协议变量（见 `r2048.protocol`）。
+
+    记录的是**实测生效值**，不是请求值：`lanes` 会被局数夹住、`device` 会因 cuda
+    不可用回退到 cpu。记请求值等于让协议与事实不符，而协议的全部价值就在于它属实。
+    """
+    search = config.track == "nn_mcts"
+    precision = None
+    if model is not None:
+        precision = str(next(model.parameters()).dtype).removeprefix("torch.")
+    return build_protocol(
+        {
+            "track": config.track,
+            "rules_version": int(r2048_core.RULES_VERSION),
+            "protocol_version": int(r2048_core.PROTOCOL_VERSION),
+            # 纯网络 track 只做一次前向，没有搜索预算与探索系数，声明 null：
+            # 旧实现把它们强行记成 0，等于把“没有这个变量”说成“这个变量的值是 0”。
+            "simulations": config.simulations if search else None,
+            "c_puct": config.c_puct if search else None,
+            "temperature": 0.0 if search else None,
+            "temperature_moves": 0 if search else None,
+            "inference_precision": precision,
+            "lanes": lanes,
+            "in_flight": config.in_flight,
+            "max_batch": config.max_batch,
+            "cache_entries": config.cache_entries,
+            "device": device.type,
+        }
+    )
 
 
 def run_evaluation(config: EvalConfig) -> EvalResult:
@@ -136,6 +174,7 @@ def run_evaluation(config: EvalConfig) -> EvalResult:
         raise ValueError("纯网络 track 需要 --checkpoint（没有网络就没有前向）")
 
     lanes = max(1, min(config.lanes, config.games))
+    protocol = build_eval_protocol(config, lanes, device, model)
     engine_config = {
         "lanes": lanes,
         "simulations": config.simulations if config.track == "nn_mcts" else 1,
@@ -192,26 +231,28 @@ def run_evaluation(config: EvalConfig) -> EvalResult:
         games=results,
         seconds=seconds,
         model_id=model_id,
-        simulations=config.simulations if config.track == "nn_mcts" else 0,
+        simulations=int(protocol["simulations"] or 0),
         jsonl=config.jsonl,
+        protocol=protocol,
     )
     if config.jsonl:
         path = Path(config.jsonl)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as handle:
             for game in results:
+                # 协议变量平铺在每一行里：逐局记录是唯一能自证“这局怎么测出来的”的东西，
+                # 把协议放在文件头会让下游（评分池按行 ingest）读不到它。
                 handle.write(
                     json.dumps(
                         {
                             "episode": game.episode,
                             "label": result.label,
-                            "track": config.track,
                             "model_id": model_id,
-                            "simulations": result.simulations,
                             "seed": config.seed,
                             "score": game.score,
                             "max_exponent": game.max_exponent,
                             "steps": game.steps,
+                            **protocol,
                         }
                     )
                     + "\n"

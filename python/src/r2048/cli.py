@@ -249,36 +249,49 @@ def _command_rating(args: argparse.Namespace) -> int:
           "这就是“同 seed 对齐开局”能提供的全部信息")
 
     report = {"openings": openings, "tracks": {}}
-    for track, block in ratings.items():
-        anchor = block["anchor"]
-        print(f"\n[{track}] 锚点 {anchor['model_id']}（{anchor['n_ref']} 局）= 1000，"
-              f"协议 {block['protocol_hash']}")
-        print(f"{'模型':<22}{'评分':>10}{'±95%':>8}{'局数':>7}{'对数均值':>10}{'均分':>10}"
-              f"{'中位':>9}{'平均步数':>9}  每万局到达 2048/4096")
-        ordered = sorted(block["models"].items(), key=lambda item: -item[1]["rating"])
-        for model_id, stats in ordered:
-            tiles = stats["tile_reach_per_10k"]
-            print(
-                f"{model_id:<22}{stats['rating']:>10.1f}{stats['ci95']:>8.1f}{stats['n']:>7}"
-                f"{stats['L']:>10.3f}{stats['mean_score']:>10.0f}{stats['median_score']:>9.0f}"
-                f"{stats['mean_steps']:>9.0f}  {tiles.get('2048', 0):>5.1f} / {tiles.get('4096', 0):>5.1f}"
-            )
-        report["tracks"][track] = {
-            "anchor": anchor["model_id"],
-            "protocol_hash": block["protocol_hash"],
-            "models": {
-                model_id: {
-                    "rating": stats["rating"],
-                    "ci95": stats["ci95"],
-                    "n": stats["n"],
-                    "L": stats["L"],
-                    "mean_score": stats["mean_score"],
-                    "median_score": stats["median_score"],
-                    "tile_reach_per_10k": stats["tile_reach_per_10k"],
+    for track, blocks in ratings.items():
+        for block in blocks:
+            anchor = block["anchor"]
+            print(f"\n[{track}] 锚点 {anchor['model_id']}（{anchor['n_ref']} 局）= 1000，"
+                  f"协议 {block['protocol_hash']}")
+            # 同一 track 的不同协议都会放到这把尺子上（曲线就是这么来的），
+            # 所以差异必须打出来：不然“这条线是在什么条件下得到的”只能靠比对两个哈希。
+            if block["differs_from_anchor"]:
+                difference = "，".join(
+                    f"{name} {pair[0]}→{pair[1]}"
+                    for name, pair in block["differs_from_anchor"].items()
+                )
+                print(f"  与锚点协议不同的字段：{difference}")
+            print(f"{'模型':<22}{'评分':>10}{'±95%':>8}{'局数':>7}{'对数均值':>10}{'均分':>10}"
+                  f"{'中位':>9}{'平均步数':>9}  每万局到达 2048/4096")
+            ordered = sorted(block["models"].items(), key=lambda item: -item[1]["rating"])
+            for model_id, stats in ordered:
+                tiles = stats["tile_reach_per_10k"]
+                print(
+                    f"{model_id:<22}{stats['rating']:>10.1f}{stats['ci95']:>8.1f}{stats['n']:>7}"
+                    f"{stats['L']:>10.3f}{stats['mean_score']:>10.0f}{stats['median_score']:>9.0f}"
+                    f"{stats['mean_steps']:>9.0f}  {tiles.get('2048', 0):>5.1f} / {tiles.get('4096', 0):>5.1f}"
+                )
+            report["tracks"].setdefault(track, []).append(
+                {
+                    "anchor": anchor["model_id"],
+                    "protocol_hash": block["protocol_hash"],
+                    "protocol": block["protocol"],
+                    "differs_from_anchor": block["differs_from_anchor"],
+                    "models": {
+                        model_id: {
+                            "rating": stats["rating"],
+                            "ci95": stats["ci95"],
+                            "n": stats["n"],
+                            "L": stats["L"],
+                            "mean_score": stats["mean_score"],
+                            "median_score": stats["median_score"],
+                            "tile_reach_per_10k": stats["tile_reach_per_10k"],
+                        }
+                        for model_id, stats in block["models"].items()
+                    },
                 }
-                for model_id, stats in block["models"].items()
-            },
-        }
+            )
 
     # 模型间差异：同时给“评分口径（独立两样本）”与“同 seed 配对差分”，
     # 后者用来量化配对到底省了多少方差，而不是默认它有效。

@@ -696,7 +696,7 @@ def run_training(config: TrainConfig) -> TrainResult:
         # 有候选监督时用“最优候选命中率”，否则退回价值 MAE；策略模式看交叉熵。
         if config.mode == "policy":
             primary, maximize = val_ce, False
-        elif best_hit == best_hit:  # 非 NaN 说明用了候选监督
+        elif not math.isnan(best_hit):  # 非 NaN 说明这一轮确实用了候选监督
             primary, maximize = best_hit, True
         else:
             primary, maximize = val_mae, False
@@ -720,7 +720,9 @@ def run_training(config: TrainConfig) -> TrainResult:
             },
             run_dir / "last.pt",
         )
-        improved = primary == primary and (
+        # `primary` 为 NaN 表示这一轮没算出主指标（例如验证集里没有可用样本），
+        # 显式写出来而不是用 `x != x` 的自比较写法。
+        improved = not math.isnan(primary) and (
             best_metric is None or (primary > best_metric if maximize else primary < best_metric)
         )
         if improved:

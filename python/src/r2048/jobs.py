@@ -263,7 +263,9 @@ class JobDir:
         path: str | Path | None = None,
     ) -> None:
         if root is not None and path is not None:
-            raise ValueError("JobDir 只接受 root 或 path 之一：前者是作业目录们的所在目录，后者就是作业目录本身")
+            raise ValueError(
+                "JobDir 只接受 root 或 path 之一：前者是作业目录们的所在目录，后者就是作业目录本身"
+            )
         self.job_id = job_id
         self.kind = kind
         self.params = dict(params or {})

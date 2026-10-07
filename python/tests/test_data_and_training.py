@@ -219,7 +219,7 @@ def test_candidate_block_matches_rules_and_main_fields(search_batch_dir: Path) -
         decision = record["decision"]
         action = int(record["action"])
         mask = int(record["legal_mask"])
-        assert int(record["candidate_count"]) == bin(mask).count("1"), "候选数量必须等于合法方向数"
+        assert int(record["candidate_count"]) == mask.bit_count(), "候选数量必须等于合法方向数"
         for candidate in range(4):
             if not (mask >> candidate) & 1:
                 assert int(record["candidate_value"][candidate]) == 0, "非法方向的槽位应保持为空"

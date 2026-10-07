@@ -39,7 +39,6 @@ def transform_policy_targets(
     动作顺序是 UP=0, RIGHT=1, DOWN=2, LEFT=3（见 ADR 0004）。逆时针旋转一次等价于
     动作编号减一，水平镜像把 LEFT/RIGHT 对调。
     """
-    count = legal_mask.shape[0]
     new_mask = torch.zeros_like(legal_mask)
     new_visits = torch.zeros_like(visits)
     for action in range(4):

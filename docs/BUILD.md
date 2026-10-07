@@ -367,8 +367,14 @@ host 内存带宽、GPU 算力、VRAM 带宽）全都没满"放在一起，结�
 （所以产出的仍是一批数据），实测 **+20%**（182k → 218k 模拟/秒，GPU 忙 45.8% → 61%）：
 
 ```bash
-# 生产形态：多进程（每个进程一个批次目录，训练时按多来源喂进去），并且**每个进程钉成 1 个 CPU 线程**
-OMP_NUM_THREADS=1 make py ARGS="selfplay --checkpoint ... --simulations 256 --lanes 64 --in-flight 16"
+# 生产形态：多进程**共用同一个批次目录**（--join），每个进程钉成 1 个 CPU 线程。
+# 第一个起来的进程创建这一批，其余加入；局号由跨进程发号器统一发放，清单在文件锁下合并，
+# 所以一次运行仍然只产出一个数据批（训练侧一行数据源）。
+for i in 1 2 3 4; do
+  OMP_NUM_THREADS=1 nohup python -m r2048 selfplay --checkpoint runs/x/model.pt \
+    --out $R2048_OUTPUT_DIR/data/<批次号> --join --batch-id <批次号> \
+    --simulations 256 --lanes 64 --in-flight 16 --device cuda &
+done
 # 进程内多线程（单进程内 +29%，见 ADR 0028）：
 make py ARGS="selfplay --checkpoint ... --simulations 256 --lanes 64 --in-flight 16 --search-threads 8"
 ```
@@ -385,6 +391,10 @@ make py ARGS="selfplay --checkpoint ... --simulations 256 --lanes 64 --in-flight
 单进程有约 38% 的上限（串行流水线）；多进程一路爬到 GPU 功耗上限。
 **注意 `OMP_NUM_THREADS=1`（或让进程自己钉线程）是必须的**：torch 默认按核数开 CPU 线程池，
 4 个进程就是 64 线程抢 16 核，CPU 先被打满、GPU 只能停在 57.5%。
+
+**4 个进程 `--join` 写同一批（实跑验收）**：一个批次目录、一份清单、4 个写者的分片、
+496,534 条 / 500 局；局号重复 0 个、不同局号数与清单局数一致；`verify` 通过；
+GPU 85.0%、功耗 594 W（上限 600）。设计见 ADR 0029（发号器、清单合并、分片声明局数与跨度）。
 
 整轮复核：**dt3 = 964.7 样本/秒 vs dt2（同参数单线程）747.5 = +29%**（批均值 3323 行）。
 

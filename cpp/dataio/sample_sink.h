@@ -25,9 +25,10 @@ namespace r2048 {
 // 协议参数）因此仍然准确，不需要给 K 个引擎编造 K 个种子。
 class SampleSink {
 public:
-    // 新起一批（resume=false，目录必须不存在或为空）或续跑（resume=true，读回清单比对参数）。
+    // 三种进入方式（与 ShardWriter 一致）：新起 / 顺序续跑 / 加入并行写者。
+    enum class Mode { kNew, kResume, kJoin };
     SampleSink(std::string data_dir, BatchMeta meta, uint64_t samples_target, uint64_t shard_samples,
-               bool resume);
+               Mode mode);
     SampleSink(const SampleSink&) = delete;
     SampleSink& operator=(const SampleSink&) = delete;
 
@@ -76,8 +77,6 @@ private:
     mutable std::mutex mutex_;
     std::map<uint32_t, std::vector<Sample>> completed_;
     uint64_t samples_produced_ = 0;
-    uint32_t next_episode_to_write_ = 0;
-    std::atomic<uint32_t> next_episode_{0};
     std::atomic<bool> stop_{false};
     ControlCommand requested_stop_ = ControlCommand::kNone;
     bool finished_ = false;

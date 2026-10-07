@@ -60,6 +60,7 @@ r2048::EngineConfig engine_config_from_dict(const py::dict& dict) {
     config.collect_samples = get_uint("collect_samples", 1) != 0;
     config.episodes_target = get_uint("episodes_target", 0);
     config.resume = get_uint("resume", 0) != 0;
+    config.join = get_uint("join", 0) != 0;
     if (dict.contains("control_path")) config.control_path = dict["control_path"].cast<std::string>();
     // 产出环境参数（device / max_batch）走"原样透传"：C++ 不认识它们的含义，
     // 但它们是数据来源记录的一部分，也让续跑时的参数闸门能发现"换了设备"。

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <unistd.h>
 #include <stdexcept>
 
 namespace r2048 {
@@ -36,8 +37,19 @@ void ensure_parent_dir(const std::string& path) {
     ensure_dir(path.substr(0, slash));
 }
 
+namespace {
+
+// 临时文件名带进程号：**多个进程同时写同一个目标**（多写者跑谱的清单、发号器文件）时，
+// 共用 `<path>.tmp` 会让先完成的那一个把别人的临时文件 rename 走，另一个随即失败——
+// 实测崩掉过一个跑谱进程。带上 pid 之后并发写各自独立，rename 仍保证"要么完整要么没有"。
+std::string temp_path_for(const std::string& path) {
+    return path + "." + std::to_string(::getpid()) + ".tmp";
+}
+
+}  // namespace
+
 void write_file_atomic(const std::string& path, const void* data, size_t len) {
-    const std::string temp_path = path + ".tmp";
+    const std::string temp_path = temp_path_for(path);
     FILE* file = std::fopen(temp_path.c_str(), "wb");
     if (file == nullptr) throw std::runtime_error("无法写入文件: " + temp_path);
     if (len > 0 && std::fwrite(data, 1, len, file) != len) {

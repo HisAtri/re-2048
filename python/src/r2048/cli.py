@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -186,6 +187,11 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="continue_",
         action="store_true",
         help="续跑：在既有批次上接着编号写下去（参数逐项比对，不一致直接拒绝）",
+    )
+    selfplay.add_argument(
+        "--join",
+        action="store_true",
+        help="加入已有批次并行写（多个进程指向同一个 --out）：局号跨进程统一发放，仍是一个批次",
     )
     selfplay.add_argument(
         "--control", default="", help="控制文件路径（默认 <数据批目录>/control，内容是 pause/stop）"
@@ -555,6 +561,7 @@ def _command_selfplay(args: argparse.Namespace) -> int:
         max_batch=args.max_batch,
         control_path=args.control or "",
         resume=args.continue_,
+        join=args.join,
     )
     print(
         f"计划：NN 自对弈，模型 {model_id}，模拟 {config.simulations}，lane {config.lanes}，"
@@ -564,8 +571,10 @@ def _command_selfplay(args: argparse.Namespace) -> int:
     )
 
     # 作业目录与数据批同名：一次跑谱的现场记录（status/log）和它产出的数据放在
-    # 两个并列的目录里，事后能一眼对上。
-    with JobDir(batch_id, "selfplay", params=config.__dict__) as job:
+    # 两个并列的目录里，事后能一眼对上。**join 时按进程分目录**：多个进程共用一个
+    # 作业目录会互相踩 status.json.tmp（实测直接崩掉两个进程）。
+    job_id = f"{batch_id}-p{os.getpid()}" if args.join else batch_id
+    with JobDir(job_id, "selfplay", params=config.__dict__) as job:
         config.on_progress = job.callback()
         result = run_selfplay(config, model, device)
         job.finish(

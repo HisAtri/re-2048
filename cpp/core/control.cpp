@@ -91,6 +91,11 @@ ControlCommand Control::poll() {
     }
     if (command == ControlCommand::kNone) return ControlCommand::kNone;
 
+    if (sticky_) {
+        // 多写者（--join）：控制文件留着，让每个写者都能读到同一条指令。一次性消费只能停住
+        // 抢到它的那一个进程，其余会继续跑——而用户按下的意图是"停这一批"。
+        return command;
+    }
     // 一次性：消费掉它。删除失败不是致命错误（进程照样会停），但要说出来——
     // 下次 --continue 会立刻又被这条指令叫停，用户得知道为什么。
     if (std::remove(path_.c_str()) != 0) {

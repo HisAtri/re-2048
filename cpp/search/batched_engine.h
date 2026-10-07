@@ -58,6 +58,9 @@ struct EngineConfig {
     std::string control_path;
     // 续跑：在既有数据批上接着编号写下去（参数逐项比对，不一致直接拒绝）。
     bool resume = false;
+    // 加入一个**正在被别的写者写**的批次（多进程指向同一个 --out）：比对参数、从共享发号器
+    // 领号、不读回末片。与 resume 互斥（resume 是"接上一次停下的位置顺序续写"）。
+    bool join = false;
     // 产出侧才知道的协议参数（device、max_batch）：C++ 引擎不认识它们，但它们会改变
     // 逐局结果（批组成决定在途模拟的调度），所以必须作为来源记录写进清单，
     // 并在续跑时参与比对。Python 侧透传，不走猜测。

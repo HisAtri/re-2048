@@ -99,8 +99,20 @@ TEST(engine_completes_and_writes_in_episode_order) {
     expect_equal_u64(manifest.samples, 3000, "样本数恰好等于目标");
     expect_true(manifest.meta.policy == "nn", "策略标记为 nn");
     expect_true(manifest.meta.model_id == "synthetic", "来源模型记录在清单里");
-    expect_equal_u64(manifest.episodes, manifest.shards.back().last_episode + 1,
-                     "局数与末分片覆盖的局号一致");
+    // 局数与"最高局号 + 1"不再相等：多个 lane 同时开局、只有一部分走完，所以局号有洞
+    // （发号器按块预留的设计使然，见 ADR 0029）。不变量是"局数 = 各分片区间之和"，
+    // 并且整批最小的局号是 0。
+    uint64_t covered = 0;
+    uint32_t lowest = UINT32_MAX;
+    uint32_t highest = 0;
+    for (const ShardInfo& shard : manifest.shards) {
+        covered += shard.episodes;
+        lowest = std::min(lowest, shard.first_episode);
+        highest = std::max(highest, shard.last_episode);
+    }
+    expect_equal_u64(manifest.episodes, covered, "局数 = 各分片记录的局数之和");
+    expect_equal_u64(lowest, 0, "整批最小的局号必须是 0");
+    expect_true(manifest.next_episode > highest, "清单的 next_episode 必须是高水位");
     expect_contains(finished.manifest_path, "manifest.json", "返回 manifest 路径");
     expect_true(finished.state == BatchState::kComplete, "跑满目标时状态为 complete");
 

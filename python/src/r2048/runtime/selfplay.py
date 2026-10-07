@@ -61,6 +61,9 @@ class SelfplayConfig:
     control_path: str = ""
     # 续跑：在既有批次上接着编号写下去（参数逐项比对，不一致直接拒绝）。
     resume: bool = False
+    # 加入一个**正在被别的进程写**的批次（多进程指向同一个 --out）：局号由跨进程发号器
+    # 统一发放、清单在文件锁下合并，所以一次运行仍然只产出一个数据批。
+    join: bool = False
     # 结构化进度回调（见 r2048.jobs）。给了回调就不再打印，由调用方决定怎么呈现——
     # CLI 与将来的界面因此只在这一点上分叉。回调收到的 dict 每 0.5 秒一次，
     # 一次自对弈几千次，所以回调本身要廉价（写文件要走原子替换，不要在这里做重活）。
@@ -158,6 +161,7 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
         "seed": config.seed,
         "control_path": config.control_path or str(Path(config.data_dir) / "control"),
         "resume": int(config.resume),
+        "join": int(config.join),
         # 只有 Python 侧知道这两项，但它们会改变逐局结果（批组成决定在途模拟的调度），
         # 所以必须进数据来源记录，也让续跑能发现"换了设备/改了批大小"。
         "provenance": {"device": device.type, "max_batch": str(config.max_batch)},

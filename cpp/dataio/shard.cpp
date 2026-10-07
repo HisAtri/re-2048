@@ -1,7 +1,14 @@
 #include "dataio/shard.h"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <mutex>
 #include <stdexcept>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
 
 #include "core/fileio.h"
 #include "core/hash.h"
@@ -11,9 +18,10 @@ namespace r2048 {
 
 namespace {
 
-std::string shard_path(size_t index) {
-    char name[64];
-    std::snprintf(name, sizeof(name), "shards/shard-%06zu.bin", index);
+// 分片名带写者标识：多进程同时写同一批数据时不可能撞名（撞名 = 覆盖别人的分片）。
+std::string shard_path(const std::string& writer_tag, size_t index) {
+    char name[128];
+    std::snprintf(name, sizeof(name), "shards/shard-%s-%06zu.bin", writer_tag.c_str(), index);
     return name;
 }
 
@@ -134,6 +142,7 @@ Json manifest_to_json(const BatchManifest& manifest) {
     root.set("samples_target", Json::integer(static_cast<int64_t>(manifest.meta.samples_target)));
     root.set("samples", Json::integer(static_cast<int64_t>(manifest.samples)));
     root.set("episodes", Json::integer(manifest.episodes));
+    root.set("next_episode", Json::integer(manifest.next_episode));
     root.set("workers", Json::integer(manifest.meta.workers));
     root.set("state", Json::str(batch_state_name(manifest.state)));
 
@@ -146,6 +155,7 @@ Json manifest_to_json(const BatchManifest& manifest) {
         Json entry = Json::object();
         entry.set("path", Json::str(shard.path));
         entry.set("samples", Json::integer(static_cast<int64_t>(shard.samples)));
+        entry.set("episodes", Json::integer(shard.episodes));
         entry.set("first_episode", Json::integer(shard.first_episode));
         entry.set("last_episode", Json::integer(shard.last_episode));
         entry.set("sha256", Json::str(shard.sha256));
@@ -168,6 +178,11 @@ BatchManifest manifest_from_json(const Json& json) {
     manifest.meta.workers = static_cast<uint32_t>(json.at("workers").as_int());
     manifest.samples = static_cast<uint64_t>(json.at("samples").as_int());
     manifest.episodes = static_cast<uint32_t>(json.at("episodes").as_int());
+    // 老清单（这一版之前）没有 next_episode：那时刻的号是稠密的，于是 episodes 就是
+    // 下一个号，等价成立。
+    manifest.next_episode = json.has("next_episode")
+                                ? static_cast<uint32_t>(json.at("next_episode").as_int())
+                                : manifest.episodes;
     // 这两个字段是“可增量提交”之后才有的。旧清单没有它们，而旧实现只在结尾写一次清单
     // （写到即完整），因此按 complete + 旧切分规则解释是准确的，不是兜底猜测。
     manifest.state = json.has("state") ? batch_state_from_name(json.at("state").as_string())
@@ -184,6 +199,7 @@ BatchManifest manifest_from_json(const Json& json) {
         ShardInfo shard;
         shard.path = entry.at("path").as_string();
         shard.samples = static_cast<uint64_t>(entry.at("samples").as_int());
+        shard.episodes = static_cast<uint32_t>(entry.at("episodes").as_int());
         shard.first_episode = static_cast<uint32_t>(entry.at("first_episode").as_int());
         shard.last_episode = static_cast<uint32_t>(entry.at("last_episode").as_int());
         shard.sha256 = entry.at("sha256").as_string();
@@ -214,6 +230,90 @@ BatchManifest read_manifest(const std::string& data_dir) {
     return manifest_from_json(parse_json(read_text_file(data_dir + "/manifest.json")));
 }
 
+namespace {
+
+// 跨进程互斥：flock 一把独立的锁文件（不锁 manifest 本身——它会被原子替换，
+// 锁在一个随时被 rename 掉的 inode 上没有意义）。
+class ManifestLock {
+public:
+    explicit ManifestLock(const std::string& data_dir) {
+        const std::string path = data_dir + "/manifest.lock";
+        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd_ < 0) throw std::runtime_error("打不开锁文件 " + path);
+        if (::flock(fd_, LOCK_EX) != 0) {
+            ::close(fd_);
+            throw std::runtime_error("锁不上 " + path);
+        }
+    }
+    ~ManifestLock() {
+        ::flock(fd_, LOCK_UN);
+        ::close(fd_);
+    }
+    ManifestLock(const ManifestLock&) = delete;
+    ManifestLock& operator=(const ManifestLock&) = delete;
+
+private:
+    int fd_ = -1;
+};
+
+// 整批已提交的局数：局号可以有空洞（发号器按块预留、写者被杀会留下未用的号），
+// 所以只能按各分片的区间求和，不能拿"计数"当"局号"。
+uint32_t count_episodes(const std::vector<ShardInfo>& shards) {
+    uint64_t total = 0;
+    for (const ShardInfo& shard : shards) total += shard.episodes;
+    return static_cast<uint32_t>(total);
+}
+
+// 本批已有的最大局号 + 1（没有分片时是 0）。
+uint32_t max_episode_plus_one(const std::vector<ShardInfo>& shards) {
+    uint32_t highest = 0;
+    for (const ShardInfo& shard : shards) highest = std::max(highest, shard.last_episode + 1);
+    return highest;
+}
+
+}  // namespace
+
+EpisodeCounter::EpisodeCounter(std::string data_dir, uint32_t floor, bool reset)
+    : path_(std::move(data_dir) + "/episodes.counter") {
+    if (reset || !path_exists(path_)) {
+        write_text_atomic(path_, std::to_string(floor));
+        next_ = limit_ = floor;
+        return;
+    }
+    const std::string text = path_exists(path_) ? read_text_file(path_) : std::string();
+    const uint32_t recorded = text.empty() ? 0 : static_cast<uint32_t>(std::stoul(text));
+    next_ = limit_ = std::max(recorded, floor);
+}
+
+void EpisodeCounter::reserve_block() {
+    // 读-改-写必须在同一把锁里：否则两个写者会领到同一段号（同一局被造两次）。
+    // 进程内用互斥量、跨进程用 flock（同一进程里的多个引擎与多个进程都要覆盖）。
+    static std::mutex in_process;
+    std::lock_guard<std::mutex> guard(in_process);
+    const std::string lock_path = path_ + ".lock";
+    const int fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) throw std::runtime_error("打不开发号器锁 " + lock_path);
+    if (::flock(fd, LOCK_EX) != 0) {
+        ::close(fd);
+        throw std::runtime_error("锁不上发号器 " + lock_path);
+    }
+    uint32_t current = 0;
+    if (path_exists(path_)) {
+        const std::string text = read_text_file(path_);
+        if (!text.empty()) current = static_cast<uint32_t>(std::stoul(text));
+    }
+    next_ = current;
+    limit_ = current + kBlock;
+    write_text_atomic(path_, std::to_string(limit_));
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+}
+
+uint32_t EpisodeCounter::take() {
+    if (next_ >= limit_) reserve_block();
+    return next_++;
+}
+
 ShardWriter::ShardWriter(std::string data_dir, uint64_t shard_samples, BatchMeta meta)
     : data_dir_(std::move(data_dir)), shard_samples_(shard_samples), meta_(std::move(meta)) {
     if (shard_samples_ == 0) throw std::runtime_error("分片样本数必须大于 0");
@@ -223,6 +323,16 @@ ShardWriter::ShardWriter(std::string data_dir, uint64_t shard_samples, BatchMeta
     shards_dir_ = data_dir_ + "/shards";
     ensure_dir(shards_dir_);
     buffer_.reserve(static_cast<size_t>(shard_samples_) * kSampleBytes);
+    // 分片文件名带写者标识：多进程同时写时不可能撞名（撞名 = 覆盖别人的分片 = 丢数据）。
+    writer_tag_ = std::to_string(::getpid()) + "-" +
+                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    // **不重置**：并发创建时（多个进程同时指向一个空目录）每个都会走到这个构造函数，
+    // 重置一次就有一个写者从 0 重新发号——实测 4 个进程同时起跑，局号重叠了约 4 倍。
+    // 发号器文件不存在时才初始化，这一步天然幂等；显式重置只留给顺序续跑（单写者）。
+    counter_ = std::make_unique<EpisodeCounter>(data_dir_, 0, /*reset=*/false);
+    // 立刻落一份空清单：**批次目录与清单同时出现**。否则并发写者（--join）在第一个分片
+    // 落盘之前看不到这一批，启动时就会失败——实测踩到过。
+    merge_into_manifest(state_);
 }
 
 ShardWriter ShardWriter::resume(const std::string& data_dir, uint64_t shard_samples,
@@ -242,8 +352,11 @@ ShardWriter ShardWriter::resume(const std::string& data_dir, uint64_t shard_samp
 
     ShardWriter writer(data_dir, shard_samples, meta);
     writer.flushed_samples_ = existing.samples;
-    writer.episodes_written_ = existing.episodes;
     writer.shards_ = existing.shards;
+    // 续跑的记号从"已有的最大局号 + 1"接着来（不能再用"已写局数"，局号可能有空洞）。
+    // 顺序续跑：把手上的号拉回"已有的最大局号 + 1"，保住 ADR 0020 的逐字节复现。
+    writer.counter_ = std::make_unique<EpisodeCounter>(data_dir, max_episode_plus_one(existing.shards),
+                                                       /*reset=*/true);
 
     // 末片不满 = 上一次是在停车点落盘的。把它读回缓冲继续填，而不是新起一片：
     // 这样续跑最终产出的分片与“一次跑完”的分片逐字节相同（强判据，见 ADR 0020）。
@@ -263,17 +376,56 @@ ShardWriter ShardWriter::resume(const std::string& data_dir, uint64_t shard_samp
             writer.buffered_first_episode_ = last.first_episode;
             writer.buffered_last_episode_ = last.last_episode;
             writer.shards_.pop_back();  // 它还没填满，等填满后按同样的内容重写
+            writer.flushed_samples_ -= last.samples;  // 它的字节现在在缓冲里，不能再算作已提交
+            writer.reuse_shard_path_ = last.path;     // 原地重写：换名字等于把同一段写两遍
+            // 把读回来的那些局号也放进"本片已收"的集合：否则重写这一片时它只报新增的局数，
+            // 整批局数会少算（实测少 2 局，正是末片里的那两局）。
+            for (uint64_t offset = 0; offset + kSampleBytes <= writer.buffer_.size();
+                 offset += kSampleBytes) {
+                writer.buffer_episodes_.insert(decode_sample(writer.buffer_.data() + offset).episode);
+            }
             writer.flushed_samples_ -= last.samples;
         }
     }
     return writer;
 }
 
+ShardWriter ShardWriter::join(const std::string& data_dir, uint64_t shard_samples,
+                              const BatchMeta& meta) {
+    if (!path_exists(data_dir + "/manifest.json")) {
+        // 并发起跑时可能都还没提交过清单（比如目录刚被创建）。当成新起一批：局号由共享
+        // 发号器发放、清单在锁下合并，所以几条路径最终仍汇成一批。
+        return ShardWriter(data_dir, shard_samples, meta);
+    }
+    const BatchManifest existing = read_manifest(data_dir);
+    if (existing.state == BatchState::kComplete) {
+        throw std::runtime_error("这一批已经跑完（state=complete）：不能再加入写者");
+    }
+    if (existing.shard_layout != kShardLayout) {
+        throw std::runtime_error("该批使用旧的分片切分规则（shard_layout=" +
+                                 std::to_string(existing.shard_layout) +
+                                 "）：并行写入会让两种布局混在一起，请新起一批");
+    }
+    if (existing.meta.batch_id != meta.batch_id) {
+        throw std::runtime_error("加入批次时批号必须一致：磁盘上是 " + existing.meta.batch_id +
+                                 "，本次是 " + meta.batch_id);
+    }
+    compare_resume_meta(existing.meta, meta, shard_samples);
+
+    // **不读回末片**：它可能正被别的写者填着，读回来重写会把那一段数据写两遍。
+    ShardWriter writer(data_dir, shard_samples, meta);
+    // 并行加入：计数器只读不重置（别的写者可能正握着预留的号）。若这一批还没有计数器
+    // （旧批次），就从"已有的最大局号 + 1"建一个。
+    writer.counter_ = std::make_unique<EpisodeCounter>(data_dir, max_episode_plus_one(existing.shards),
+                                                       /*reset=*/false);
+    return writer;
+}
+
 void ShardWriter::check_episode_order(uint32_t episode) const {
-    if (episode != episodes_written_) {
-        throw std::runtime_error("局号必须从 " + std::to_string(episodes_written_) +
-                                 " 开始连续递增，实际收到第 " + std::to_string(episode) +
-                                 " 局（跳号会让清单的局数与分片内容对不上）");
+    // 只做一件事：拒绝**同一片内重复写同一局**（那意味着发号器或调用方出了错，
+    // 数据里会出现两遍同一局，而读取端无法分辨）。顺序不要求：分片自带局号区间。
+    if (buffer_episodes_.count(episode) != 0) {
+        throw std::runtime_error("同一分片内重复写入第 " + std::to_string(episode) + " 局");
     }
 }
 
@@ -283,13 +435,20 @@ void ShardWriter::add_episode(uint32_t episode, const std::vector<Sample>& sampl
     uint8_t encoded[kSampleBytes];
     for (const Sample& sample : samples) {
         if (sample.episode != episode) throw std::runtime_error("样本的局号与所属局不一致");
-        if (buffer_.empty()) buffered_first_episode_ = episode;
-        buffered_last_episode_ = episode;
+        if (buffer_.empty()) {
+            buffered_first_episode_ = episode;
+            buffered_last_episode_ = episode;
+        } else {
+            // 一局是一次 append，局号由跨进程发号器发放、各写者只拿到自己那一段。字面上
+            // 可能是乱序到达的（同一写者内两条 lane 的比赛完成顺序不定），所以这里只记
+            // **区间**，不要求递增——分片内容有序与否，读取端都能从记录里的局号还原。
+            buffered_first_episode_ = std::min(buffered_first_episode_, episode);
+            buffered_last_episode_ = std::max(buffered_last_episode_, episode);
+        }
         encode_sample(sample, encoded);
         buffer_.insert(buffer_.end(), encoded, encoded + kSampleBytes);
     }
-    episodes_written_++;
-
+    buffer_episodes_.insert(episode);
     // 分片只在**局边界**上切分（攒满容量之后的第一局末尾）。这条规则换来两件事：
     //   * 末片的 last_episode 永远是完整的一局，清单里的 episodes 恒等于 last_episode+1，
     //     于是续跑从 manifest.episodes 接着编号即可，不存在“半局”这种状态；
@@ -300,21 +459,26 @@ void ShardWriter::add_episode(uint32_t episode, const std::vector<Sample>& sampl
 
 void ShardWriter::flush_shard() {
     if (buffer_.empty()) return;
-    const std::string relative = shard_path(shards_.size());
+    const std::string relative =
+        reuse_shard_path_.empty() ? shard_path(writer_tag_, my_shard_count_++) : reuse_shard_path_;
+    reuse_shard_path_.clear();
     const std::string absolute = join_path(data_dir_, relative);
     write_file_atomic(absolute, buffer_.data(), buffer_.size());
 
     ShardInfo info;
     info.path = relative;
     info.samples = buffer_.size() / kSampleBytes;
+    info.episodes = static_cast<uint32_t>(buffer_episodes_.size());
     info.first_episode = buffered_first_episode_;
     info.last_episode = buffered_last_episode_;
     info.sha256 = sha256_hex(buffer_.data(), buffer_.size());
-    shards_.push_back(std::move(info));
+    shards_.push_back(info);
     flushed_samples_ += buffer_.size() / kSampleBytes;
     buffer_.clear();
-    // 每落一片就提交一次清单：清单从此是提交日志，被 SIGKILL 只会留下未被列出的孤儿分片。
-    publish(state_);
+    buffer_episodes_.clear();
+    // 每落一片就提交一次清单（在文件锁下与别的写者合并）：清单是提交日志，
+    // 被 SIGKILL 只会留下未被列出的孤儿分片。
+    merge_into_manifest(state_);
 }
 
 BatchManifest ShardWriter::snapshot(BatchState state) const {
@@ -326,15 +490,49 @@ BatchManifest ShardWriter::snapshot(BatchState state) const {
     // 已提交的内容从定义上只包含分片里的记录：缓冲里的数据还没落盘，不能算数
     // （否则崩溃之后清单会声称存在一批读不出来的数据）。
     manifest.samples = flushed_samples_;
-    manifest.episodes = episodes_written_;
+    manifest.episodes = count_episodes(shards_);
+    manifest.next_episode =
+        std::max(counter_ ? counter_->high_water() : 0u, max_episode_plus_one(shards_));
     manifest.shards = shards_;
     return manifest;
 }
 
-void ShardWriter::publish(BatchState state) {
+void ShardWriter::merge_into_manifest(BatchState state) {
     state_ = state;
-    write_manifest(data_dir_, snapshot(state));
+    ManifestLock lock(data_dir_);
+    const std::string manifest_path = data_dir_ + "/manifest.json";
+    BatchManifest current = path_exists(manifest_path) ? read_manifest(data_dir_) : snapshot(state);
+    // 把自己新落的分片并进去（按路径去重）。**不能直接写自己那份快照**：别的写者可能
+    // 已经提交了分片，覆盖等于把它们从清单里抹掉（数据还在盘上但读取端永远看不到）。
+    for (const ShardInfo& shard : shards_) {
+        bool replaced = false;
+        for (ShardInfo& entry : current.shards) {
+            if (entry.path != shard.path) continue;
+            // 同名 = 续跑时原地重写了它：条数与哈希都变了，必须替换而不是当成"已经有了"。
+            entry = shard;
+            replaced = true;
+            break;
+        }
+        if (!replaced) current.shards.push_back(shard);
+    }
+    current.meta = meta_;
+    current.meta.shard_samples = shard_samples_;
+    current.state = state;
+    current.shard_layout = kShardLayout;
+    current.episodes = count_episodes(current.shards);
+    current.next_episode = std::max(counter_->high_water(), batch_max_episode_plus_one_);
+    batch_episodes_ = current.episodes;
+    batch_max_episode_plus_one_ = max_episode_plus_one(current.shards);
+    current.samples = 0;
+    for (const ShardInfo& shard : current.shards) current.samples += shard.samples;
+    write_manifest(data_dir_, current);
 }
+
+void ShardWriter::publish(BatchState state) { merge_into_manifest(state); }
+
+uint32_t ShardWriter::episodes_written() const { return batch_episodes_; }
+
+uint32_t ShardWriter::episode_floor() const { return batch_max_episode_plus_one_; }
 
 BatchManifest ShardWriter::finish(BatchState state) {
     flush_shard();  // 末尾那一段不满的数据在这里落盘（它一定结束在一局的末尾）

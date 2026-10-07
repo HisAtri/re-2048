@@ -96,10 +96,18 @@ struct BatchedEngine::Impl {
         if (config.simulations == 0) throw std::runtime_error("模拟次数必须大于 0");
         if (config.simulations > 0xFFFF) throw std::runtime_error("模拟次数上限为 65535");
         control.set_path(config.control_path);
+        control.set_sticky(config.join);  // 多写者：一条 stop 要停整批（见 Control::set_sticky）
         if (config.collect_samples) {
+            if (config.resume && config.join) {
+                throw std::runtime_error("--continue 与 --join 互斥：前者是顺序续写上一段，"
+                                         "后者是加入别人正在写的批次");
+            }
             if (!sink) {
+                const SampleSink::Mode mode = config.join    ? SampleSink::Mode::kJoin
+                                              : config.resume ? SampleSink::Mode::kResume
+                                                              : SampleSink::Mode::kNew;
                 sink = std::make_shared<SampleSink>(data_dir, build_meta(), samples_target_in,
-                                                   shard_samples_in, config.resume);
+                                                   shard_samples_in, mode);
             }
             // lane 的起始局号从共享写入侧取：续跑时接着清单里的局数，新批从 0 开始。
             next_episode.store(sink->peek_next_episode());

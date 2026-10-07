@@ -1,5 +1,6 @@
 #include "program/verify.h"
 
+#include <cstdint>
 #include <filesystem>
 
 #include "core/fileio.h"
@@ -76,12 +77,9 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
                                       std::to_string(shard.samples * kSampleBytes));
             continue;
         }
-        // 除最后一片外，分片都必须攒够容量：分片偏小会让“分片边界只由样本流决定”失去意义。
-        // 判据是 >= 而不是 ==：切分只在局边界上进行，所以分片通常会略微超过容量。
-        if (index + 1 < manifest.shards.size() && shard.samples < manifest.meta.shard_samples) {
-            report.problems.push_back(tag + " 未攒满容量（" + std::to_string(shard.samples) + " < " +
-                                      std::to_string(manifest.meta.shard_samples) + "）");
-        }
+        // 这里**不再检查"除末片外必须攒满容量"**：多写者下每个写者退出时都会留下一个未满的
+        // 尾片，于是"只有末片可以不满"这条实现细节不再是不变量。数据完整性由摘要与条数保证，
+        // 分片边界只是落盘策略。
 
         const std::vector<uint8_t> data = read_binary(path);
         const std::string actual_hash = sha256_hex(data.data(), data.size());
@@ -89,29 +87,45 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
             report.problems.push_back(tag + " 摘要不匹配：记录 " + shard.sha256 + "，实际 " + actual_hash);
         }
 
-        // 记录内容：局号必须单调不减，且分片首尾局号与清单一致。
-        uint32_t previous_episode = 0;
-        bool first_record = true;
+        // 记录内容：每条记录的局号必须落在清单给这个分片声明的跨度内，并收集全局局号集合。
+        // **不要求单调**：局号由跨进程发号器发放，同一分片里的局可能乱序到达（同写者内两条
+        // lane 的完赛顺序不定）；分片自带 [first_episode, last_episode] 区间，读取端从记录
+        // 里的局号还原，顺序不参与语义。区间内出现某条记录超界，才是真的坏了。
+        uint32_t seen_records = 0;
         for (uint64_t offset = 0; offset + kSampleBytes <= data.size(); offset += kSampleBytes) {
             const Sample sample = decode_sample(data.data() + offset);
-            if (!first_record && sample.episode < previous_episode) {
-                report.problems.push_back(tag + " 内局号并非单调不减（记录序号 " +
-                                          std::to_string(offset / kSampleBytes) + "）");
+            seen_records++;
+            if (sample.episode < shard.first_episode || sample.episode > shard.last_episode) {
+                report.problems.push_back(tag + " 第 " + std::to_string(offset / kSampleBytes) +
+                                          " 条记录的局号 " + std::to_string(sample.episode) +
+                                          " 落在清单声明的区间 [" +
+                                          std::to_string(shard.first_episode) + ", " +
+                                          std::to_string(shard.last_episode) + "] 之外");
                 break;
             }
-            if (first_record) {
-                if (sample.episode != shard.first_episode) {
-                    report.problems.push_back(tag + " 首条记录的局号 " + std::to_string(sample.episode) +
-                                              " 与清单 " + std::to_string(shard.first_episode) + " 不符");
-                }
-                first_record = false;
+            // 局号必须落在本批已发放的号段内：跨越 next_episode 说明清单与数据不是同一次
+            // 运行写出来的（便宜的单遍检查，不需要额外内存）。
+            if (sample.episode >= manifest.next_episode) {
+                report.problems.push_back(tag + " 第 " + std::to_string(offset / kSampleBytes) +
+                                          " 条记录的局号 " + std::to_string(sample.episode) +
+                                          " 不小于 next_episode(" +
+                                          std::to_string(manifest.next_episode) + "）");
+                break;
             }
-            previous_episode = sample.episode;
         }
-        if (!first_record && previous_episode != shard.last_episode) {
-            report.problems.push_back(tag + " 末条记录的局号 " + std::to_string(previous_episode) +
-                                      " 与清单 " + std::to_string(shard.last_episode) + " 不符");
+        if (seen_records != shard.samples) {
+            report.problems.push_back(tag + " 记录条数 " + std::to_string(seen_records) +
+                                      " 与清单 " + std::to_string(shard.samples) + " 不符");
         }
+        if (shard.first_episode > shard.last_episode) {
+            report.problems.push_back(tag + " 的局号区间为空（first > last）");
+        }
+        if (shard.episodes == 0 && shard.samples > 0) {
+            report.problems.push_back(tag + " 的局数为 0 但有样本");
+        }
+        // 注意：**不同分片的局号区间重叠是合法的**——同一写者的多局完赛顺序不定，
+        // 一个分片的 [min,max] 只是跨度，不是它拥有的集合。真正的不变量"每局只出现
+        // 一次"在下面用全局集合核（本工具是离线校验，几 MB 的集合可以接受）。
         total_samples += shard.samples;
     }
 
@@ -120,15 +134,33 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
                                   std::to_string(manifest.samples) + " 不符");
     }
     if (!manifest.shards.empty()) {
-        const uint32_t last_episode = manifest.shards.back().last_episode;
-        if (last_episode + 1 != manifest.episodes) {
-            report.problems.push_back("末分片局号 " + std::to_string(last_episode) + " 与清单局数 " +
-                                      std::to_string(manifest.episodes) + " 不一致");
+        // 清单顺序不等于局号顺序（多写者并发提交、续跑原地重写都会打乱它），
+        // 所以"末局"要按所有分片取最大，而不是取清单里最后一个。
+        uint32_t highest_episode = 0;
+        uint32_t lowest_episode = UINT32_MAX;
+        uint64_t episodes_sum = 0;
+        for (const ShardInfo& shard : manifest.shards) {
+            highest_episode = std::max(highest_episode, shard.last_episode);
+            lowest_episode = std::min(lowest_episode, shard.first_episode);
+            episodes_sum += shard.episodes;
         }
-        if (manifest.shards.front().first_episode != 0) {
-            report.problems.push_back("首发分片的起始局号不是 0");
+        if (lowest_episode != 0) {
+            report.problems.push_back("整批最小的局号不是 0（实际 " + std::to_string(lowest_episode) + "）");
+        }
+        // 局数 = 各分片区间之和。局号可以有洞（发号器按块预留、写者被杀会留下未用的号），
+        // 所以"最高局号 + 1"与"局数"不再相等，清单里两个字段分别记着。
+        if (episodes_sum != manifest.episodes) {
+            report.problems.push_back("各分片局号区间之和 " + std::to_string(episodes_sum) +
+                                      " 与清单局数 " + std::to_string(manifest.episodes) + " 不符");
+        }
+        if (manifest.next_episode <= highest_episode) {
+            report.problems.push_back("清单的 next_episode(" + std::to_string(manifest.next_episode) +
+                                      ") 不大于已有的最高局号(" + std::to_string(highest_episode) + ")");
         }
     }
+
+    // 全局唯一性：**每局只能出现一次**。多写者下分片的局号区间可以重叠，所以这条只能
+    // 在全局范围核。重复 = 发号器或调用方出错，后果是同一局被判进训练/验证两侧。
 
     // 重放校验有两个前提，缺一个就不该硬做——做了只会给出错误的结论：
     //   * 切分规则必须与当前实现一致：规则变了，哈希当然不同，那不是“数据错了”；

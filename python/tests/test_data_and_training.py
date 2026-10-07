@@ -752,9 +752,10 @@ def test_resume_keeps_best_selection(batch_dir: Path, tmp_path: Path) -> None:
     first = run_training(line())
     state = torch.load(tmp_path / "line" / "last.pt", weights_only=False, map_location="cpu")
     assert state["best_metric_kind"] == "val_value_mae" and state["best_metric"] is not None
-    # 前提：第一段的最后一轮就是最佳。这条测试的整个判据都建立在"新一轮不可能更好"上，
-    # 前提不成立时它应当直接失败，而不是悄悄变成一条什么都没测的测试。
-    assert state["best_metric"] == state["history"][-1]["val_value_mae"]
+    # 前提：第一段的最佳**不差于**最后一轮（这样 lr=0 的那一轮就不构成改善）。
+    # 之前这里写的是"最佳 = 最后一轮"，它在另一批数据上不成立并直接失败了——那是对的
+    # （前提不成立就该失败），但这个更强的前提并不是判据需要的：判据只需要"新旧一轮不更好"。
+    assert state["best_metric"] <= state["history"][-1]["val_value_mae"]
     selected_digest = torch.load(first.best_checkpoint, weights_only=False, map_location="cpu")["metadata"][
         "config_digest"
     ]

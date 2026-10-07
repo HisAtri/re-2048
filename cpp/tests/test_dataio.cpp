@@ -195,7 +195,9 @@ TEST(dataio_manifest_json_roundtrip) {
     manifest.meta.params = {{"policy", "mcts"}, {"samples", "200000"}};
     manifest.samples = 200000;
     manifest.episodes = 1697;
-    manifest.shards = {{"shards/shard-000000.bin", 100000, 0, 812, "aa"}, {"shards/shard-000001.bin", 100000, 812, 1696, "bb"}};
+    manifest.next_episode = 1697;
+    manifest.shards = {{"shards/shard-000000.bin", 100000, 813, 0, 812, "aa"},
+                       {"shards/shard-000001.bin", 100000, 884, 813, 1696, "bb"}};
 
     const std::string text = manifest_to_json(manifest).dump(2);
     const BatchManifest parsed = manifest_from_json(parse_json(text));
@@ -209,7 +211,9 @@ TEST(dataio_manifest_json_roundtrip) {
     expect_equal_u64(parsed.episodes, 1697, "局数往返一致");
     expect_equal_u64(parsed.shards.size(), 2, "分片数往返一致");
     expect_contains(parsed.shards[1].sha256, "bb", "分片摘要往返一致");
-    expect_equal_u64(parsed.shards[1].first_episode, 812, "分片起始局号往返一致");
+    expect_equal_u64(parsed.shards[1].first_episode, 813, "分片起始局号往返一致");
+    expect_equal_u64(parsed.shards[0].episodes, 813, "分片局数往返一致");
+    expect_equal_u64(parsed.next_episode, 1697, "发号高水位往返一致");
     expect_equal_u64(parsed.meta.params.size(), 2, "原始参数往返一致");
 
     // 版本不匹配必须报错：用错语义解释旧数据比直接失败危险得多。

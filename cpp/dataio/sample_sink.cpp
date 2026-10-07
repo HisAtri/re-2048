@@ -8,11 +8,14 @@
 namespace r2048 {
 
 SampleSink::SampleSink(std::string data_dir, BatchMeta meta, uint64_t samples_target,
-                       uint64_t shard_samples, bool resume)
+                       uint64_t shard_samples, Mode mode)
     : data_dir_(std::move(data_dir)), meta_(std::move(meta)), samples_target_(samples_target) {
-    if (resume) {
-        // 续跑：编号接着清单里的局数，所以写入器必须先建好，lane 才能拿到起始编号。
+    if (mode == Mode::kResume) {
+        // 顺序续跑：编号接着清单里的最大局号，所以写入器必须先建好，lane 才能拿到起始编号。
         writer_ = std::make_unique<ShardWriter>(ShardWriter::resume(data_dir_, shard_samples, meta_));
+    } else if (mode == Mode::kJoin) {
+        // 加入并行写者：与 resume 的区别是**不读回末片**（它可能正被别的写者填着）。
+        writer_ = std::make_unique<ShardWriter>(ShardWriter::join(data_dir_, shard_samples, meta_));
     } else {
         if (!dir_is_usable_as_output(data_dir_)) {
             throw std::runtime_error("输出目录已存在且非空，拒绝覆盖: " + data_dir_ +
@@ -21,14 +24,12 @@ SampleSink::SampleSink(std::string data_dir, BatchMeta meta, uint64_t samples_ta
         ensure_dir(data_dir_);
         writer_ = std::make_unique<ShardWriter>(data_dir_, shard_samples, meta_);
     }
-    next_episode_.store(writer_->next_episode());
-    next_episode_to_write_ = writer_->next_episode();
     manifest_path_ = data_dir_ + "/manifest.json";
 }
 
-uint32_t SampleSink::next_episode() { return next_episode_.fetch_add(1); }
+uint32_t SampleSink::next_episode() { return writer_->take_episode(); }
 
-uint32_t SampleSink::peek_next_episode() const { return next_episode_.load(); }
+uint32_t SampleSink::peek_next_episode() const { return writer_->next_episode(); }
 
 void SampleSink::submit_episode(uint32_t episode, std::vector<Sample> samples) {
     {
@@ -41,24 +42,29 @@ void SampleSink::submit_episode(uint32_t episode, std::vector<Sample> samples) {
 }
 
 void SampleSink::flush_locked() {
-    while (true) {
-        const auto found = completed_.find(next_episode_to_write_);
-        if (found == completed_.end()) break;
-        std::vector<Sample> samples = std::move(found->second);
-        completed_.erase(found);
+    // 把**已完成的局**按局号排序后落盘，不等"下一个号"。
+    //
+    // 旧实现（单写者时代）会等 `next_episode_to_write_` 到齐才落盘，好处是每个分片正好是
+    // 一段连续局号。但局号现在由**跨进程**发号器发放，某个号可能属于另一个写者、永远不会
+    // 送到这里——等它就等于永久卡住。所以：分片按"自己收到的局号区间"落盘，区间可以有洞，
+    // 读取端从每条记录的局号还原（分片自带 first/last_episode），顺序不再参与语义。
+    while (!completed_.empty()) {
+        auto it = completed_.begin();  // std::map 有序：每次都取最小的那一局
+        const uint32_t episode = it->first;
+        std::vector<Sample> samples = std::move(it->second);
+        completed_.erase(it);
 
         if (samples_target_ > 0 && writer_->samples_written() >= samples_target_) {
             stop_.store(true);
             break;
         }
         if (samples_target_ > 0 && writer_->samples_written() + samples.size() > samples_target_) {
-            // 最后一个不完整的局被截断：样本数恰好等于目标条数，且截断只依赖目标，
-            // 与并发度、调度顺序无关。不限量（目标为 0）时没有截断可言：一局要么整局落盘，要么不落。
+            // 目标边界上那一局被截断：总数恰好等于目标。多写者下"哪一局被截断"取决于落盘
+            // 顺序（不再唯一），但**条数只由目标决定**——训练看到的总量是确定的。
             samples.resize(static_cast<size_t>(samples_target_ - writer_->samples_written()));
             stop_.store(true);
         }
-        writer_->add_episode(next_episode_to_write_, samples);
-        next_episode_to_write_++;
+        writer_->add_episode(episode, samples);
         if (samples_target_ > 0 && writer_->samples_written() >= samples_target_) stop_.store(true);
     }
 }

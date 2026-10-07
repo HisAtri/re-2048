@@ -30,6 +30,9 @@ public:
 
     // path 为空表示只用信号通道（评测这类短任务用不上控制文件）。
     void set_path(std::string path);
+    // 多写者（--join）时设 true：控制文件**不删**，于是每个写者都能读到同一条指令
+    // （一次性消费只能停住抢到它的那一个进程，其余会继续跑——那不是用户期望的"停这一批"）。
+    void set_sticky(bool sticky) { sticky_ = sticky; }
     const std::string& path() const { return path_; }
 
     // 安装 SIGINT/SIGTERM 处理。只允许纯 C++ 命令调用：Python 侧有自己的
@@ -44,6 +47,7 @@ public:
     ControlCommand poll();
 
 private:
+    bool sticky_ = false;
     std::string path_;
     std::string warned_content_;  // 已经报过错的非法内容（同一句话不重复刷屏）
     double next_poll_at_ = 0.0;   // 节流：下一次允许读文件的时间

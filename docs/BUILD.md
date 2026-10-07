@@ -139,6 +139,46 @@ python -m r2048 selfplay ...      # NN 引导的批量自对弈（需要 --check
 （Makefile 已代劳）。它不在 PyPI 上，也不会被装进 site-packages——源码树里因此
 不会出现任何二进制产物。
 
+### 训练配置（YAML）
+
+训练是唯一带配置文件的环节（ADR 0021）：它的参数属于"一条训练线"，要被反复引用、
+被记进 checkpoint、被迭代编排复用。跑谱 / 评测 / 评分仍然只有 CLI。
+
+```yaml
+# train.yaml
+datasets: # 用它训练哪些数据，多来源在这里列
+  - path: $R2048_OUTPUT_DIR/data/teacher-s256
+    weight: 1.0 # 每轮采样的相对配额；0 = 不用这个来源
+  - path: $R2048_OUTPUT_DIR/data/teacher-s1024
+    weight: 0.25 # 小比例混入
+    limit: 0 # 可选：只用该来源的前 N 条（0 = 不限）
+train:
+  mode: value
+  epochs: 8
+  batch_size: 4096
+  lr: 3.0e-4
+  seed: 11
+```
+
+```bash
+make py ARGS="train --config train.yaml --output $R2048_OUTPUT_DIR/runs/value-w1"
+# --data 是单批用法，给了它就以它为准（编排用它把训练线切到刚跑出来的数据上）
+make py ARGS="train --config train.yaml --data $R2048_OUTPUT_DIR/data/new --output ..."
+```
+
+几条要点：
+
+* **优先级 CLI > YAML > 默认值**，`train:` 里的字段名与 `TrainConfig` 一致；
+  出现未知小节 / 字段 / 数据键都直接报错（拼错的键被忽略等于"改了半天没生效"）。
+* **来源身份 = `(source_key, episode)`**：局号只在批内有效，`source_key` 由 provenance
+  （策略、模拟数、seed、模型、build、协议参数、schema/rules/protocol 版本）算出，
+  与目录名、批次号无关。合并多个来源时**每个来源自己的划分不会变**，
+  而"同 seed 的同一局号"不再被判成同一局。
+* **权重是每轮配额**（`quota_i ∝ w_i × 训练池_i`，每轮长度默认 = 各来源训练池之和）。
+  **权重 0 等于没列这个来源**：训练曲线与"不列它"逐张量相同。
+* 训练日志逐来源报出训练/验证局数；`train.json` 与 checkpoint 元数据逐来源记身份与权重；
+  **验证集为空直接报错**（除非显式 `val_fraction=0`）。
+
 ## 性能记录（本机实测，16 核 WSL2 + 直通 GPU）
 
 | 场景 | 参数 | 结果 |

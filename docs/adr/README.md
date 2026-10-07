@@ -26,6 +26,7 @@ ADR 解释为什么整体是这个形状。
 | [0018](0018-protocol-variable-registry.md) | 协议变量收口：清单、归属与拒绝兜底 | 已采纳 |
 | [0019](0019-jobs-and-progress.md) | 作业目录、结构化进度与子进程封装 | 已采纳（C++ 子命令进度已结构化，见 0020 决策 10） |
 | [0020](0020-selfplay-lifecycle-and-incremental-commit.md) | 跑谱生命周期与增量提交（不限量 / 暂停 / 继续 / 终止） | 已采纳 |
+| [0021](0021-multi-source-identity-and-training-config.md) | 多来源数据身份与训练配置（YAML） | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

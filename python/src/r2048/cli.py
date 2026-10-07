@@ -23,34 +23,73 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("version", help="打印 Python 侧与 C++ 内核的版本信息")
     sub.add_parser("env", help="打印输出目录等路径解析结果")
 
-    train = sub.add_parser("train", help="训练价值头 / 策略头 / 联合 / 双塔")
-    train.add_argument("--data", required=True, help="数据批目录（含 manifest.json）")
+    train = sub.add_parser(
+        "train",
+        help="训练价值头 / 策略头 / 联合 / 双塔",
+        description=(
+            "训练。默认值取自 TrainConfig（见 nn/training.py），--config 的 train 小节与命令行同名；"
+            "优先级 CLI > YAML > 默认值。"
+        ),
+    )
+    # 所有参数都用 SUPPRESS 默认值：只有显式给出的才会出现在 namespace 里，
+    # 于是"用户到底指定了什么"是精确可知的，YAML 与 CLI 的合并才谈得上"谁覆盖谁"。
+    train.add_argument("--config", default="", help="训练配置文件（YAML：datasets + train）")
+    train.add_argument(
+        "--data", default="", help="数据批目录（含 manifest.json）；与 --config 的 datasets 二选一"
+    )
     train.add_argument("--output", required=True, help="运行目录（写 checkpoint 与 train.json）")
-    train.add_argument("--mode", default="value", choices=["value", "policy", "joint", "dual"])
-    train.add_argument("--init-checkpoint", default="", help="从已有 checkpoint 初始化")
-    train.add_argument("--architecture", default="", help="覆盖结构（默认按模式选）")
-    train.add_argument("--freeze-value", action="store_true", help="只训练策略路径（策略模式的推荐做法）")
-    train.add_argument("--epochs", type=int, default=20)
-    train.add_argument("--batch-size", type=int, default=4096)
-    train.add_argument("--lr", type=float, default=3e-4)
-    train.add_argument("--weight-decay", type=float, default=0.0)
-    train.add_argument("--lr-schedule", default="cosine", choices=["cosine", "constant"])
-    train.add_argument("--warmup-steps", type=int, default=200)
-    train.add_argument("--grad-clip", type=float, default=1.0)
-    train.add_argument("--value-loss", default="huber", choices=["huber", "mse"])
-    train.add_argument("--value-weight", type=float, default=1.0)
-    train.add_argument("--policy-weight", type=float, default=1.0)
-    train.add_argument("--val-fraction", type=float, default=0.05)
-    train.add_argument("--split-seed", type=int, default=0)
-    train.add_argument("--no-augment", action="store_true", help="关闭 D4 增强")
-    train.add_argument("--max-samples", type=int, default=0, help="限制训练样本数（调试用）")
-    train.add_argument("--device", default="cuda")
-    train.add_argument("--seed", type=int, default=0)
-    train.add_argument("--amp", default="off", choices=["off", "bf16"])
-    train.add_argument("--no-channels-last", action="store_true")
-    train.add_argument("--compile", action="store_true", help="torch.compile（首次调用有编译开销）")
-    train.add_argument("--log-every", type=int, default=50)
-    train.add_argument("--resume", action="store_true")
+    train.add_argument("--mode", default=argparse.SUPPRESS, choices=["value", "policy", "joint", "dual"])
+    train.add_argument("--init-checkpoint", default=argparse.SUPPRESS, help="从已有 checkpoint 初始化")
+    train.add_argument("--architecture", default=argparse.SUPPRESS, help="覆盖结构（默认按模式选）")
+    train.add_argument(
+        "--freeze-value",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="只训练策略路径（策略模式的推荐做法）",
+    )
+    train.add_argument("--epochs", type=int, default=argparse.SUPPRESS)
+    train.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
+    train.add_argument("--lr", type=float, default=argparse.SUPPRESS)
+    train.add_argument("--weight-decay", type=float, default=argparse.SUPPRESS)
+    train.add_argument("--lr-schedule", default=argparse.SUPPRESS, choices=["cosine", "constant"])
+    train.add_argument("--warmup-steps", type=int, default=argparse.SUPPRESS)
+    train.add_argument("--grad-clip", type=float, default=argparse.SUPPRESS)
+    train.add_argument("--value-loss", default=argparse.SUPPRESS, choices=["huber", "mse"])
+    train.add_argument(
+        "--value-target",
+        default=argparse.SUPPRESS,
+        choices=["auto", "candidate", "trajectory"],
+        help="价值回归用候选目标还是主轨迹回报（auto：有候选监督就用候选）",
+    )
+    train.add_argument("--value-weight", type=float, default=argparse.SUPPRESS)
+    train.add_argument("--policy-weight", type=float, default=argparse.SUPPRESS)
+    train.add_argument("--val-fraction", type=float, default=argparse.SUPPRESS)
+    train.add_argument("--split-seed", type=int, default=argparse.SUPPRESS)
+    train.add_argument(
+        "--samples-per-epoch",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="每轮采样多少条（0 = 各来源训练池之和）",
+    )
+    train.add_argument("--no-augment", action="store_true", default=argparse.SUPPRESS, help="关闭 D4 增强")
+    train.add_argument(
+        "--max-samples",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="限制训练样本数（调试用，按全局下标顺序截断）",
+    )
+    train.add_argument("--device", default=argparse.SUPPRESS)
+    train.add_argument("--seed", type=int, default=argparse.SUPPRESS)
+    train.add_argument("--amp", default=argparse.SUPPRESS, choices=["off", "bf16"])
+    train.add_argument("--no-channels-last", action="store_true", default=argparse.SUPPRESS)
+    train.add_argument(
+        "--compile",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="torch.compile（首次调用有编译开销）",
+    )
+    train.add_argument("--log-every", type=int, default=argparse.SUPPRESS)
+    train.add_argument("--resume", action="store_true", default=argparse.SUPPRESS)
 
     evaluate = sub.add_parser("eval", help="用 checkpoint 跑固定局数评测（三条 track）")
     evaluate.add_argument("--checkpoint", default="", help="模型 checkpoint（纯网络 track 必需）")
@@ -170,47 +209,20 @@ def _command_env() -> int:
 
 
 def _command_train(args: argparse.Namespace) -> int:
-    from dataclasses import asdict
-
+    from r2048.config import build_train_config
     from r2048.jobs import JobDir
-    from r2048.nn.training import TrainConfig, run_training
+    from r2048.nn.training import config_payload, data_label, run_training
 
-    config = TrainConfig(
-        data=args.data,
-        output=args.output,
-        mode=args.mode,
-        init_checkpoint=args.init_checkpoint,
-        architecture=args.architecture,
-        freeze_value=args.freeze_value,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        lr_schedule=args.lr_schedule,
-        warmup_steps=args.warmup_steps,
-        grad_clip=args.grad_clip,
-        value_loss=args.value_loss,
-        value_weight=args.value_weight,
-        policy_weight=args.policy_weight,
-        val_fraction=args.val_fraction,
-        split_seed=args.split_seed,
-        augment=not args.no_augment,
-        max_samples=args.max_samples,
-        device=args.device,
-        seed=args.seed,
-        amp=args.amp,
-        channels_last=not args.no_channels_last,
-        compile=args.compile,
-        log_every=args.log_every,
-        resume=args.resume,
-    )
+    # 参数合并（CLI > YAML > 默认值）全在配置层：命令行这里不逐个字段搬运，
+    # 少一处"新加了字段但忘了接线"的地方。
+    config = build_train_config(args)
     # 训练的运行目录本来就是 --output，作业状态与日志直接落在同一个目录里：
     # 事后排查“这次训练是怎么跑的”时，job.json/status.json 与 train.json 在同一处。
-    with JobDir(Path(args.output).name, "train", params=asdict(config), root=args.output) as job:
+    with JobDir(Path(args.output).name, "train", params=config_payload(config), path=args.output) as job:
         config.on_progress = job.callback()
         result = run_training(config)
         job.finish(best_checkpoint=result.best_checkpoint, train_json=result.train_json)
-    print(f"完成：最佳 checkpoint {result.best_checkpoint}")
+    print(f"完成：{data_label(config)} 最佳 checkpoint {result.best_checkpoint}")
     print(f"运行记录 {result.train_json}")
     # stdout 只放可被脚本消费的结果。
     print(result.best_checkpoint)

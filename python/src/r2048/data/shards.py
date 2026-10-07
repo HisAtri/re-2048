@@ -115,14 +115,73 @@ class BatchManifest:
         """
         return int(self.data.get("shard_layout", 1))
 
+    def source_key(self) -> str:
+        """这批数据的**来源身份**：由"第 k 局是哪一局"的字段算出，不看目录与批次号。
+
+        为什么需要它：`episode` 是**批内**编号（0..N−1），而切分是按局哈希做的。
+        两个来源共用同一 seed 时（自对弈的常规情形——`teacher-s256` 与 `teacher-s1024`
+        都是 seed 20261020、局号都从 0 起），合并后同一个局号指向两局不同的棋：
+        "同一局不跨训练/验证集"这条保护随之失效，按局统计也会串线。
+        把来源折进局的身份是唯一的修法。
+
+        为什么是这些字段而不是路径或批次号：来源是"谁、用什么协议产出的"，
+        与它放在哪个目录、叫什么批次号无关（搬目录、就地续跑都不该换身份）。
+        也**不含** samples / episodes / state——续跑会一直改它们，
+        而续跑前后的数据按定义仍是同一个来源。
+        """
+        return source_identity(self.data)[0]
+
+    def source_code(self) -> int:
+        """来源身份的 64 位数值形式，供向量化的按局哈希使用（见 dataset.make_split）。"""
+        return source_identity(self.data)[1]
+
     def describe(self) -> str:
         # 状态写在最前面：拿一份 paused/stopped 的批次去训练，是「数据还在长」而不是
         # 「数据已定稿」，这个区别必须在第一眼就看见。
         return (
             f"{self.path.parent.name} [{self.state}]: 策略 {self.policy}，模拟 {self.simulations}，"
             f"模型 {self.model_id or '-'}，样本 {self.samples}，局数 {self.episodes}，"
-            f"引擎 {self.build_id}"
+            f"引擎 {self.build_id}，来源 {self.source_key()}"
         )
+
+
+# 决定"第 k 局是哪一局"的字段：协议 + 种子 + 产出者。
+# 少一项就等于把两个不同的来源当成同一个：例如漏掉 simulations，"s256" 与 "s1024"
+# 的自对弈数据会被认为第 0 局是同一局，而同种子下它们下的是完全不同的棋。
+SOURCE_KEY_FIELDS = ("policy", "simulations", "temperature_moves", "seed", "model_id", "build_id")
+# params 里属于协议的键（与 C++ 侧 cpp/dataio/shard.cpp 的 kProtocolParams 同源：
+# 那边用它做续跑闸门，这边用它做来源身份——两处都只关心"会改变逐局结果"的参数）。
+SOURCE_KEY_PARAMS = (
+    "c_puct",
+    "lanes",
+    "in_flight_per_lane",
+    "temperature",
+    "cache_entries",
+    "max_batch",
+    "device",
+)
+
+
+def source_identity(data: dict) -> tuple[str, int]:
+    """算出来源身份：返回（十六进制短标识, 64 位数值）。
+
+    两个形式来自同一个摘要：短标识给人看与写进日志/元数据，
+    数值形式让"按局哈希"可以整数组算，不必逐样本走 Python。
+    """
+    params = data.get("params", {}) or {}
+    canonical = json.dumps(
+        {
+            "fields": {name: data.get(name) for name in SOURCE_KEY_FIELDS},
+            "params": {name: params.get(name) for name in SOURCE_KEY_PARAMS if name in params},
+            "schema_version": data.get("schema_version"),
+            "rules_version": data.get("rules_version"),
+            "protocol_version": data.get("protocol_version"),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode()
+    digest = hashlib.blake2b(canonical, digest_size=8).digest()
+    return digest.hex(), int.from_bytes(digest, "little")
 
 
 def read_manifest(data_dir: str | Path, check_versions: bool = True) -> BatchManifest:
@@ -231,3 +290,8 @@ class BatchReader:
     def close(self) -> None:
         self._arrays.clear()
         self._episodes = None
+
+    def describe(self) -> str:
+        """训练日志的一行来源说明。与 `MultiSourceReader.describe()` 同形，
+        训练侧不必区分拿到的是一批还是多批。"""
+        return self.manifest.describe()

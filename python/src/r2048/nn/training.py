@@ -30,7 +30,7 @@ import r2048_core
 import torch
 from torch.nn import functional as F
 
-from r2048.data.dataset import Batch, BatchStream, batch_manifest_summary, open_batch
+from r2048.data.dataset import Batch, BatchStream, SourceMix, open_sources, source_summary
 from r2048.data.shards import CANDIDATE_TARGET_DEFINITION
 from r2048.jobs import finish_console, progress_payload
 from r2048.nn.augment import augment_joint, augment_policy, augment_value
@@ -53,10 +53,24 @@ def default_architecture(mode: str) -> str:
     return DUAL_TOWER_ARCHITECTURE if mode == "dual" else SHARED_ARCHITECTURE
 
 
+@dataclass(frozen=True)
+class DatasetSpec:
+    """一个训练数据来源：路径 + 采样权重 + 可选条数上限。
+
+    权重是"每轮按它分配采样配额"的相对量，不是"这个来源跑几遍"：课程学习里要表达的是
+    "把新数据小比例混进大池子"，配额语义能直接写出它。**权重 0 等于不列这个来源**
+    （样本数不参与每轮长度，也不消耗随机数），所以关掉一个来源不会改变别的来源的采样。
+    """
+
+    path: str
+    weight: float = 1.0
+    limit: int = 0  # 只用该来源的前 N 条（0 = 不限）
+
+
 @dataclass
 class TrainConfig:
-    data: str
-    output: str
+    datasets: list[DatasetSpec] = field(default_factory=list)
+    output: str = ""
     mode: str = "value"
     init_checkpoint: str = ""
     architecture: str = ""
@@ -76,6 +90,8 @@ class TrainConfig:
     policy_weight: float = 1.0
     val_fraction: float = 0.05
     split_seed: int = 0
+    # 每轮采样多少条（0 = 各来源训练池之和）。只在多来源或显式想缩短轮长时才有意义。
+    samples_per_epoch: int = 0
     augment: bool = True
     max_samples: int = 0
     device: str = "cuda"
@@ -124,8 +140,27 @@ class TrainResult:
     train_json: str = ""
 
 
+def config_payload(config: TrainConfig) -> dict:
+    """可序列化的配置快照：进度回调是运行期接进来的，不属于配置。
+
+    它必须与配置摘要、落盘共用同一份口径——回调进不了 JSON，一旦混进去，
+    带回调跑训练（也就是走 CLI 的每一次）会在第一次写 checkpoint 时崩掉。
+    """
+    payload = asdict(config)
+    payload.pop("on_progress", None)
+    return payload
+
+
 def config_digest(config: TrainConfig) -> str:
-    return hashlib.sha256(json.dumps(asdict(config), sort_keys=True).encode()).hexdigest()[:16]
+    return hashlib.sha256(json.dumps(config_payload(config), sort_keys=True).encode()).hexdigest()[:16]
+
+
+def data_label(config: TrainConfig) -> str:
+    """写进 model_id 的数据标签：单来源用目录名（与既有 checkpoint 的命名习惯一致），
+    多来源只报个数——把三个来源的目录名拼进 model_id 只会让标识长到没人读。"""
+    if len(config.datasets) == 1:
+        return Path(config.datasets[0].path).name
+    return f"{len(config.datasets)}src"
 
 
 def file_digest(path: str | Path) -> str:
@@ -485,13 +520,49 @@ def run_training(config: TrainConfig) -> TrainResult:
     rng = torch.Generator(device=device.type).manual_seed(config.seed)
     score_scale = float(r2048_core.SCORE_SCALE)
 
-    reader, split = open_batch(config.data, val_fraction=config.val_fraction, seed=config.split_seed)
+    if not config.datasets:
+        raise ValueError(
+            "必须给出训练数据：TrainConfig.datasets 至少要有一个来源（CLI 是 --data 或 --config）"
+        )
+    reader, split = open_sources(
+        [(spec.path, spec.weight, spec.limit) for spec in config.datasets],
+        val_fraction=config.val_fraction,
+        seed=config.split_seed,
+    )
+    if reader.duplicates:
+        repeated = "，".join(f"{name}（{key}）" for key, name in reader.duplicates)
+        print(f"警告：以下来源在配置里重复出现，已按来源身份去重：{repeated}")
     train_indices, val_indices = split.train, split.val
     if config.max_samples > 0:
+        # 调试用的全局上限：按全局下标顺序截断（多来源时就是按配置顺序先喂满前面的来源）。
         train_indices = train_indices[: config.max_samples]
         val_indices = val_indices[: max(1, min(config.max_samples // 10, val_indices.size))]
     if train_indices.size == 0:
         raise ValueError("训练集为空：检查 val_fraction 与数据批内容")
+    if config.val_fraction > 0 and val_indices.size == 0:
+        # 验证集空掉时不会报错，只会让所有验证指标变成 NaN、让"最佳 checkpoint"永远选不出来
+        # （实测：5% × 50 局的批次有约 8% 的概率一局都选不进验证集）。这类安静的空转
+        # 必须变成显式的失败，或者由调用方显式声明 val_fraction=0。
+        raise ValueError(
+            f"验证集为空：val_fraction={config.val_fraction} 在 {reader.episodes} 局（逐来源："
+            + "，".join(f"{source.episodes} 局" for source in reader.sources)
+            + "）里一局都没选到。提高 val_fraction、换 split_seed，或显式设 val_fraction=0 关闭验证。"
+        )
+    # 单来源不套采样器：走原来的“整池打乱”，一个随机数都不多用。多来源（或显式指定轮长）
+    # 才需要按权重分配配额。采样器在截断之后建，池子就一定是训练集的下标子集。
+    mix = (
+        SourceMix.for_split(
+            reader, train_indices, samples_per_epoch=config.samples_per_epoch, seed=config.seed
+        )
+        if len(reader.sources) > 1 or config.samples_per_epoch > 0
+        else None
+    )
+    data_summary = source_summary(reader)
+    # 单来源保留历史上那两个键（评测脚本与旧产物比对在用）；多来源不挑一个来源冒充整体，
+    # 身份一律以 sources 列表为准。
+    only_manifest = reader.sources[0].manifest if len(reader.sources) == 1 else None
+    single_batch_id = str(only_manifest.data.get("batch_id", "")) if only_manifest else ""
+    single_build_id = only_manifest.build_id if only_manifest else ""
 
     source_metadata: dict = {}
     if config.init_checkpoint:
@@ -515,15 +586,20 @@ def run_training(config: TrainConfig) -> TrainResult:
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=config.lr, weight_decay=config.weight_decay)
-    steps_per_epoch = max(1, len(train_indices) // config.batch_size)
+
+    train_stream = BatchStream(
+        reader, train_indices, config.batch_size, seed=config.seed, shuffle=True, mix=mix
+    )
+    val_stream = (
+        BatchStream(reader, val_indices, config.batch_size, seed=config.seed) if val_indices.size else None
+    )
+    # 轮长取采样器报出的每轮样本数，而不是训练下标数组的长度：多来源时两者不等
+    # （配额之和 vs 池子大小），用错了会让学习率日程按错误的总步数铺开。
+    steps_per_epoch = max(1, train_stream.samples_per_epoch // config.batch_size)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, _make_lr_lambda(config, steps_per_epoch * config.epochs)
     )
 
-    train_stream = BatchStream(reader, train_indices, config.batch_size, seed=config.seed, shuffle=True)
-    val_stream = (
-        BatchStream(reader, val_indices, config.batch_size, seed=config.seed) if val_indices.size else None
-    )
     architecture = source_metadata.get(
         "architecture", config.architecture or default_architecture(config.mode)
     )
@@ -543,8 +619,10 @@ def run_training(config: TrainConfig) -> TrainResult:
         best_metric = None
         print(f"续训：从第 {start_epoch + 1} 轮继续（已有 {len(history)} 轮记录）")
 
-    print(reader.manifest.describe())
+    print(reader.describe())
     print(split.describe())
+    if mix is not None:
+        print(mix.describe())
     print(
         f"模式 {config.mode}，结构 {architecture}，可训练参数 {sum(p.numel() for p in trainable):,}，"
         f"冻结张量 {len(frozen)}，批 {config.batch_size}，设备 {device}{' bf16' if amp_dtype else ''}"
@@ -638,7 +716,7 @@ def run_training(config: TrainConfig) -> TrainResult:
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "history": [asdict(item) for item in history],
-                "config": asdict(config),
+                "config": config_payload(config),
             },
             run_dir / "last.pt",
         )
@@ -649,7 +727,7 @@ def run_training(config: TrainConfig) -> TrainResult:
             best_metric = primary
             best_checkpoint = str(run_dir / "model.pt")
             meta = _unwrap(model).metadata(
-                model_id=f"{config.mode}-{Path(config.data).name}",
+                model_id=f"{config.mode}-{data_label(config)}",
                 parent=str(source_metadata.get("model_id", "")),
             )
             meta.update(
@@ -657,8 +735,12 @@ def run_training(config: TrainConfig) -> TrainResult:
                     "training_target": config.mode,
                     "value_frozen": bool(config.mode == "policy" and config.freeze_value),
                     "rules_version": int(r2048_core.RULES_VERSION),
-                    "batch_id": reader.manifest.data.get("batch_id", ""),
-                    "data_build_id": reader.manifest.build_id,
+                    # 数据身份以**逐来源**的形式记：多来源训练时，单独一个 batch_id 说不清
+                    # 这份权重吃过什么。单来源时同时保留 batch_id/data_build_id，让既有
+                    # 读取方（评测脚本、旧产物比对）继续能拿到熟悉的那两个键。
+                    "sources": data_summary["sources"],
+                    "batch_id": single_batch_id,
+                    "data_build_id": single_build_id,
                     "config_digest": config_digest(config),
                     "value_target": (
                         "candidate"
@@ -685,13 +767,17 @@ def run_training(config: TrainConfig) -> TrainResult:
     Path(train_json).write_text(
         json.dumps(
             {
-                "config": asdict(config),
+                "config": config_payload(config),
                 "config_digest": config_digest(config),
                 "architecture": architecture,
                 "frozen_parameters": len(frozen),
                 "trainable_parameters": sum(p.numel() for p in trainable),
-                "data": batch_manifest_summary(reader.manifest),
-                "data_manifest_sha256": file_digest(reader.manifest.path),
+                "data": data_summary,
+                # 逐来源的 manifest 摘要：manifest 是"这批数据有没有被改过"的唯一凭据，
+                # 多来源时它必须逐来源记，否则事后无法判断到底是哪一批变了。
+                "data_manifest_sha256": {
+                    source.key: file_digest(source.manifest.path) for source in reader.sources
+                },
                 "split": {"train": int(train_indices.size), "val": int(val_indices.size)},
                 "history": [asdict(item) for item in history],
                 "best_checkpoint": best_checkpoint,

@@ -244,6 +244,14 @@ class JobDir:
 
     `job_id` 标识**一次尝试**（例如 `selfplay-nn-s64-20261007-120000`），
     而不是一类任务：同一个目录被再次进入时日志是追加的，`job.json` 会被覆盖。
+
+    目录位置有两种意图，所以有两个参数而不是一个含糊的 `root`：
+
+    * `root`：作业目录**们**所在的目录，作业目录 = `<root>/<job_id>`
+      （默认是输出根的 `runs/`）。`selfplay` / `eval` 走这条。
+    * `path`：直接用这个目录当作业目录。`train` 走这条——它的运行目录本来就是
+      `--output`（checkpoint 与 train.json 都写在那里），作业记录应当落在同一处，
+      而不是在它下面再套一层。
     """
 
     def __init__(
@@ -252,13 +260,19 @@ class JobDir:
         kind: str,
         params: dict | None = None,
         root: str | Path | None = None,
+        path: str | Path | None = None,
     ) -> None:
+        if root is not None and path is not None:
+            raise ValueError("JobDir 只接受 root 或 path 之一：前者是作业目录们的所在目录，后者就是作业目录本身")
         self.job_id = job_id
         self.kind = kind
         self.params = dict(params or {})
-        # root 是"作业目录们所在的目录"（默认输出根的 runs/），作业目录本身永远由
-        # job_id 决定：若让 root 直接充当作业目录，两处命名就会开始各说各话。
-        self.path = Path(root) / job_id if root is not None else paths.run_dir(job_id)
+        if path is not None:
+            self.path = Path(path)
+        elif root is not None:
+            self.path = Path(root) / job_id
+        else:
+            self.path = paths.run_dir(job_id)
         self._started = time.monotonic()
         self._log = None
         self._finished = False

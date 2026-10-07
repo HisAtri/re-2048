@@ -182,6 +182,13 @@ values 是**归一化**价值（分数 / score_scale），C++ 侧换算回原始
         py::arg("max_requests"));
 
     engine.def(
+        "abandon",
+        [](r2048::BatchedEngine& self) {
+            py::gil_scoped_release release;
+            self.abandon();
+        },
+        "把当前在途请求全部重新排队（调用方丢弃了一批前向时用）。")
+        .def(
         "submit",
         [](r2048::BatchedEngine& self, const U64Array& ids, const F32Array& values,
            const F32Array& policy_logits) {

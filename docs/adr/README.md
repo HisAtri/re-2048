@@ -32,6 +32,7 @@ ADR 解释为什么整体是这个形状。
 | [0024](0024-model-definition-registry.md) | 模型定义的注册表与版本 ID | 已采纳（决策 2 的论证已由 0026 订正） |
 | [0025](0025-inference-precision.md) | 推理精度的现状与暂不引入降精度开关 | 已采纳 |
 | [0026](0026-model-naming-and-tiers.md) | 模型命名分层与版本层级（测试版 / 正式版） | 已采纳 |
+| [0027](0027-inference-pipeline-utilisation.md) | 推理管线的性能诊断与引擎优化方向 | 已采纳（并行化方案待定） |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

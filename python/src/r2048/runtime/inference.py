@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Protocol
 
 import numpy as np
@@ -34,6 +35,11 @@ class BatchedEvaluator:
         self.device = device
         self.batches = 0
         self.rows = 0
+        # 分相位计时。**GPU 执行时间单独用 CUDA event 量**：Python 侧的 forward 调用是
+        # 异步的（只是把核函数排进流），墙钟量到的是"排队"而不是"算"，唯一能说明
+        # "GPU 忙了多久"的是 event。这两个数放在一起才能回答"到底谁在等谁"。
+        self.seconds = {"encode": 0.0, "forward": 0.0, "collect": 0.0}
+        self.gpu_seconds = 0.0
 
     def evaluate(self, kinds: np.ndarray, boards: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """kinds: (N,) uint8；boards: (N,16) uint8。
@@ -45,12 +51,33 @@ class BatchedEvaluator:
             return (np.zeros(0, dtype=np.float32), np.zeros((0, r2048_core.NUM_ACTIONS), dtype=np.float32))
 
         rows = boards.shape[0]
+        started = time.monotonic()
         encoded = encode_boards(torch.from_numpy(np.ascontiguousarray(boards)).to(torch.long).to(self.device))
+        self.seconds["encode"] += time.monotonic() - started
+
+        started = time.monotonic()
+        # event 只在 CUDA 上能用；CPU 后端就没有"GPU 执行时间"这回事，记 0。
+        use_event = self.device.type == "cuda"
+        begin = end = None
+        if use_event:
+            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            begin.record()
         with torch.no_grad():
             value, logits = self.model(encoded)
-        self.batches += 1
-        self.rows += rows
-        return (
+        if use_event:
+            end.record()
+        self.seconds["forward"] += time.monotonic() - started
+
+        started = time.monotonic()
+        out = (
             value.reshape(-1).to(dtype=torch.float32).cpu().numpy(),
             logits.to(dtype=torch.float32).cpu().numpy(),
         )
+        self.seconds["collect"] += time.monotonic() - started
+        if use_event:
+            # 取回结果已经把流同步了，所以这里的 elapsed_time 是可靠的。
+            self.gpu_seconds += begin.elapsed_time(end) / 1e3
+
+        self.batches += 1
+        self.rows += rows
+        return out

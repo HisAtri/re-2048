@@ -125,8 +125,16 @@ public:
     Advance advance(uint32_t max_requests);
 
     // 回填一批结果：values 为归一化后的价值，policy_logits 为 4 个方向的 logits
-    // （按请求种类只取其一；长度均为 count）。
+    // （按请求种类只取其一；长度均为 count）。未发出的 id 或重复回填直接抛错。
     void submit(const uint64_t* ids, const float* values, const float* policy_logits, size_t count);
+
+    // 放弃所有在途请求：把它们重新排队（下次 advance 会再发一遍）。
+    //
+    // 契约：`advance` 交出去的一批，要么 `submit` 回填，要么在"确实丢了"的时候显式
+    // `abandon`。**允许在未回填的情况下继续 advance**（管线重叠的前提：GPU 在算这一批时，
+    // 搜索继续推进不依赖这些叶子的模拟），所以引擎不再自动补发——那会把正在计算的批次
+    // 当成丢失的重复发一遍。异常路径（Ctrl-C 落在前向里、回调抛异常）由调用方调它。
+    void abandon();
 
     EngineStats stats() const;
 

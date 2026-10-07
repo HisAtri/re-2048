@@ -926,17 +926,9 @@ BatchedEngine::Advance BatchedEngine::advance(uint32_t max_requests) {
         std::lock_guard<std::mutex> lock(impl.cache_mutex);
         impl.fresh_answers.clear();
     }
-    // 上一轮发出、却没有被 submit 回填的请求，在这里重新排队。
-    //
-    // 没有这一步，一次被丢弃的前向就会把这批 lane 永久挂住：待发队列已空、lane 又没有
-    // 收工（它还在等那些答案），于是调用方拿到的是“没有请求、也没有结束”——实测正是
-    // 这样（Ctrl-C 恰好落在前向里）。请求本身可重放（同一个局面、同一份搜索状态），
-    // 重发是唯一正确的补救：那些答案从来没有存在过。
-    // 正常路径下这里是空循环：调用方总会把收到的整批回填掉。
-    {
-        std::lock_guard<std::mutex> lock(impl.bookkeeping_mutex);
-        for (const auto& entry : impl.in_flight) impl.requests.push_back(entry.second);
-    }
+    // 这里**不再**自动补发在途请求：调用方现在允许"手上有一批没回填、同时继续 advance"
+    // （管线重叠，见 ADR 0027）。自动补发会把那批当成丢失的重复发一遍，而它们其实正在
+    // GPU 上算——重复的 id 会让 submit 直接抛错。丢弃由调用方显式声明：abandon()。
 
     // 控制通道：pause/stop 只是把 stop_all 立起来，停车点仍然只有“局与局之间”，
     // 正在进行的局一定走完（否则清单需要的局号会出现空洞，写入侧就永远卡在缺口上）。
@@ -992,6 +984,19 @@ BatchedEngine::Advance BatchedEngine::advance(uint32_t max_requests) {
             : impl.stop_all.load();
     out.done = target_reached && impl.requests.empty() && impl.all_lanes_finished();
     return out;
+}
+
+void BatchedEngine::abandon() {
+    // 把当前在途（已交给调用方、尚未回填）的请求全部重新排队。
+    //
+    // 这是"一次被丢弃的前向"的唯一补救入口：没有它，那批 lane 会永久挂住——待发队列
+    // 已空、lane 又没收工（还在等那些答案），调用方拿到的是"没有请求、也没有结束"
+    // （实测：Ctrl-C 恰好落在前向里）。请求本身可重放（同一局面、同一份搜索状态），
+    // 重发是唯一正确的做法：那些答案从来没有存在过。
+    // 正常路径下它是空操作——调用方总是把收到的整批 submit 掉。
+    Impl& impl = *impl_;
+    std::lock_guard<std::mutex> lock(impl.bookkeeping_mutex);
+    for (const auto& entry : impl.in_flight) impl.requests.push_back(entry.second);
 }
 
 void BatchedEngine::submit(const uint64_t* ids, const float* values, const float* policy_logits,

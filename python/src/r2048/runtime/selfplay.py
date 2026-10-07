@@ -86,6 +86,29 @@ class SelfplayResult:
         return self.forward_rows / self.forward_batches if self.forward_batches > 0 else 0.0
 
 
+def phase_summary(phases: dict, evaluator: BatchedEvaluator, elapsed: float) -> dict:
+    """相位占比与"GPU 真正忙了多久"。
+
+    `advance` 是 C++ 树搜索（单线程），`evaluate` 是编码+前向+取回，`submit` 是回填。
+    `gpu_busy_rate` 用 CUDA event 量到的执行时间除以墙钟——它是"这段流水线到底把 GPU
+    用起来没有"的唯一直接判据（利用率采样是外部的、会漏掉短核函数）。
+    """
+    total = max(1e-9, elapsed)
+    return {
+        "advance": round(phases["advance"], 3),
+        "evaluate": round(phases["evaluate"], 3),
+        "submit": round(phases["submit"], 3),
+        "advance_share": round(phases["advance"] / total, 3),
+        "evaluate_share": round(phases["evaluate"] / total, 3),
+        "submit_share": round(phases["submit"] / total, 3),
+        "gpu_seconds": round(evaluator.gpu_seconds, 3),
+        "gpu_busy_rate": round(evaluator.gpu_seconds / total, 3),
+        "encode_seconds": round(evaluator.seconds["encode"], 3),
+        "forward_launch_seconds": round(evaluator.seconds["forward"], 3),
+        "collect_seconds": round(evaluator.seconds["collect"], 3),
+    }
+
+
 def _progress_line(written: int, total: int | None, rate: float, rows_per_forward: float) -> str:
     head = (
         f"自对弈 {written} 条"
@@ -124,6 +147,10 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
 
     started = time.monotonic()
     last_report = started
+    # 每轮的三段墙钟。为什么要在生产代码里留这个：GPU 占用率低的时候，"是搜索在等 GPU
+    # 还是 GPU 在等搜索"只有这三个数（加上推理器里的 CUDA event）能回答；没有它们，
+    # 调 in_flight/lanes/线程都是猜。开销是每轮三次 time.monotonic()，可以忽略。
+    phases = {"advance": 0.0, "evaluate": 0.0, "submit": 0.0}
     idle_rounds = 0
     graceful = False
     result: SelfplayResult | None = None
@@ -141,7 +168,10 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
             state=str(finished["state"]),
             forward_batches=evaluator.batches,
             forward_rows=evaluator.rows,
-            stats=dict(engine.stats()),
+            stats={
+                **engine.stats(),
+                "phases": phase_summary(phases, evaluator, time.monotonic() - started),
+            },
         )
 
     try:
@@ -151,12 +181,18 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
             # ——实测中断落在 torch 的卷积里，直接穿到顶层，虽然 finally 保住了数据，
             # 但用户看到的是一段回溯，而不是"已停车"。
             try:
+                tick = time.monotonic()
                 advance = engine.advance(config.max_batch)
+                phases["advance"] += time.monotonic() - tick
                 request_ids = advance["request_ids"]
                 if request_ids.size:
                     idle_rounds = 0
+                    tick = time.monotonic()
                     values, logits = evaluator.evaluate(advance["request_kinds"], advance["boards"])
+                    phases["evaluate"] += time.monotonic() - tick
+                    tick = time.monotonic()
                     engine.submit(request_ids, values, logits)
+                    phases["submit"] += time.monotonic() - tick
                 else:
                     idle_rounds += 1
                     if advance["done"]:
@@ -184,6 +220,7 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
                             "forward_batches": evaluator.batches,
                             "forward_rows": evaluator.rows,
                             "episodes": int(advance["episodes_written"]),
+                            "phases": phase_summary(phases, evaluator, now - started),
                         },
                     )
                     if config.on_progress is None:
@@ -192,10 +229,11 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
                         config.on_progress(payload)
             except KeyboardInterrupt:
                 # 一次 Ctrl-C = 请求停车：进行中的局走完、已产出的数据提交，然后正常退出。
-                # 未回填的前向请求不必抢救：引擎会在下一次 advance 里补发它们（见
-                # batched_engine.cpp 的 "还没被用掉的需求会被补发"），所以这里继续循环、
-                # 让这几局走完，比立刻收尾多留下几局数据。
+                # 手上的前向批次必须显式声明放弃（abandon）：引擎不再自动补发在途请求——那会
+                # 把管线重叠时"正在算"的批次当成丢失的重复发一遍。放弃之后那批叶子会重新排队，
+                # 因此这里继续循环，几局走完后再收尾，比立刻退出多留下几局数据。
                 # 再按一次才是硬退出（此时 finally 里仍然会把已产出的数据提交掉）。
+                engine.abandon()
                 if graceful:
                     raise
                 graceful = True

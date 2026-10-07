@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "core/fileio.h"
@@ -142,11 +143,15 @@ TEST(engine_is_deterministic_for_same_config) {
 }
 
 
-TEST(engine_requeues_dropped_batch) {
+TEST(engine_abandon_requeues_dropped_batch) {
     // 一次被丢掉的前向必须能被补救：Ctrl-C 恰好落在前向里、Python 侧回调抛异常、
     // 显存不足，都会让"已发出但未回填"的请求留在引擎里。若它们不被重发，这些 lane
     // 就永远等不到答案——调用方看到的是"没有请求、也没有结束"，只能卡死或放弃整批数据。
-    TempDir dir("requeue");
+    //
+    // 补救现在是**显式**的（`abandon()`）：管线重叠允许"手上有未回填的批次、同时继续
+    // advance"，所以引擎不能再自动补发——那会把正在 GPU 上算的批次当成丢失的重复发一遍
+    // （重复 id 会让 submit 直接抛错）。见 ADR 0027。
+    TempDir dir("abandon");
     EngineConfig config;
     config.lanes = 4;
     config.simulations = 8;
@@ -154,17 +159,16 @@ TEST(engine_requeues_dropped_batch) {
     config.cache_entries = 1 << 12;
     config.seed = 4242;
 
-    BatchedEngine engine(config, dir.sub("batch"), "requeue-test", "synthetic", 1500, 500);
-    std::vector<uint64_t> dropped;
+    BatchedEngine engine(config, dir.sub("batch"), "abandon-test", "synthetic", 1500, 500);
     uint64_t rounds = 0;
     bool done = false;
     while (rounds < 200000 && !done) {
         rounds++;
         BatchedEngine::Advance advance = engine.advance(4096);
         if (rounds == 3) {
-            // 第 3 轮模拟"这一批被丢掉"：既不回填，也不报错。
-            dropped = advance.request_ids;
-            expect_true(!dropped.empty(), "被丢掉的那一轮确实带走了请求");
+            // 第 3 轮模拟"这一批被丢掉"：既不回填，也不报错；调用方随后声明放弃它。
+            expect_true(!advance.request_ids.empty(), "被丢掉的那一轮确实带走了请求");
+            engine.abandon();
             continue;
         }
         if (!advance.request_ids.empty()) {
@@ -176,15 +180,55 @@ TEST(engine_requeues_dropped_batch) {
             done = true;
         }
     }
-    expect_true(done, "丢掉一批之后引擎仍然能跑完（而不是永远没有请求可发）");
+    expect_true(done, "声明放弃一批之后引擎仍然能跑完（而不是永远没有请求可发）");
 
-    // 丢掉的那些 id 必须在后续某一轮里原样重发：重发的是同一批请求，不是新的请求。
     const EngineStats stats = engine.stats();
     expect_equal_u64(stats.requests_issued, stats.requests_submitted,
                      "最终每个请求都恰好回填一次（补发不会让请求数重复计）");
     engine.finish();
     const BatchManifest manifest = read_manifest(dir.sub("batch"));
     expect_equal_u64(manifest.samples, 1500, "补发之后样本数仍然恰好等于目标");
+}
+
+TEST(engine_advance_waits_when_budget_is_full) {
+    // **边界**：`in_flight_per_lane` 就是引擎的管线深度。一次 advance 会把每条 lane 的在途
+    // 预算用满，所以"手上还有未回填的批次时继续 advance"拿不到新请求——不是 bug，而是
+    // "在途模拟互相看不见对方"这条搜索语义的直接后果（ADR 0017）。
+    //
+    // 这条测试钉住这个事实，有两个用处：
+    //  1. 它解释了"为什么 GPU 会等 CPU"：管线深度是搜索参数，不能为了喂饱 GPU 随便加深
+    //     （加深会改变数据，实测 lanes/in_flight 单独就能让评分位移 +20.1 分）；
+    //  2. 谁将来要动并行化（把 lane 分组跑线程），这条测试会立刻告诉他改了什么。
+    TempDir dir("budget");
+    EngineConfig config;
+    config.lanes = 4;
+    config.simulations = 8;
+    config.in_flight_per_lane = 4;
+    config.cache_entries = 1 << 12;
+    config.seed = 99;
+
+    BatchedEngine engine(config, dir.sub("batch"), "budget-test", "synthetic", 3000, 1000);
+    const BatchedEngine::Advance first = engine.advance(4096);
+    expect_true(!first.request_ids.empty(), "第一轮应当把在途预算用满");
+    const BatchedEngine::Advance second = engine.advance(4096);
+    expect_true(second.request_ids.empty(),
+                "预算用满后继续 advance 必须返回空批（要更多请求就得先回填或加深 in_flight）");
+    expect_true(!second.done, "空批不等于收工");
+
+    // 未回填的那一批**不能被重复发出**：id 不允许在后续批次里再出现。
+    std::unordered_set<uint64_t> first_ids(first.request_ids.begin(), first.request_ids.end());
+    for (const uint64_t id : second.request_ids) {
+        expect_true(first_ids.count(id) == 0, "未回填的批次不该被重复发出");
+    }
+
+    // 回填之后立刻又能推进：这条保证"空批"不会变成死锁。
+    std::vector<float> values(first.request_ids.size(), 0.0f);
+    std::vector<float> logits(first.request_ids.size() * kNumActions, 0.0f);
+    engine.submit(first.request_ids.data(), values.data(), logits.data(), first.request_ids.size());
+    expect_true(!engine.advance(4096).request_ids.empty(), "回填之后必须能继续推进");
+
+    engine.abandon();  // 收尾：把在途的清掉，避免运行结束时留着未回填的请求
+    engine.finish();
 }
 
 TEST(engine_greedy_modes_skip_search_and_report_outcomes) {

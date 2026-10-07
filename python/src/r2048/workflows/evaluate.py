@@ -154,6 +154,10 @@ def build_eval_protocol(config: EvalConfig, lanes: int, device: torch.device, mo
 
 
 def run_evaluation(config: EvalConfig) -> EvalResult:
+    # 同上：CPU 侧算子都是小算子，线程池只会和其他进程抢核（见 runtime/selfplay.pin_cpu_threads）。
+    from r2048.runtime.selfplay import pin_cpu_threads
+
+    pin_cpu_threads()
     if config.track not in TRACKS:
         raise ValueError(f"未知 track: {config.track}（可选 {'/'.join(TRACKS)}）")
     if config.games <= 0:

@@ -523,7 +523,10 @@ def test_multi_source_split_has_no_leakage(sibling_batches) -> None:
     这件事在日志里看不出来。
     """
     first, second = sibling_batches
-    reader, split = open_sources([(str(first), 1.0, 0), (str(second), 1.0, 0)], val_fraction=0.2, seed=11)
+    # 验证比例取 0.5：这个小批次每个来源只有十几局，0.2 时"某来源一局都没进验证集"的概率
+    # 约 1.4%，而来源身份里含 build_id——重建 C++ 就换哈希，这种小概率事件真的会翻出来。
+    # 这条测的是"逐来源都非空"的不变式，不该靠运气。
+    reader, split = open_sources([(str(first), 1.0, 0), (str(second), 1.0, 0)], val_fraction=0.5, seed=11)
     episodes = reader.episode_column()
     codes = np.repeat(
         np.asarray([source.code for source in reader.sources], dtype=np.uint64),

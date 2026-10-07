@@ -89,6 +89,21 @@ class SelfplayResult:
         return self.forward_rows / self.forward_batches if self.forward_batches > 0 else 0.0
 
 
+def pin_cpu_threads(threads: int = 1) -> None:
+    """把 torch 的 CPU 侧算子线程数钉到 1。
+
+    为什么必须这么做（实测，多进程跑谱时最严重）：torch 默认按核数开 intra-op 线程池，
+    而这条流水线里 CPU 侧的算子都是**极小**的（把 16 列棋盘从 uint8 转 int64、拷贝输出），
+    真正的算力活全在 GPU 上。跑 4 个进程时就是 4×16=64 个线程抢 16 个核，光线程调度就把
+    CPU 打满：实测 4 进程的总 CPU 98.7%、GPU 只有 57.5%；改成每进程 1 线程之后
+    **CPU 降到 25.5%，GPU 升到 83.8%、功耗 443 → 586 W**（贴近 600 W 上限），
+    总吞吐约 3×。这不是微调，是"GPU 有没有被喂饱"的分界。
+    """
+    # 只钉 intra-op 线程数：`set_num_interop_threads` 一旦在并行工作开始后调用就会抛错，
+    # 而它对这条流水线没有意义（CPU 侧没有并行区）。
+    torch.set_num_threads(threads)
+
+
 def phase_summary(phases: dict, evaluator: BatchedEvaluator, elapsed: float, threads: int = 1) -> dict:
     """相位汇总：谁在等谁、GPU 真正忙了多久。
 
@@ -128,6 +143,8 @@ def _progress_line(written: int, total: int | None, rate: float, rows_per_forwar
 
 
 def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.device) -> SelfplayResult:
+    """NN 自对弈。**进程内 CPU 只用一个线程**（见下面 pin_cpu_threads 的说明）。"""
+    pin_cpu_threads()
     engine_config = {
         "lanes": config.lanes,
         "simulations": config.simulations,

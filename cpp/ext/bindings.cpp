@@ -57,6 +57,16 @@ r2048::EngineConfig engine_config_from_dict(const py::dict& dict) {
     config.decision_mode = static_cast<r2048::DecisionMode>(get_uint("decision_mode", 0));
     config.collect_samples = get_uint("collect_samples", 1) != 0;
     config.episodes_target = get_uint("episodes_target", 0);
+    config.resume = get_uint("resume", 0) != 0;
+    if (dict.contains("control_path")) config.control_path = dict["control_path"].cast<std::string>();
+    // 产出环境参数（device / max_batch）走"原样透传"：C++ 不认识它们的含义，
+    // 但它们是数据来源记录的一部分，也让续跑时的参数闸门能发现"换了设备"。
+    if (dict.contains("provenance")) {
+        for (const auto& item : dict["provenance"].cast<py::dict>()) {
+            config.provenance.emplace_back(item.first.cast<std::string>(),
+                                           item.second.cast<std::string>());
+        }
+    }
     return config;
 }
 
@@ -246,10 +256,29 @@ values 是**归一化**价值（分数 / score_scale），C++ 侧换算回原始
     });
 
     engine.def(
+        "request_stop",
+        [](r2048::BatchedEngine& self) { self.request_stop(); },
+        "请求在下一个合法停车点（局与局之间）停下并收尾：正在进行的局一定走完。\n"
+        "Python 侧收到 KeyboardInterrupt 时走这条路，尾部数据因此不会丢。");
+    engine.def("stop_requested", [](const r2048::BatchedEngine& self) {
+        return self.stop_requested();
+    });
+
+    engine.def(
         "finish",
         [](r2048::BatchedEngine& self) {
-            py::gil_scoped_release release;
-            return self.finish();
+            r2048::FinishResult result;
+            {
+                py::gil_scoped_release release;
+                result = self.finish();
+            }
+            py::dict out;
+            out["manifest_path"] = result.manifest_path;
+            out["state"] = r2048::batch_state_name(result.state);
+            out["samples"] = result.samples;
+            out["episodes"] = result.episodes;
+            return out;
         },
-        "收尾：写完最后一个分片并落 manifest，返回 manifest 路径。");
+        "收尾：写完最后一个分片并落 manifest，返回 {manifest_path, state, samples, episodes}。\n"
+        "state 为 complete 表示跑满目标，paused/stopped 表示被叫停（可以 --continue 接着跑）。");
 }

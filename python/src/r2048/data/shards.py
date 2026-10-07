@@ -32,26 +32,26 @@ CANDIDATE_TARGET_DEFINITION = "q_mean_minus_reward"
 # 便于将来加字段时只改这里和 C++ 侧（记录长度不变）。
 RECORD_DTYPE = np.dtype(
     [
-        ("decision", "u1", (16,)),      # 0
-        ("afterstate", "u1", (16,)),    # 16
-        ("action", "u1"),               # 32
-        ("legal_mask", "u1"),           # 33
-        ("step", "<u2"),                # 34
-        ("episode", "<u4"),             # 36
-        ("simulations", "<u2"),         # 40
-        ("move_score", "<u4"),          # 42
-        ("_pad0", "u1", (2,)),          # 46
-        ("mc_return", "<i8"),           # 48
-        ("_pad1", "u1", (8,)),          # 56
-        ("visits", "<u2", (4,)),        # 64
-        ("_pad2", "u1", (8,)),          # 72
+        ("decision", "u1", (16,)),  # 0
+        ("afterstate", "u1", (16,)),  # 16
+        ("action", "u1"),  # 32
+        ("legal_mask", "u1"),  # 33
+        ("step", "<u2"),  # 34
+        ("episode", "<u4"),  # 36
+        ("simulations", "<u2"),  # 40
+        ("move_score", "<u4"),  # 42
+        ("_pad0", "u1", (2,)),  # 46
+        ("mc_return", "<i8"),  # 48
+        ("_pad1", "u1", (8,)),  # 56
+        ("visits", "<u2", (4,)),  # 64
+        ("_pad2", "u1", (8,)),  # 72
         # --- v2 候选块：按方向下标对齐，槽位 a 恒对应方向 a ---
         ("candidate_afterstate", "u1", (4, 16)),  # 80
-        ("candidate_value", "<i4", (4,)),         # 144：A(u_a) = Q̄(a) − r(s,a)，原始分数单位
-        ("candidate_reward", "<u4", (4,)),        # 160：r(s,a)
-        ("candidate_visits", "<u2", (4,)),        # 176：该候选边的根访问数
-        ("candidate_count", "u1"),                # 184：0 = 无候选监督
-        ("_pad3", "u1", (7,)),                    # 185
+        ("candidate_value", "<i4", (4,)),  # 144：A(u_a) = Q̄(a) − r(s,a)，原始分数单位
+        ("candidate_reward", "<u4", (4,)),  # 160：r(s,a)
+        ("candidate_visits", "<u2", (4,)),  # 176：该候选边的根访问数
+        ("candidate_count", "u1"),  # 184：0 = 无候选监督
+        ("_pad3", "u1", (7,)),  # 185
     ],
     align=False,
 )
@@ -97,9 +97,29 @@ class BatchManifest:
     def params(self) -> dict:
         return dict(self.data.get("params", {}))
 
+    @property
+    def state(self) -> str:
+        """这一批的生命周期状态（running/paused/stopped/complete）。
+
+        跑谱可以随时停车并就地续跑，所以 manifest 是增量提交日志而不是结尾标记：
+        任何时刻读到它，都要知道这一批是「还在长」还是「已经定稿」。取不到状态的老批
+        按 complete 算——旧协议只在跑完时才写 manifest，这个默认值与事实一致。
+        """
+        return str(self.data.get("state", "complete"))
+
+    @property
+    def shard_layout(self) -> int:
+        """分片切分规则版本：1 = 按容量精确切（旧），2 = 按局边界切（当前）。
+
+        续跑只有在规则相同时才可能逐字节复现，所以这个值必须能被读到并参与比对。
+        """
+        return int(self.data.get("shard_layout", 1))
+
     def describe(self) -> str:
+        # 状态写在最前面：拿一份 paused/stopped 的批次去训练，是「数据还在长」而不是
+        # 「数据已定稿」，这个区别必须在第一眼就看见。
         return (
-            f"{self.path.parent.name}: 策略 {self.policy}，模拟 {self.simulations}，"
+            f"{self.path.parent.name} [{self.state}]: 策略 {self.policy}，模拟 {self.simulations}，"
             f"模型 {self.model_id or '-'}，样本 {self.samples}，局数 {self.episodes}，"
             f"引擎 {self.build_id}"
         )
@@ -113,8 +133,7 @@ def read_manifest(data_dir: str | Path, check_versions: bool = True) -> BatchMan
     path = Path(data_dir) / "manifest.json"
     if not path.exists():
         raise FileNotFoundError(
-            f"找不到 {path}。数据批以 manifest.json 作为“已写完”的提交标记，"
-            "只有它出现才说明这一批是完整的。"
+            f"找不到 {path}。数据批以 manifest.json 作为“已写完”的提交标记，只有它出现才说明这一批是完整的。"
         )
     data = json.loads(path.read_text())
     if check_versions:
@@ -123,13 +142,9 @@ def read_manifest(data_dir: str | Path, check_versions: bool = True) -> BatchMan
                 f"数据批的记录格式版本 {data['schema_version']} 与本实现 {SCHEMA_VERSION} 不一致"
             )
         if int(data["rules_version"]) != RULES_VERSION:
-            raise ValueError(
-                f"数据批的规则版本 {data['rules_version']} 与本实现 {RULES_VERSION} 不一致"
-            )
+            raise ValueError(f"数据批的规则版本 {data['rules_version']} 与本实现 {RULES_VERSION} 不一致")
         if int(data["record_bytes"]) != RECORD_BYTES:
-            raise ValueError(
-                f"数据批的记录长度 {data['record_bytes']} 与本地布局 {RECORD_BYTES} 不一致"
-            )
+            raise ValueError(f"数据批的记录长度 {data['record_bytes']} 与本地布局 {RECORD_BYTES} 不一致")
     return BatchManifest(path=path, data=data)
 
 
@@ -171,9 +186,7 @@ class BatchReader:
             array = np.memmap(path, dtype=RECORD_DTYPE, mode="r")
             expected = int(shard["samples"])
             if array.shape[0] != expected:
-                raise ValueError(
-                    f"{shard['path']} 的记录数 {array.shape[0]} 与清单 {expected} 不一致"
-                )
+                raise ValueError(f"{shard['path']} 的记录数 {array.shape[0]} 与清单 {expected} 不一致")
             self._arrays.append(array)
             counts.append(array.shape[0])
             cumulative.append(cumulative[-1] + array.shape[0])

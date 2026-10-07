@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -109,9 +111,7 @@ def cli_path() -> Path:
 
     candidate = Path(r2048_core.__file__).resolve().parent.parent / "bin" / "r2048"
     if not candidate.exists():
-        raise FileNotFoundError(
-            f"找不到 C++ CLI（{candidate}）：先 make build，或设 R2048_CLI 指向它"
-        )
+        raise FileNotFoundError(f"找不到 C++ CLI（{candidate}）：先 make build，或设 R2048_CLI 指向它")
     return candidate
 
 
@@ -132,6 +132,33 @@ def _argv(command: str, args: dict | list | None) -> list[str]:
     return argv
 
 
+def parse_cpp_progress(line: str) -> dict | None:
+    """解析 C++ `--progress-json` 的一行；不是进度行则返回 None。
+
+    单位换算只在这里做一次：C++ 的 Json 没有浮点，所以它报毫秒与整数速率，
+    而作业 status.json 的契约是秒（见 PROGRESS_KEYS）。两个单位混在同一字段名里，
+    迟早在某个 ETA 上算错——所以交界处就换掉。
+    `total == 0` 转成 None：C++ 用 0 表示"不限量"，Python 侧的不限量是 None。
+    """
+    if not line.startswith('{"progress"'):
+        return None
+    try:
+        payload = json.loads(line)["progress"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    eta = int(payload.get("eta_seconds", -1))
+    return {
+        "stage": str(payload.get("stage", "")),
+        "done": int(payload.get("done", 0)),
+        "total": int(payload.get("total", 0)) or None,
+        "unit": str(payload.get("unit", "")),
+        "elapsed": round(int(payload.get("elapsed_ms", 0)) / 1000.0, 3),
+        "rate": float(payload.get("rate", 0)),
+        "eta": None if eta < 0 else float(eta),
+        "line": str(payload.get("line", "")),
+    }
+
+
 def run_cpp(
     command: str,
     args: dict | list | None = None,
@@ -140,6 +167,7 @@ def run_cpp(
     check: bool = True,
     echo: bool = True,
     env: dict | None = None,
+    progress: bool = False,
 ) -> CppResult:
     """跑一个 C++ 子命令，逐行转发输出。
 
@@ -149,29 +177,62 @@ def run_cpp(
     输出根显式传给子进程：C++ 侧读同一个环境变量（`R2048_OUTPUT_DIR`），
     但库调用方（脚本、界面）不该依赖"启动前先 export 过"——一旦两边算出不同的根，
     数据会写到两个地方而没有任何报错。
+
+    **两条流分开读**：stdout 是结果（ADR 0008：末行是产物路径 / 汇总 JSON），
+    stderr 是进度与日志。合并成一条会让"末行"这个约定失效——进度行会在结果之后
+    继续出现，于是 `last_line` 变成随机取到哪一行。`progress=True` 时给子命令加
+    `--progress-json`，并把 stderr 上的进度行解析成结构化 payload 交给作业状态文件。
     """
     argv = [str(cli_path()), command, *_argv(command, args)]
+    if progress:
+        argv.append("--progress-json")
     child_env = {**os.environ, paths.ENV_OUTPUT_DIR: str(paths.output_root()), **(env or {})}
     if job is not None:
         job.log("exec", {"argv": argv[1:]})
     process = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
         env=child_env,
     )
     lines: list[str] = []
-    assert process.stdout is not None
-    for raw in process.stdout:
-        line = raw.rstrip("\n")
-        lines.append(line)
-        if job is not None:
-            job.log("stdout", {"line": line})
-        if echo:
-            print(line, flush=True)
-    returncode = process.wait()
+    rendered = []  # 非空 = 已经在终端上覆盖式渲染过进度，收尾需要补一个换行
+
+    def drain_stderr() -> None:
+        assert process.stderr is not None
+        for raw in process.stderr:
+            text = raw.rstrip("\n")
+            payload = parse_cpp_progress(text) if progress else None
+            if payload is not None:
+                if job is not None:
+                    job.progress(payload)
+                if echo:
+                    print("\r" + payload["line"], end="", file=sys.stderr, flush=True)
+                    rendered.append(True)
+                continue
+            if job is not None:
+                job.log("stderr", {"line": text})
+            if echo:
+                print(text, file=sys.stderr, flush=True)
+
+    reader = threading.Thread(target=drain_stderr, daemon=True)
+    reader.start()
+    try:
+        assert process.stdout is not None
+        for raw in process.stdout:
+            line = raw.rstrip("\n")
+            lines.append(line)
+            if job is not None:
+                job.log("stdout", {"line": line})
+            if echo:
+                print(line, flush=True)
+    finally:
+        returncode = process.wait()
+        reader.join()
+    if rendered and echo:
+        print(file=sys.stderr, flush=True)
     result = CppResult(command=command, returncode=returncode, lines=lines)
     if check and returncode != 0:
         raise RuntimeError(f"{result} —— 见作业日志")
@@ -195,7 +256,9 @@ class JobDir:
         self.job_id = job_id
         self.kind = kind
         self.params = dict(params or {})
-        self.path = Path(root) if root is not None else paths.run_dir(job_id)
+        # root 是"作业目录们所在的目录"（默认输出根的 runs/），作业目录本身永远由
+        # job_id 决定：若让 root 直接充当作业目录，两处命名就会开始各说各话。
+        self.path = Path(root) / job_id if root is not None else paths.run_dir(job_id)
         self._started = time.monotonic()
         self._log = None
         self._finished = False

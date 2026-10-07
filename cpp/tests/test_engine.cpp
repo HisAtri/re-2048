@@ -93,14 +93,15 @@ TEST(engine_completes_and_writes_in_episode_order) {
     const bool done = driver.run_until_done();
     expect_true(done, "引擎应当在有限轮次内达到目标样本数");
 
-    const std::string manifest_path = engine.finish();
+    const FinishResult finished = engine.finish();
     const BatchManifest manifest = read_manifest(dir.sub("batch"));
     expect_equal_u64(manifest.samples, 3000, "样本数恰好等于目标");
     expect_true(manifest.meta.policy == "nn", "策略标记为 nn");
     expect_true(manifest.meta.model_id == "synthetic", "来源模型记录在清单里");
     expect_equal_u64(manifest.episodes, manifest.shards.back().last_episode + 1,
                      "局数与末分片覆盖的局号一致");
-    expect_contains(manifest_path, "manifest.json", "返回 manifest 路径");
+    expect_contains(finished.manifest_path, "manifest.json", "返回 manifest 路径");
+    expect_true(finished.state == BatchState::kComplete, "跑满目标时状态为 complete");
 
     const EngineStats stats = engine.stats();
     expect_true(stats.requests_issued > 0, "确实发出过批推理请求");
@@ -140,6 +141,51 @@ TEST(engine_is_deterministic_for_same_config) {
     expect_true(hashes_first == hashes_second, "同配置两次运行的每个分片哈希都相同");
 }
 
+
+TEST(engine_requeues_dropped_batch) {
+    // 一次被丢掉的前向必须能被补救：Ctrl-C 恰好落在前向里、Python 侧回调抛异常、
+    // 显存不足，都会让"已发出但未回填"的请求留在引擎里。若它们不被重发，这些 lane
+    // 就永远等不到答案——调用方看到的是"没有请求、也没有结束"，只能卡死或放弃整批数据。
+    TempDir dir("requeue");
+    EngineConfig config;
+    config.lanes = 4;
+    config.simulations = 8;
+    config.in_flight_per_lane = 2;
+    config.cache_entries = 1 << 12;
+    config.seed = 4242;
+
+    BatchedEngine engine(config, dir.sub("batch"), "requeue-test", "synthetic", 1500, 500);
+    std::vector<uint64_t> dropped;
+    uint64_t rounds = 0;
+    bool done = false;
+    while (rounds < 200000 && !done) {
+        rounds++;
+        BatchedEngine::Advance advance = engine.advance(4096);
+        if (rounds == 3) {
+            // 第 3 轮模拟"这一批被丢掉"：既不回填，也不报错。
+            dropped = advance.request_ids;
+            expect_true(!dropped.empty(), "被丢掉的那一轮确实带走了请求");
+            continue;
+        }
+        if (!advance.request_ids.empty()) {
+            std::vector<float> values(advance.request_ids.size(), 0.0f);
+            std::vector<float> logits(advance.request_ids.size() * kNumActions, 0.0f);
+            engine.submit(advance.request_ids.data(), values.data(), logits.data(),
+                          advance.request_ids.size());
+        } else if (advance.done) {
+            done = true;
+        }
+    }
+    expect_true(done, "丢掉一批之后引擎仍然能跑完（而不是永远没有请求可发）");
+
+    // 丢掉的那些 id 必须在后续某一轮里原样重发：重发的是同一批请求，不是新的请求。
+    const EngineStats stats = engine.stats();
+    expect_equal_u64(stats.requests_issued, stats.requests_submitted,
+                     "最终每个请求都恰好回填一次（补发不会让请求数重复计）");
+    engine.finish();
+    const BatchManifest manifest = read_manifest(dir.sub("batch"));
+    expect_equal_u64(manifest.samples, 1500, "补发之后样本数仍然恰好等于目标");
+}
 
 TEST(engine_greedy_modes_skip_search_and_report_outcomes) {
     // 评测模式：关闭样本收集、按局数停止，并且每局结束都回报结果。

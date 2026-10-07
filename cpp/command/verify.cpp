@@ -16,7 +16,9 @@ void print_usage() {
         "用法: r2048 verify --data <数据目录> [选项]\n\n"
         "校验一个数据批：清单与分片的一致性、逐分片摘要、记录内局号的单调性，\n"
         "并（默认）用清单记录的参数重新生成整批数据逐分片比对哈希。\n"
-        "重放会使用与生成时不同的线程数，因此它同时验证了“数据布局与线程数无关”。\n\n"
+        "重放会使用与生成时不同的线程数，因此它同时验证了“数据布局与线程数无关”。\n"
+        "未跑完的批次（被 pause/stop 叫停）按未完成校验：此时重放没有可比的终点，\n"
+        "校验报告会说明重放被跳过——它不会被当成失败，也不会被当成通过。\n\n"
         "  --data            数据批目录（必需）\n"
         "  --no-replay       只做结构与摘要校验，不重放\n"
         "  --replay-workers  重放时的 worker 数（默认 1）\n"
@@ -50,20 +52,24 @@ int run_verify(int argc, const char* const* argv) {
     Json summary = Json::object();
     summary.set("data", Json::str(data_dir));
     summary.set("ok", Json::boolean(report.ok));
+    summary.set("state", Json::str(report.state));
     summary.set("samples", Json::integer(static_cast<int64_t>(report.samples)));
     summary.set("episodes", Json::integer(report.episodes));
     summary.set("shards", Json::integer(static_cast<int64_t>(report.shards)));
     summary.set("replay_checked", Json::boolean(report.replay_checked));
+    summary.set("replay_note", Json::str(report.replay_note));
     summary.set("seconds", Json::integer(static_cast<int64_t>(report.seconds + 0.5)));
     Json problems = Json::array();
     for (const std::string& problem : report.problems) problems.push(Json::str(problem));
     summary.set("problems", std::move(problems));
 
     for (const std::string& problem : report.problems) log_error("%s", problem.c_str());
+    if (!report.replay_note.empty()) log_status("注意：%s", report.replay_note.c_str());
     if (report.ok) {
-        log_status("校验通过：样本 %llu，局数 %u，分片 %zu，耗时 %.1f 秒%s",
-                   static_cast<unsigned long long>(report.samples), report.episodes, report.shards,
-                   report.seconds, report.replay_checked ? "（已重放比对哈希）" : "");
+        log_status("校验通过：状态 %s，样本 %llu，局数 %u，分片 %zu，耗时 %.1f 秒%s",
+                   report.state.c_str(), static_cast<unsigned long long>(report.samples),
+                   report.episodes, report.shards, report.seconds,
+                   report.replay_checked ? "（已重放比对哈希）" : "（未重放）");
     } else {
         log_status("校验失败：%zu 个问题，耗时 %.1f 秒", report.problems.size(), report.seconds);
     }

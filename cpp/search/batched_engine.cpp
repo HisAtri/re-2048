@@ -10,6 +10,7 @@
 #include <mutex>
 #include <stdexcept>
 
+#include "core/control.h"
 #include "core/fileio.h"
 #include "core/logging.h"
 #include "dataio/sample.h"
@@ -91,12 +92,22 @@ struct BatchedEngine::Impl {
         if (config.lanes == 0) throw std::runtime_error("lane 数必须大于 0");
         if (config.simulations == 0) throw std::runtime_error("模拟次数必须大于 0");
         if (config.simulations > 0xFFFF) throw std::runtime_error("模拟次数上限为 65535");
+        control.set_path(config.control_path);
         if (config.collect_samples) {
-            if (!dir_is_usable_as_output(data_dir)) {
-                throw std::runtime_error("输出目录已存在且非空，拒绝覆盖: " + data_dir);
+            if (config.resume) {
+                // 续跑：编号接着清单里的局数，所以写入器必须先于 lane 初始化。
+                writer = std::make_unique<ShardWriter>(
+                    ShardWriter::resume(data_dir, shard_samples_in, build_meta()));
+            } else {
+                if (!dir_is_usable_as_output(data_dir)) {
+                    throw std::runtime_error("输出目录已存在且非空，拒绝覆盖: " + data_dir +
+                                             "（续跑请加 --continue，新起一批请换一个目录）");
+                }
+                ensure_dir(data_dir);
+                writer = std::make_unique<ShardWriter>(data_dir, shard_samples_in, build_meta());
             }
-            ensure_dir(data_dir);
-            writer = std::make_unique<ShardWriter>(data_dir, shard_samples_in);
+            next_episode.store(writer->next_episode());
+            next_episode_to_write = writer->next_episode();
         }
         // 表长取 2 的幂，容量至少是配置值的一倍（保持低负载因子）。
         size_t capacity = 64;
@@ -105,6 +116,29 @@ struct BatchedEngine::Impl {
         cache.assign(capacity, CacheEntry{});
         lanes.resize(config.lanes);
         for (uint32_t i = 0; i < config.lanes; i++) start_episode(lanes[i]);
+    }
+
+    // 数据来源记录：写入器要用它校验续跑参数，所以必须在开跑之前就组装好，
+    // 而不是等到 finish 时才拼（那时已经晚了——参数不一致本该在起步前就拒绝）。
+    BatchMeta build_meta() const {
+        BatchMeta meta;
+        meta.batch_id = batch_id;
+        meta.policy = "nn";
+        meta.simulations = config.decision_mode == kDecisionSearch ? config.simulations : 0;
+        meta.temperature_moves = config.temperature_moves;
+        meta.seed = config.seed;
+        meta.workers = config.lanes;  // 产出这批数据的并发对局数（协议参数，见 ADR 0003）
+        meta.samples_target = samples_target;
+        meta.model_id = model_id;
+        // 这些参数会改变搜索树的演化，因此属于数据生成协议的一部分，必须记录下来。
+        meta.params.emplace_back("c_puct", std::to_string(config.c_puct));
+        meta.params.emplace_back("lanes", std::to_string(config.lanes));
+        meta.params.emplace_back("in_flight_per_lane", std::to_string(config.in_flight_per_lane));
+        meta.params.emplace_back("temperature", std::to_string(config.temperature));
+        meta.params.emplace_back("cache_entries", std::to_string(config.cache_entries));
+        // Python 侧透传的产出环境参数（device / max_batch）：它们同样改变逐局结果。
+        for (const auto& entry : config.provenance) meta.params.push_back(entry);
+        return meta;
     }
 
     // ---------------- 推理缓存 ----------------
@@ -672,7 +706,7 @@ struct BatchedEngine::Impl {
                 std::lock_guard<std::mutex> lock(bookkeeping_mutex);
                 samples_produced += samples.size();
                 completed[lane.episode] = std::move(samples);
-                if (config.episodes_target == 0 && samples_produced >= samples_target) stop_all.store(true);
+                if (stop_on_samples_target()) stop_all.store(true);
                 finished_outcomes.push_back(outcome);
             } else {
                 std::lock_guard<std::mutex> lock(bookkeeping_mutex);
@@ -687,6 +721,19 @@ struct BatchedEngine::Impl {
         reset_tree(lane);
     }
 
+    // 是否按样本目标停止。**样本目标为 0 表示不限量**：此时只有控制通道能叫停，
+    // 绝不能让 `0 >= 0` 这种比较把一批数据判成“目标已达成”。
+    bool stop_on_samples_target() const {
+        return config.episodes_target == 0 && samples_target > 0 && samples_produced >= samples_target;
+    }
+
+    // 目标是否真的达成了（决定收尾时写 complete 还是 paused/stopped）。
+    bool target_reached() const {
+        if (config.episodes_target > 0) return stat_episodes.load() >= config.episodes_target;
+        if (samples_target > 0) return written_samples() >= samples_target;
+        return false;
+    }
+
     // 按局号顺序写盘：写入内容因此与 lane 调度顺序完全无关。
     void flush_completed() {
         while (true) {
@@ -695,19 +742,25 @@ struct BatchedEngine::Impl {
             std::vector<Sample> samples = std::move(found->second);
             completed.erase(found);
 
-            if (written_samples() >= samples_target) {
+            if (config.episodes_target == 0 && samples_target > 0 &&
+                written_samples() >= samples_target) {
                 stop_all = true;
                 break;
             }
-            if (written_samples() + samples.size() > samples_target) {
+            if (config.episodes_target == 0 && samples_target > 0 &&
+                written_samples() + samples.size() > samples_target) {
                 // 最后一个不完整的局被截断：样本数恰好等于目标条数，
                 // 且截断只依赖目标，与线程数、调度顺序无关。
+                // 不限量（目标为 0）时没有截断可言：一局要么整局落盘，要么不落。
                 samples.resize(static_cast<size_t>(samples_target - written_samples()));
                 stop_all = true;
             }
             writer->add_episode(next_episode_to_write, samples);
             next_episode_to_write++;
-            if (written_samples() >= samples_target) stop_all = true;
+            if (config.episodes_target == 0 && samples_target > 0 &&
+                written_samples() >= samples_target) {
+                stop_all = true;
+            }
         }
     }
 
@@ -834,6 +887,8 @@ struct BatchedEngine::Impl {
     uint64_t next_request_id = 1;
     uint64_t samples_produced = 0;
     std::atomic<bool> stop_all{false};
+    Control control;
+    ControlCommand requested_stop = ControlCommand::kNone;  // 这次是被谁叫停的（决定清单状态）
     std::atomic<uint64_t> stat_requests{0};
     std::atomic<uint64_t> stat_submitted{0};
     std::atomic<uint64_t> stat_leaf{0};
@@ -870,6 +925,30 @@ BatchedEngine::Advance BatchedEngine::advance(uint32_t max_requests) {
         // 上一轮回填的答案到这里为止：还没被用掉的需求会被补发，因此丢弃是安全的。
         std::lock_guard<std::mutex> lock(impl.cache_mutex);
         impl.fresh_answers.clear();
+    }
+    // 上一轮发出、却没有被 submit 回填的请求，在这里重新排队。
+    //
+    // 没有这一步，一次被丢弃的前向就会把这批 lane 永久挂住：待发队列已空、lane 又没有
+    // 收工（它还在等那些答案），于是调用方拿到的是“没有请求、也没有结束”——实测正是
+    // 这样（Ctrl-C 恰好落在前向里）。请求本身可重放（同一个局面、同一份搜索状态），
+    // 重发是唯一正确的补救：那些答案从来没有存在过。
+    // 正常路径下这里是空循环：调用方总会把收到的整批回填掉。
+    {
+        std::lock_guard<std::mutex> lock(impl.bookkeeping_mutex);
+        for (const auto& entry : impl.in_flight) impl.requests.push_back(entry.second);
+    }
+
+    // 控制通道：pause/stop 只是把 stop_all 立起来，停车点仍然只有“局与局之间”，
+    // 正在进行的局一定走完（否则清单需要的局号会出现空洞，写入侧就永远卡在缺口上）。
+    // 轮询在 Control 内部节流，所以放在这个热路径上是安全的。
+    if (!impl.stop_all.load()) {
+        const ControlCommand command = impl.control.poll();
+        if (command != ControlCommand::kNone) {
+            impl.requested_stop = command;
+            impl.stop_all.store(true);
+            log_status("收到 %s：正在停车（进行中的局会走完，已产出的数据会被提交）",
+                       control_command_name(command).c_str());
+        }
     }
 
     // 即使目标已经达成也要继续推进 lane：此时 lane 只会“在局与局之间”停下，
@@ -1031,7 +1110,15 @@ BatchedEngine::DebugState BatchedEngine::debug_state() const {
     return state;
 }
 
-std::string BatchedEngine::finish() {
+void BatchedEngine::request_stop() {
+    Impl& impl = *impl_;
+    impl.requested_stop = ControlCommand::kStop;
+    impl.stop_all.store(true);
+}
+
+bool BatchedEngine::stop_requested() const { return impl_->stop_all.load(); }
+
+FinishResult BatchedEngine::finish() {
     Impl& impl = *impl_;
     if (impl.finished) throw std::runtime_error("引擎已经收尾过了");
     if (impl.writer == nullptr) {
@@ -1040,27 +1127,25 @@ std::string BatchedEngine::finish() {
     impl.stop_all.store(true);
     impl.flush_completed();
 
-    BatchMeta meta;
-    meta.batch_id = impl.batch_id;
-    meta.policy = "nn";
-    meta.simulations = impl.config.decision_mode == kDecisionSearch ? impl.config.simulations : 0;
-    meta.temperature_moves = impl.config.temperature_moves;
-    meta.seed = impl.config.seed;
-    meta.workers = impl.config.lanes;  // 产出这批数据的并发对局数（协议参数，见 ADR 0003）
-    meta.samples_target = impl.samples_target;
-    meta.model_id = impl.model_id;
-    // 这些参数会改变搜索树的演化，因此属于数据生成协议的一部分，必须记录下来。
-    meta.params.emplace_back("c_puct", std::to_string(impl.config.c_puct));
-    meta.params.emplace_back("lanes", std::to_string(impl.config.lanes));
-    meta.params.emplace_back("in_flight_per_lane", std::to_string(impl.config.in_flight_per_lane));
-    meta.params.emplace_back("temperature", std::to_string(impl.config.temperature));
-    meta.params.emplace_back("cache_entries", std::to_string(impl.config.cache_entries));
+    // 终态：跑满目标是 complete，否则如实记下这次是怎么停的。
+    // “停在哪”直接决定这批数据能不能被 --continue 接着写。
+    BatchState state = BatchState::kStopped;
+    if (impl.target_reached()) {
+        state = BatchState::kComplete;
+    } else if (impl.requested_stop == ControlCommand::kPause) {
+        state = BatchState::kPaused;
+    }
 
-    const BatchManifest manifest = impl.writer->finish(meta);
-    write_manifest(impl.data_dir, manifest);
+    const BatchManifest manifest = impl.writer->finish(state);
     impl.finished = true;
     impl.stats = stats();
-    return impl.data_dir + "/manifest.json";
+
+    FinishResult result;
+    result.manifest_path = impl.data_dir + "/manifest.json";
+    result.state = state;
+    result.samples = manifest.samples;
+    result.episodes = manifest.episodes;
+    return result;
 }
 
 }  // namespace r2048

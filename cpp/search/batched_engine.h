@@ -3,9 +3,11 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/version.h"
+#include "dataio/shard.h"  // BatchState：收尾时要回报这一批停在什么状态
 
 namespace r2048 {
 
@@ -43,6 +45,14 @@ struct EngineConfig {
     bool collect_samples = true;
     // >0 时按“跑满多少局”停止（评测用）；否则按样本目标停止（跑谱用）。
     uint32_t episodes_target = 0;
+    // 控制文件路径（内容是 pause/stop）：跑谱要能被进程外叫停，评测不需要。
+    std::string control_path;
+    // 续跑：在既有数据批上接着编号写下去（参数逐项比对，不一致直接拒绝）。
+    bool resume = false;
+    // 产出侧才知道的协议参数（device、max_batch）：C++ 引擎不认识它们，但它们会改变
+    // 逐局结果（批组成决定在途模拟的调度），所以必须作为来源记录写进清单，
+    // 并在续跑时参与比对。Python 侧透传，不走猜测。
+    std::vector<std::pair<std::string, std::string>> provenance;
 };
 
 // 一局结束的结果。评测只关心它，跑谱时它也用于进度显示。
@@ -68,6 +78,15 @@ struct EngineStats {
                                      : static_cast<double>(leaf_from_cache) /
                                            static_cast<double>(leaf_evaluations);
     }
+};
+
+// 收尾的结果。清单路径之外还回报这一批的终态：complete 表示跑满目标，
+// paused/stopped 表示被叫停（此时可以带同样的参数 --continue 接着跑）。
+struct FinishResult {
+    std::string manifest_path;
+    BatchState state = BatchState::kStopped;
+    uint64_t samples = 0;
+    uint32_t episodes = 0;
 };
 
 // 批量 NN-MCTS 自对弈引擎：C++ 持有多局并发生成的全部状态，Python 只负责神经网络。
@@ -111,6 +130,13 @@ public:
 
     EngineStats stats() const;
 
+    // 请求在下一个合法停车点（局与局之间）停下并收尾。Python 侧的 KeyboardInterrupt
+    // 走这条路：Ctrl-C 不该丢掉尾部已产出的数据。
+    void request_stop();
+
+    // 收尾结果里包含本次运行的终态：complete / paused / stopped。
+    bool stop_requested() const;
+
     // 诊断用快照：每条 lane 的状态与写入侧进度。卡住时唯一能看清全局的东西，
     // 因此保留成正式接口而不是临时调试代码。
     struct MissingNeed {
@@ -144,8 +170,8 @@ public:
     };
     DebugState debug_state() const;
 
-    // 达到目标后收尾：写完最后一个分片并落 manifest，返回 manifest 路径。
-    std::string finish();
+    // 达到目标或被叫停后收尾：写完最后一个分片并落 manifest，返回 manifest 路径与终态。
+    FinishResult finish();
 
 private:
     struct Impl;

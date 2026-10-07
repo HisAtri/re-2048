@@ -3,6 +3,7 @@
 
 set(R2048_CORE_SOURCES
     core/args.cpp
+    core/control.cpp
     core/fileio.cpp
     core/hash.cpp
     core/json.cpp

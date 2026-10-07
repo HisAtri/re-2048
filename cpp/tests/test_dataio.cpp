@@ -57,6 +57,44 @@ std::vector<std::string> shard_hashes(const std::string& data_dir) {
     return hashes;
 }
 
+// 合成一局的样本：局号决定条数，这样"某一局跨过容量边界"是可控的，
+// 不必依赖真实对局的长度分布去碰运气。
+std::vector<Sample> synthetic_episode(uint32_t episode, const BatchMeta& meta) {
+    std::vector<Sample> samples;
+    const uint32_t count = 1 + (episode * 7) % 3;  // 1~3 条
+    for (uint32_t step = 0; step < count; step++) {
+        Sample sample;
+        sample.decision = Board::empty();
+        sample.afterstate = Board::empty();
+        sample.decision.tiles[0] = static_cast<uint8_t>(episode % 15);
+        sample.afterstate.tiles[1] = static_cast<uint8_t>(step % 15);
+        sample.action = static_cast<uint8_t>(episode % kNumActions);
+        sample.legal_mask = 0b1111;
+        sample.step = static_cast<uint16_t>(step);
+        sample.episode = episode;
+        sample.simulations = static_cast<uint16_t>(meta.simulations);
+        sample.move_score = 0;
+        sample.mc_return = static_cast<int64_t>(episode * 10 + step);
+        samples.push_back(sample);
+    }
+    return samples;
+}
+
+BatchMeta test_meta() {
+    BatchMeta meta;
+    meta.batch_id = "test-batch";
+    meta.policy = "mcts";
+    meta.simulations = 8;
+    meta.temperature_moves = 2;
+    meta.seed = 20261006;
+    meta.shard_samples = 4;
+    meta.workers = 1;
+    meta.samples_target = 0;
+    meta.build_id = "test-build";
+    meta.params = {{"device", "cpu"}};
+    return meta;
+}
+
 }  // namespace
 
 TEST(dataio_sample_roundtrip) {
@@ -203,6 +241,107 @@ TEST(dataio_generate_deterministic_across_workers) {
     config.seed = 999;
     run_generate(config);
     expect_true(shard_hashes(other) != shard_hashes(single), "不同种子产出不同数据");
+}
+
+// 暂停再续跑必须与"一次跑完"产出完全相同的数据。
+//
+// 这是跑谱生命周期的核心判据：第 N 局的内容只由 (种子, 局号) 决定，所以停车、
+// 落盘、再续跑这一串动作**不允许**在数据里留下任何痕迹。两个停车点各代表一种情形：
+//   2：停车时缓冲恰好被清空（末片满）→ 续跑必须新起一片；
+//   3：停车时缓冲里还有一局（末片不满）→ 续跑必须把它读回来接着填，
+//      否则分片边界会从停车点偏移，后面的每一片都跟着变。
+void expect_resume_matches_oneshot(const std::string& root, uint32_t pause_after) {
+    const BatchMeta meta = test_meta();
+    const uint32_t episodes = 11;
+    const std::string oneshot = root + "/oneshot-" + std::to_string(pause_after);
+    const std::string resumed = root + "/resumed-" + std::to_string(pause_after);
+
+    {
+        ShardWriter writer(oneshot, meta.shard_samples, meta);
+        for (uint32_t episode = 0; episode < episodes; episode++) {
+            writer.add_episode(episode, synthetic_episode(episode, meta));
+        }
+        writer.finish(BatchState::kComplete);
+    }
+    uint64_t paused_episodes = 0;
+    {
+        ShardWriter writer(resumed, meta.shard_samples, meta);
+        for (uint32_t episode = 0; episode < pause_after; episode++) {
+            writer.add_episode(episode, synthetic_episode(episode, meta));
+        }
+        const BatchManifest paused = writer.finish(BatchState::kPaused);
+        expect_equal_u64(static_cast<uint64_t>(paused.state),
+                         static_cast<uint64_t>(BatchState::kPaused), "停车后清单状态是 paused");
+        // 停车必须把内存缓冲落盘：--continue 从 manifest.episodes 接着编号，
+        // 缓冲里的局若不提交，续跑就会把这几局重新编号一遍。
+        expect_equal_u64(paused.episodes, pause_after, "停车时缓冲里的局也提交了");
+        paused_episodes = paused.episodes;
+    }
+    {
+        ShardWriter writer = ShardWriter::resume(resumed, meta.shard_samples, meta);
+        expect_equal_u64(writer.next_episode(), paused_episodes, "续跑从清单的局数接着编号");
+        for (uint32_t episode = paused_episodes; episode < episodes; episode++) {
+            writer.add_episode(episode, synthetic_episode(episode, meta));
+        }
+        writer.finish(BatchState::kComplete);
+    }
+
+    const BatchManifest one = read_manifest(oneshot);
+    const BatchManifest two = read_manifest(resumed);
+    const std::string tag = "停车点 " + std::to_string(pause_after) + "：";
+    expect_equal_u64(two.samples, one.samples, tag + "续跑产出条数与一次跑完一致");
+    expect_equal_u64(two.episodes, one.episodes, tag + "续跑产出局数与一次跑完一致");
+    expect_equal_u64(two.shards.size(), one.shards.size(), tag + "分片数与一次跑完一致");
+    expect_true(shard_hashes(resumed) == shard_hashes(oneshot), tag + "逐片哈希与一次跑完一致");
+}
+
+TEST(dataio_pause_resume_matches_oneshot) {
+    TempDir dir("resume");
+    expect_resume_matches_oneshot(dir.path(), 2);
+    expect_resume_matches_oneshot(dir.path(), 3);
+}
+
+TEST(dataio_resume_refuses_other_source) {
+    TempDir dir("resume-gate");
+    const BatchMeta meta = test_meta();
+    const std::string data = dir.sub("batch");
+    {
+        ShardWriter writer(data, meta.shard_samples, meta);
+        writer.add_episode(0, synthetic_episode(0, meta));
+        writer.finish(BatchState::kPaused);
+    }
+
+    // 每一类不一致都必须被拒绝，并且**说出是哪一项**：只说"参数不一致"等于没说。
+    BatchMeta other_seed = meta;
+    other_seed.seed = 999;
+    expect_contains(catch_message([&] { (void)ShardWriter::resume(data, meta.shard_samples, other_seed); }),
+                    "seed", "换种子续跑被拒绝并指名 seed");
+
+    BatchMeta other_device = meta;
+    other_device.params = {{"device", "cuda"}};
+    expect_contains(
+        catch_message([&] { (void)ShardWriter::resume(data, meta.shard_samples, other_device); }), "device",
+        "换设备续跑被拒绝并指名 device");
+
+    expect_contains(catch_message([&] { (void)ShardWriter::resume(data, meta.shard_samples + 1, meta); }),
+                    "shard_samples", "改分片容量续跑被拒绝并指名 shard_samples");
+
+    // 旧的分片切分规则：续写会让同一批数据里出现两种布局，只能新起一批。
+    BatchManifest legacy = read_manifest(data);
+    legacy.shard_layout = 1;
+    write_manifest(data, legacy);
+    expect_contains(catch_message([&] { (void)ShardWriter::resume(data, meta.shard_samples, meta); }),
+                    "切分规则", "旧切分规则的数据批拒绝续写");
+
+    // 已经跑完的批次不允许追加：追加数据应当新起一批（多来源训练见 ADR 0021）。
+    const std::string done = dir.sub("done");
+    {
+        ShardWriter writer(done, meta.shard_samples, meta);
+        writer.add_episode(0, synthetic_episode(0, meta));
+        writer.finish(BatchState::kComplete);
+    }
+    expect_contains(catch_message([&] { (void)ShardWriter::resume(done, meta.shard_samples, meta); }),
+                    "complete", "跑完的批次拒绝续写");
 }
 
 TEST(dataio_verify_detects_corruption) {

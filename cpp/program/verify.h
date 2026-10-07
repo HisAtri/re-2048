@@ -23,6 +23,10 @@ struct VerifyReport {
     uint32_t episodes = 0;
     size_t shards = 0;
     bool replay_checked = false;
+    // 重放被跳过的原因（空表示没跳过）。它必须能被打印出来：
+    // “校验通过”与“校验通过，但重放这一环没做”是两件不同的事。
+    std::string replay_note;
+    std::string state;  // 批次状态（complete / paused / stopped / running）
     double seconds = 0.0;
     std::vector<std::string> problems;
 };

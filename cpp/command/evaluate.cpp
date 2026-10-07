@@ -27,6 +27,7 @@ void print_usage() {
         "  --workers      并行 worker 数（默认取硬件并发数）\n"
         "  --jsonl        逐局结果写入的文件（默认 $R2048_OUTPUT_DIR/eval/<策略>-<时间>.jsonl）\n"
         "  --label        逐局记录里的标签（默认用策略名）\n"
+        "  --progress-json 进度以 JSON 行写到 stderr（给上层编排读，不给人看）\n"
         "  --quiet        不打印计划行\n");
 }
 
@@ -55,7 +56,7 @@ int run_evaluate(int argc, const char* const* argv) {
         return 0;
     }
     args.expect_only({"policy", "games", "seed", "simulations", "workers", "jsonl", "label", "quiet",
-                      "temperature-moves", "help"});
+                      "temperature-moves", "progress-json", "help"});
 
     EvaluateConfig config;
     config.policy = args.str("policy", "");
@@ -75,6 +76,7 @@ int run_evaluate(int argc, const char* const* argv) {
     config.temperature_moves = static_cast<uint32_t>(args.i32("temperature-moves", 0));
     config.label = args.str("label", config.policy);
     config.jsonl_path = args.str("jsonl", default_jsonl(config.policy, config.simulations));
+    config.progress_json = args.flag("progress-json");
 
     if (!args.flag("quiet")) {
         log_status("计划：策略 %s%s，局数 %llu，种子 %llu，输出 %s", config.policy.c_str(),

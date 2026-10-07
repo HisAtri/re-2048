@@ -94,6 +94,39 @@ checkpoint 的挑选也按“最优候选命中率”而不是全局 MAE——�
 约定：所有参数都是具名的（`--key value` 或 `--key=value`），未知参数直接报错；
 stdout 只放可被脚本消费的结果，进度与统计走 stderr。
 
+### 跑谱的生命周期（不限量 / 暂停 / 继续 / 终止）
+
+跑谱不再是"给多少局就跑多少局、中途不停"的形状（见 ADR 0020）：
+
+```bash
+# 不限量：跑到被叫停为止（--samples 0 是默认值）
+make py ARGS="selfplay --checkpoint runs/x/model.pt --simulations 64 --shard-samples 20000"
+
+# 停车：把 pause 或 stop 写进控制文件（默认 <数据批目录>/control），一次性消费
+echo stop  > $R2048_OUTPUT_DIR/data/nn-s64-20261007-120000/control
+echo pause > $R2048_OUTPUT_DIR/data/nn-s64-20261007-120000/control
+
+# 接着跑：同样的参数加 --continue，数据写进同一个批次目录
+make py ARGS="selfplay --checkpoint runs/x/model.pt --simulations 64 --shard-samples 20000 \
+  --samples 200000 --continue --out $R2048_OUTPUT_DIR/data/nn-s64-20261007-120000"
+```
+
+几条要点：
+
+* **停车点只有"局与局之间"**：进行中的局会走完，已产出的数据一定被提交。
+  一次 Ctrl-C 等价于 `stop`（再按一次才硬退出）。`kill -9` 也只丢掉"尚未落盘的那一屏"，
+  已提交的分片与清单都是完好的——清单是**增量提交日志**，它列出的分片才有效。
+* **续跑参数逐项比对**：`seed / policy / simulations / temperature_moves / model_id /
+  build_id / shard_samples` 与协议参数（`c_puct / lanes / in_flight_per_lane /
+  temperature / cache_entries / max_batch / device`）必须一致，不一致会**指名**拒绝
+  （"seed 原为 888，本次为 999"）。非协议项（`--samples`、`--workers`、`--out`、`--control`）
+  可以改。跑满目标的批次（`state: complete`）不允许追加，请新起一批。
+* **`--samples` 在续跑时是整批的累计目标**：想"再要 5000 条"就填当前总数 + 5000。
+* **逐字节复现的边界**：纯 C++ 跑谱（`generate`，整数运算）暂停+续跑与一次跑完
+  **逐字节相同**（`make test-cpp` 里有对应单测）；NN 自对弈的叶值依赖批组成（ADR 0017），
+  续跑进程的批组成与前一次天生不同，所以**前缀逐字节相同、尾部可能不同**
+  （实测 6000 条目标下 54 局里 10 局）。同一个停车点续跑两次是逐字节相同的。
+
 ## Python 侧
 
 ```
@@ -300,8 +333,9 @@ configure 时的仓库状态。`make build` 每次都会先 configure，所以�
 它会把整批数据重新生成一遍，成本与生成相同。只想做快速结构检查时加 `--no-replay`。
 
 **数据批目录已存在**
-`generate` 拒绝覆盖：跑谱批按“整批要么完整、要么重来”管理。换个 `--out` 或先清理。
-想减少重来代价就把 `--samples` 切小、多跑几批。
+`generate` 拒绝覆盖已在跑的一批：续写要用 `--continue`（它会逐项比对参数、
+从清单记录的局号接着编号，见 ADR 0020）。想另起一批就换个 `--out`。
+不限量跑谱下不需要"切小目标、多跑几批"这种变通：跑到够了就 `stop`，之后随时 `--continue`。
 
 **改动跨语言契约（动作顺序、棋盘含义、记录格式）**
 必须同时抬高 `cpp/core/version.h` 里的版本号：数据与 checkpoint 都靠它判断语义是否一致，

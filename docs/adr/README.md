@@ -24,7 +24,8 @@ ADR 解释为什么整体是这个形状。
 | [0016](0016-protocol-variables-and-simulation-budget.md) | 评测协议的隐蔽变量、模拟预算与探索系数 | 已采纳（决策 5/6 已实施，归因已订正；缺口 A/C 未补） |
 | [0017](0017-batch-scheduling-dependence.md) | 批组成不是浮点问题：在途模拟的调度依赖与强度代价 | 已采纳 |
 | [0018](0018-protocol-variable-registry.md) | 协议变量收口：清单、归属与拒绝兜底 | 已采纳 |
-| [0019](0019-jobs-and-progress.md) | 作业目录、结构化进度与子进程封装 | 已采纳 |
+| [0019](0019-jobs-and-progress.md) | 作业目录、结构化进度与子进程封装 | 已采纳（C++ 子命令进度已结构化，见 0020 决策 10） |
+| [0020](0020-selfplay-lifecycle-and-incremental-commit.md) | 跑谱生命周期与增量提交（不限量 / 暂停 / 继续 / 终止） | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

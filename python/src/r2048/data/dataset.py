@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from r2048.data.shards import SCORE_SCALE, BatchReader, BatchManifest
+from r2048.data.shards import SCORE_SCALE, BatchManifest, BatchReader
 
 
 @dataclass(frozen=True)
@@ -60,25 +60,25 @@ def make_split(reader: BatchReader, val_fraction: float = 0.05, seed: int = 0) -
 
 @dataclass
 class Batch:
-    decision: torch.Tensor      # (B, 16) uint8：决策局面
-    afterstate: torch.Tensor    # (B, 16) uint8：移动后、生成块前
-    action: torch.Tensor        # (B,) int64：实际执行的方向
-    legal_mask: torch.Tensor    # (B,) uint8：bit a = 1 表示方向 a 合法
-    visits: torch.Tensor        # (B, 4) float32：根访问数
+    decision: torch.Tensor  # (B, 16) uint8：决策局面
+    afterstate: torch.Tensor  # (B, 16) uint8：移动后、生成块前
+    action: torch.Tensor  # (B,) int64：实际执行的方向
+    legal_mask: torch.Tensor  # (B,) uint8：bit a = 1 表示方向 a 合法
+    visits: torch.Tensor  # (B, 4) float32：根访问数
     policy_target: torch.Tensor  # (B, 4) float32：归一化访问分布（无搜索时为全 0）
     value_target: torch.Tensor  # (B,) float32：归一化回报（分数 / score_scale）
-    move_score: torch.Tensor    # (B,) float32：归一化立即得分
-    episode: torch.Tensor       # (B,) int64
+    move_score: torch.Tensor  # (B,) float32：归一化立即得分
+    episode: torch.Tensor  # (B,) int64
     # --- 候选级监督（schema v2）：每个合法方向一条，按方向下标对齐 ---
     candidate_afterstate: torch.Tensor  # (B, 4, 16) uint8
-    candidate_value: torch.Tensor       # (B, 4) float32：A(u_a) = Q̄(a) − r(s,a)（已归一化）
-    candidate_visits: torch.Tensor      # (B, 4) float32：该候选边的根访问数
-    candidate_weight: torch.Tensor      # (B, 4) float32：sqrt(访问数)，非法/未访达/无候选处为 0
+    candidate_value: torch.Tensor  # (B, 4) float32：A(u_a) = Q̄(a) − r(s,a)（已归一化）
+    candidate_visits: torch.Tensor  # (B, 4) float32：该候选边的根访问数
+    candidate_weight: torch.Tensor  # (B, 4) float32：sqrt(访问数)，非法/未访达/无候选处为 0
 
     def __len__(self) -> int:
         return int(self.decision.shape[0])
 
-    def to(self, device: torch.device) -> "Batch":
+    def to(self, device: torch.device) -> Batch:
         return Batch(
             decision=self.decision.to(device),
             afterstate=self.afterstate.to(device),
@@ -171,13 +171,9 @@ class BatchStream:
             value_target=torch.from_numpy(
                 (records["mc_return"].astype(np.float32) / self.score_scale).copy()
             ),
-            move_score=torch.from_numpy(
-                (records["move_score"].astype(np.float32) / self.score_scale).copy()
-            ),
+            move_score=torch.from_numpy((records["move_score"].astype(np.float32) / self.score_scale).copy()),
             episode=torch.from_numpy(records["episode"].astype(np.int64)),
-            candidate_afterstate=torch.from_numpy(
-                np.ascontiguousarray(records["candidate_afterstate"])
-            ),
+            candidate_afterstate=torch.from_numpy(np.ascontiguousarray(records["candidate_afterstate"])),
             candidate_value=torch.from_numpy(
                 (records["candidate_value"].astype(np.float32) / self.score_scale).copy()
             ),
@@ -209,6 +205,10 @@ def batch_manifest_summary(manifest: BatchManifest) -> dict:
         "seed": manifest.seed,
         "samples": manifest.samples,
         "episodes": manifest.episodes,
+        # state/shard_layout 进训练产物：日后回看一份权重是用什么数据训出来的，
+        # 「这批数据当时跑完了没有」和「分片规则是哪一版」都在决定它能不能被复现。
+        "state": manifest.state,
+        "shard_layout": manifest.shard_layout,
         "build_id": manifest.build_id,
         "params": manifest.params,
     }

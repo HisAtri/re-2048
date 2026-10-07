@@ -56,6 +56,7 @@ EvaluateResult run_evaluate(const EvaluateConfig& config) {
 
     Progress progress("评测对局");
     progress.set_total(static_cast<int64_t>(config.games));
+    if (config.progress_json) progress.set_json("evaluate", "games");
     uint64_t last_seen = 0;
     while (last_seen < config.games) {
         const uint64_t now = finished.load();

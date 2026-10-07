@@ -104,11 +104,11 @@ stdout 的一行 `\r` 里**，C++ 子命令的进度更是只在终端闪一下�
 
 ## 尚未实施
 
-1. **C++ 子命令的进度还没有结构化**。`generate` / `evaluate` / `verify` 在 C++ 里
-   打印自己的进度条（`\r` + 换行前不 flush 出完整行），所以 `run_cpp` 现在只能
-   把它们当普通 stdout 记进日志；界面要显示纯 C++ 跑谱的进度条就得解析那一行。
-   修法是在 C++ 的 `Progress` 上加一个 `--progress-json` 模式，按行吐一个 JSON 对象；
-   放在 P2（跑谱生命周期）里做，因为那时本来就要重写跑谱的循环与落盘。
+1. ~~**C++ 子命令的进度还没有结构化**~~ **已实施**（ADR 0020 决策 10）：
+   `Progress::set_json(stage, unit)` 让进度按行吐 JSON 到 stderr，
+   `run_cpp(..., progress=True)` 把两条流分开读并把进度写进 `status.json` / `log.jsonl`。
+   `generate` 与 `evaluate` 已用它；`verify` / `bench` 现在没有进度条，
+   等它们有需要时再加。
 2. **没有作业清单**。`runs/` 下有哪些作业、各自什么状态，现在要靠 `ls` +
    逐个读 `status.json`。等界面真的需要"作业列表"时再加一个索引文件
    （而不是提前维护一个可能与目录不同步的清单）。

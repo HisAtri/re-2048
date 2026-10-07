@@ -45,7 +45,20 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
     report.samples = manifest.samples;
     report.episodes = manifest.episodes;
     report.shards = manifest.shards.size();
-    if (manifest.shards.empty()) report.problems.push_back("清单里没有任何分片");
+    report.state = batch_state_name(manifest.state);
+    // 未跑完的批次是正常状态（被 pause/stop 叫停），此时它本来就短、也没有“应该等于目标条数”
+    // 这回事——把“没跑完”报成“校验失败”只会让人学会忽略校验输出。
+    const bool complete = manifest.state == BatchState::kComplete;
+    if (manifest.shards.empty()) {
+        if (complete) report.problems.push_back("已完成的批次里没有任何分片");
+    }
+    if (complete && manifest.meta.samples_target > 0 && manifest.samples != manifest.meta.samples_target) {
+        report.problems.push_back("清单自称已完成，但样本数 " + std::to_string(manifest.samples) +
+                                  " 不等于目标 " + std::to_string(manifest.meta.samples_target));
+    }
+    if (!complete && manifest.episodes == 0 && manifest.samples > 0) {
+        report.problems.push_back("清单没有提交任何局，却有样本条数");
+    }
 
     uint64_t total_samples = 0;
     for (size_t index = 0; index < manifest.shards.size(); index++) {
@@ -63,9 +76,10 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
                                       std::to_string(shard.samples * kSampleBytes));
             continue;
         }
-        // 除最后一片外，分片都必须是满的：容量变化会让“分片边界”失去意义。
-        if (index + 1 < manifest.shards.size() && shard.samples != manifest.meta.shard_samples) {
-            report.problems.push_back(tag + " 不是满分片（" + std::to_string(shard.samples) + " != " +
+        // 除最后一片外，分片都必须攒够容量：分片偏小会让“分片边界只由样本流决定”失去意义。
+        // 判据是 >= 而不是 ==：切分只在局边界上进行，所以分片通常会略微超过容量。
+        if (index + 1 < manifest.shards.size() && shard.samples < manifest.meta.shard_samples) {
+            report.problems.push_back(tag + " 未攒满容量（" + std::to_string(shard.samples) + " < " +
                                       std::to_string(manifest.meta.shard_samples) + "）");
         }
 
@@ -116,7 +130,21 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
         }
     }
 
-    if (options.replay && report.problems.empty()) {
+    // 重放校验有两个前提，缺一个就不该硬做——做了只会给出错误的结论：
+    //   * 切分规则必须与当前实现一致：规则变了，哈希当然不同，那不是“数据错了”；
+    //   * 这一批必须已经跑完：未跑完的批次没有确定终点，而不限量的批次（目标 0）
+    //     更是永远跑不到头，重放会一直生成下去。
+    const bool replayable = manifest.shard_layout == kShardLayout && complete &&
+                            manifest.meta.samples_target > 0;
+    if (options.replay && !replayable) {
+        report.replay_note = manifest.shard_layout != kShardLayout
+                                 ? ("该批由旧的分片切分规则产出（shard_layout=" +
+                                    std::to_string(manifest.shard_layout) + "），当前实现无法重放比对")
+                                 : ("该批未跑完（state=" + report.state +
+                                    "）或样本目标不限量，重放没有可比的终点");
+    }
+
+    if (options.replay && replayable && report.problems.empty()) {
         const bool auto_dir = options.replay_dir.empty();
         const std::string replay_dir = auto_dir ? data_dir + "_replay" : options.replay_dir;
         std::filesystem::remove_all(replay_dir);

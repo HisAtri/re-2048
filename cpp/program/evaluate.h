@@ -17,6 +17,9 @@ struct EvaluateConfig {
     uint32_t temperature_moves = 0;
     std::string jsonl_path;  // 为空则不写逐局记录
     std::string label;       // 写入逐局记录的策略标签
+    // 进度以 JSON 行写到 stderr（见 cpp/core/logging.h 的 Progress::set_json）：
+    // 上层编排（r2048.jobs.run_cpp）靠它拿到结构化进度，而不是解析人类可读文本。
+    bool progress_json = false;
 };
 
 struct GameOutcome {

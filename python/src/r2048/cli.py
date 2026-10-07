@@ -68,7 +68,9 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--jsonl", default="", help="逐局记录输出路径")
 
     rating = sub.add_parser("rating", help="评分池：按旧版口径算评分（对数标度 + 锚点）")
-    rating.add_argument("--pool", default="", help="评分池（append-only JSONL），默认 $R2048_OUTPUT_DIR/rating/pool.jsonl")
+    rating.add_argument(
+        "--pool", default="", help="评分池（append-only JSONL），默认 $R2048_OUTPUT_DIR/rating/pool.jsonl"
+    )
     rating.add_argument("--anchors", default="", help="锚点文件，默认 $R2048_OUTPUT_DIR/rating/anchors.json")
     rating.add_argument("--ingest", nargs="*", default=[], help="把评测 JSONL 追加进评分池（自动去重）")
     rating.add_argument("--anchor", action="append", default=[], help="指定锚点，形如 track=model_id")
@@ -90,10 +92,24 @@ def _build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--seed", type=int, default=1, help="生成新开局时用的种子")
     probe.add_argument("--device", default="cuda")
 
-    selfplay = sub.add_parser("selfplay", help="NN 引导的批量自对弈跑谱")
+    selfplay = sub.add_parser(
+        "selfplay",
+        help="NN 引导的批量自对弈跑谱",
+        description=(
+            "自动对弈产出训练数据。样本目标为 0 表示不限量：跑到被暂停/终止为止，"
+            "之后用同样的参数加 --continue 接着写进同一个批次目录。"
+            "暂停/终止＝把 pause/stop 写进控制文件，或者按一次 Ctrl-C："
+            "进行中的局会走完，已产出的数据一定被提交。"
+        ),
+    )
     selfplay.add_argument("--out", default="", help="输出目录（默认 $R2048_OUTPUT_DIR/data/<批次号>）")
     selfplay.add_argument("--batch-id", default="", help="批次号（默认 nn-<模拟次数>-<时间>）")
-    selfplay.add_argument("--samples", type=int, required=True, help="目标样本条数")
+    selfplay.add_argument(
+        "--samples",
+        type=int,
+        default=0,
+        help="目标样本条数（0 = 不限量，跑到被叫停为止）；续跑时是整个批次的累计目标",
+    )
     selfplay.add_argument("--seed", type=int, default=0, help="随机种子（0 表示按时间生成）")
     selfplay.add_argument("--checkpoint", default="", help="模型 checkpoint；不给则用随机初始化模型")
     selfplay.add_argument("--random-init", action="store_true", help="显式使用随机初始化模型（仅链路自检）")
@@ -108,6 +124,15 @@ def _build_parser() -> argparse.ArgumentParser:
     selfplay.add_argument("--max-batch", type=int, default=16384)
     selfplay.add_argument("--device", default="cuda", help="cuda / cpu（默认 cuda）")
     selfplay.add_argument("--model-id", default="", help="写入数据来源记录的模型标识")
+    selfplay.add_argument(
+        "--continue",
+        dest="continue_",
+        action="store_true",
+        help="续跑：在既有批次上接着编号写下去（参数逐项比对，不一致直接拒绝）",
+    )
+    selfplay.add_argument(
+        "--control", default="", help="控制文件路径（默认 <数据批目录>/control，内容是 pause/stop）"
+    )
     return parser
 
 
@@ -218,7 +243,9 @@ def _command_eval(args: argparse.Namespace) -> int:
     with JobDir(job_id, "eval", params={**config.__dict__, "job_id": job_id}) as job:
         config.on_progress = job.callback()
         result = run_evaluation(config)
-        job.finish(jsonl=result.jsonl, games=len(result.games), protocol_hash=result.summary()["protocol_hash"])
+        job.finish(
+            jsonl=result.jsonl, games=len(result.games), protocol_hash=result.summary()["protocol_hash"]
+        )
     summary = result.summary()
     tiles = "，".join(f"{size}: {count}" for size, count in summary["tiles"].items())
     print(
@@ -261,25 +288,30 @@ def _command_rating(args: argparse.Namespace) -> int:
     anchors = rating_module.load_anchors(anchors_path)
     ratings = rating_module.compute_ratings(rows, anchors)
     openings = rating_module.count_openings()
-    print(f"开局：{openings['distinct_boards']} 种（D4 简并后 {openings['d4_orbits']} 种）——"
-          "这就是“同 seed 对齐开局”能提供的全部信息")
+    print(
+        f"开局：{openings['distinct_boards']} 种（D4 简并后 {openings['d4_orbits']} 种）——"
+        "这就是“同 seed 对齐开局”能提供的全部信息"
+    )
 
     report = {"openings": openings, "tracks": {}}
     for track, blocks in ratings.items():
         for block in blocks:
             anchor = block["anchor"]
-            print(f"\n[{track}] 锚点 {anchor['model_id']}（{anchor['n_ref']} 局）= 1000，"
-                  f"协议 {block['protocol_hash']}")
+            print(
+                f"\n[{track}] 锚点 {anchor['model_id']}（{anchor['n_ref']} 局）= 1000，"
+                f"协议 {block['protocol_hash']}"
+            )
             # 同一 track 的不同协议都会放到这把尺子上（曲线就是这么来的），
             # 所以差异必须打出来：不然“这条线是在什么条件下得到的”只能靠比对两个哈希。
             if block["differs_from_anchor"]:
                 difference = "，".join(
-                    f"{name} {pair[0]}→{pair[1]}"
-                    for name, pair in block["differs_from_anchor"].items()
+                    f"{name} {pair[0]}→{pair[1]}" for name, pair in block["differs_from_anchor"].items()
                 )
                 print(f"  与锚点协议不同的字段：{difference}")
-            print(f"{'模型':<22}{'评分':>10}{'±95%':>8}{'局数':>7}{'对数均值':>10}{'均分':>10}"
-                  f"{'中位':>9}{'平均步数':>9}  每万局到达 2048/4096")
+            print(
+                f"{'模型':<22}{'评分':>10}{'±95%':>8}{'局数':>7}{'对数均值':>10}{'均分':>10}"
+                f"{'中位':>9}{'平均步数':>9}  每万局到达 2048/4096"
+            )
             ordered = sorted(block["models"].items(), key=lambda item: -item[1]["rating"])
             for model_id, stats in ordered:
                 tiles = stats["tile_reach_per_10k"]
@@ -356,8 +388,7 @@ def _command_compare(args: argparse.Namespace) -> int:
         f"{result['candidate']} − {result['baseline']} = {result['mean_difference']:+.1f} "
         f"（95% CI [{result['ci95'][0]:+.1f}, {result['ci95'][1]:+.1f}]，"
         f"{result['wins']} 胜 {result['draws']} 平 {result['losses']} 负，"
-        f"{result['games']} 局配对）"
-        + ("，显著" if result["significant"] else "，区间跨零：不可下结论")
+        f"{result['games']} 局配对）" + ("，显著" if result["significant"] else "，区间跨零：不可下结论")
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
@@ -374,9 +405,7 @@ def _command_probe(args: argparse.Namespace) -> int:
     result = probe_position(args.checkpoint, board=board, seed=args.seed, device=args.device)
 
     print("局面（指数）:", " ".join(str(int(cell)) for cell in result.board))
-    print(
-        f"合法方向掩码 {result.legal_mask:04b}，模型 {result.model_id}，结构 {result.architecture}"
-    )
+    print(f"合法方向掩码 {result.legal_mask:04b}，模型 {result.model_id}，结构 {result.architecture}")
     scores = result.directional_scores()
     for action in range(4):
         mark = " 合法" if (result.legal_mask >> action) & 1 else " 非法"
@@ -404,16 +433,19 @@ def _command_selfplay(args: argparse.Namespace) -> int:
         args.device = "cpu"
     device = torch.device(args.device)
 
+    seed = args.seed if args.seed else int(time.time())
     if args.checkpoint:
         model, metadata = load_checkpoint(args.checkpoint, device)
         model_id = args.model_id or str(metadata.get("model_id", ""))
     else:
+        # 随机初始化的权重也必须由种子决定：否则同一条命令跑两次得到两份不同的数据，
+        # 而"没有 checkpoint 也能复现整条链路"正是这个选项存在的理由。
+        torch.manual_seed(seed)
         model = create_model().to(device).eval()
         model_id = args.model_id or "random-init"
         if not args.random_init:
             print("未提供 --checkpoint：使用随机初始化模型（只用于链路自检）", file=sys.stderr)
 
-    seed = args.seed if args.seed else int(time.time())
     batch_id = args.batch_id or f"nn-s{args.simulations}-{time.strftime('%Y%m%d-%H%M%S')}"
     out_dir = Path(args.out) if args.out else paths.data_dir(batch_id)
 
@@ -432,10 +464,13 @@ def _command_selfplay(args: argparse.Namespace) -> int:
         cache_entries=args.cache_entries,
         shard_samples=args.shard_samples,
         max_batch=args.max_batch,
+        control_path=args.control or "",
+        resume=args.continue_,
     )
     print(
         f"计划：NN 自对弈，模型 {model_id}，模拟 {config.simulations}，lane {config.lanes}，"
-        f"样本 {config.samples}，种子 {seed}，设备 {args.device}，输出 {out_dir}",
+        f"样本 {config.samples or '不限量'}，种子 {seed}，设备 {args.device}，输出 {out_dir}"
+        + ("（续跑）" if config.resume else ""),
         file=sys.stderr,
     )
 
@@ -446,18 +481,26 @@ def _command_selfplay(args: argparse.Namespace) -> int:
         result = run_selfplay(config, model, device)
         job.finish(
             manifest=result.manifest_path,
+            state=result.state,
             samples=result.samples,
             episodes=result.episodes,
             seconds=round(result.seconds, 3),
         )
     stats = result.stats
     print(
-        f"完成：样本 {result.samples}，局数 {result.episodes}，耗时 {result.seconds:.1f} 秒"
+        f"完成：状态 {result.state}，样本 {result.samples}，局数 {result.episodes}，"
+        f"耗时 {result.seconds:.1f} 秒"
         f"（{result.samples_per_second:.0f} 样本/秒），前向 {result.forward_batches} 次，"
         f"平均每批 {result.rows_per_forward:.0f} 行，"
         f"叶子缓存命中 {stats['leaf_cache_rate'] * 100:.1f}%",
         file=sys.stderr,
     )
+    if result.state != "complete":
+        print(
+            f"这批数据没有跑满目标（{result.state}）：可以用同样的参数加 --continue 接着跑，"
+            "数据会写进同一个批次目录",
+            file=sys.stderr,
+        )
     # stdout 只放可被脚本消费的结果：manifest 路径。
     print(result.manifest_path)
     return 0

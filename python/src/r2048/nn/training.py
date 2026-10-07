@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -32,6 +33,7 @@ import r2048_core
 
 from r2048.data.dataset import Batch, BatchStream, batch_manifest_summary, open_batch
 from r2048.data.shards import CANDIDATE_TARGET_DEFINITION
+from r2048.jobs import finish_console, progress_payload
 from r2048.nn.augment import augment_joint, augment_policy, augment_value
 import r2048_core
 
@@ -86,6 +88,10 @@ class TrainConfig:
     compile: bool = False
     log_every: int = 50
     resume: bool = False
+    # 结构化进度回调（见 r2048.jobs）：训练动辄几十分钟到几小时，外部观察者
+    # （脚本、界面）不该去解析那一行覆盖式打印。给了回调就不再打印。
+    # 回调粒度与 log_every 一致——每步回调一次是没必要的开销（会按步写状态文件）。
+    on_progress: Callable[[dict], None] | None = None
 
 
 @dataclass
@@ -432,16 +438,31 @@ def _run_epoch(
             gpu = ""
             if device.type == "cuda":
                 gpu = f" 显存 {torch.cuda.memory_allocated(device) / 2**20:.0f}MiB"
-            print(
-                f"\r{label} epoch {epoch + 1} step {step + 1}/{len(stream)} loss {float(loss):.4f} "
-                f"{seen / max(1e-9, elapsed):.0f} 样本/秒{gpu}   ",
-                end="",
-                flush=True,
+            payload = progress_payload(
+                "train",
+                step + 1,
+                len(stream),
+                "steps",
+                started,
+                line=(
+                    f"{label} epoch {epoch + 1} step {step + 1}/{len(stream)} loss {float(loss):.4f} "
+                    f"{seen / max(1e-9, elapsed):.0f} 样本/秒{gpu}"
+                ),
+                extra={
+                    "epoch": epoch + 1,
+                    "epochs": config.epochs,
+                    "mode": config.mode,
+                    "samples_per_second": round(seen / max(1e-9, elapsed), 1),
+                },
             )
+            if config.on_progress is None:
+                print("\r" + payload["line"] + "   ", end="", flush=True)
+            else:
+                config.on_progress(payload)
 
     seconds = time.monotonic() - started
-    if config.log_every:
-        print()
+    if config.log_every and config.on_progress is None:
+        finish_console()
     return float(loss_total.item() / max(1, batches)), metrics, seconds
 
 

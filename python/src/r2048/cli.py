@@ -145,6 +145,9 @@ def _command_env() -> int:
 
 
 def _command_train(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+
+    from r2048.jobs import JobDir
     from r2048.nn.training import TrainConfig, run_training
 
     config = TrainConfig(
@@ -176,7 +179,12 @@ def _command_train(args: argparse.Namespace) -> int:
         log_every=args.log_every,
         resume=args.resume,
     )
-    result = run_training(config)
+    # 训练的运行目录本来就是 --output，作业状态与日志直接落在同一个目录里：
+    # 事后排查“这次训练是怎么跑的”时，job.json/status.json 与 train.json 在同一处。
+    with JobDir(Path(args.output).name, "train", params=asdict(config), root=args.output) as job:
+        config.on_progress = job.callback()
+        result = run_training(config)
+        job.finish(best_checkpoint=result.best_checkpoint, train_json=result.train_json)
     print(f"完成：最佳 checkpoint {result.best_checkpoint}")
     print(f"运行记录 {result.train_json}")
     # stdout 只放可被脚本消费的结果。
@@ -185,6 +193,9 @@ def _command_train(args: argparse.Namespace) -> int:
 
 
 def _command_eval(args: argparse.Namespace) -> int:
+    import time
+
+    from r2048.jobs import JobDir
     from r2048.workflows.evaluate import EvalConfig, run_evaluation
 
     config = EvalConfig(
@@ -202,7 +213,12 @@ def _command_eval(args: argparse.Namespace) -> int:
         label=args.label,
         jsonl=args.jsonl,
     )
-    result = run_evaluation(config)
+    label = config.label or config.track
+    job_id = f"eval-{label}-{time.strftime('%Y%m%d-%H%M%S')}"
+    with JobDir(job_id, "eval", params={**config.__dict__, "job_id": job_id}) as job:
+        config.on_progress = job.callback()
+        result = run_evaluation(config)
+        job.finish(jsonl=result.jsonl, games=len(result.games), protocol_hash=result.summary()["protocol_hash"])
     summary = result.summary()
     tiles = "，".join(f"{size}: {count}" for size, count in summary["tiles"].items())
     print(
@@ -350,64 +366,26 @@ def _command_compare(args: argparse.Namespace) -> int:
 def _command_probe(args: argparse.Namespace) -> int:
     """打印一个局面的网络输出：每个方向的合并得分、afterstate 的价值、以及策略分布。
 
-    它只做“打印”，不做选招——选招口径只有 C++ 引擎一处，避免探针与引擎给出不同答案。
+    计算在 `r2048.runtime.probe` 里（界面与脚本复用同一条口径），这里只负责排版。
     """
-    import numpy as np
-    import torch
+    from r2048.runtime.probe import DIRECTION_NAMES, parse_board, probe_position
 
-    import r2048_core
+    board = parse_board(args.board) if args.board else None
+    result = probe_position(args.checkpoint, board=board, seed=args.seed, device=args.device)
 
-    from r2048.nn.encode import encode_boards
-    from r2048.nn.model import load_checkpoint
-
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        device = torch.device("cpu")
-    model, metadata = load_checkpoint(args.checkpoint, device)
-    scale = float(r2048_core.SCORE_SCALE)
-
-    if args.board:
-        values = [int(part) for part in args.board.replace(",", " ").split()]
-        if len(values) != 16:
-            raise SystemExit("--board 需要 16 个指数")
-        board = np.array(values, dtype=np.uint8)
-    else:
-        # 用与跑谱一致的开局生成口径（同一 seed 与局号 → 同一开局）。
-        import random
-
-        rng = random.Random(args.seed)
-        board = np.zeros(16, dtype=np.uint8)
-        for _ in range(2):
-            empty = [i for i in range(16) if board[i] == 0]
-            board[rng.choice(empty)] = 2 if rng.random() < 0.1 else 1
-    legal = int(r2048_core.legal_mask(board))
-
-    rows = [board]
-    scores = []
-    for action in range(4):
-        outcome = r2048_core.apply_move(board, action)
-        rows.append(np.asarray(outcome["board"], dtype=np.uint8))
-        scores.append(int(outcome["score"]))
-    with torch.no_grad():
-        value, logits = model(encode_boards(torch.from_numpy(np.stack(rows)).to(torch.long).to(device)))
-    afterstate_values = (value[1:] * scale).tolist()
-    logits = logits[0].float().cpu()
-    masked = torch.where(
-        torch.tensor([(legal >> action) & 1 == 1 for action in range(4)], dtype=torch.bool),
-        logits,
-        torch.tensor(float("-inf")),
+    print("局面（指数）:", " ".join(str(int(cell)) for cell in result.board))
+    print(
+        f"合法方向掩码 {result.legal_mask:04b}，模型 {result.model_id}，结构 {result.architecture}"
     )
-    policy = torch.softmax(masked, dim=-1).tolist()
-
-    names = ["上", "右", "下", "左"]
-    print("局面（指数）:", " ".join(str(int(cell)) for cell in board))
-    print(f"合法方向掩码 {legal:04b}，模型 {metadata.get('model_id', '')}，结构 {metadata.get('architecture', '')}")
+    scores = result.directional_scores()
     for action in range(4):
-        mark = " 合法" if (legal >> action) & 1 else " 非法"
+        mark = " 合法" if (result.legal_mask >> action) & 1 else " 非法"
         print(
-            f"  {names[action]}({action}){mark}: 合并得分 {scores[action]:6d}  "
-            f"A(u) {afterstate_values[action]:9.1f}  r+A(u) {scores[action] + afterstate_values[action]:9.1f}  "
-            f"π {policy[action]:.3f}"
+            f"  {DIRECTION_NAMES[action]}({action}){mark}: "
+            f"合并得分 {result.merge_scores[action]:6d}  "
+            f"A(u) {result.afterstate_values[action]:9.1f}  "
+            f"r+A(u) {scores[action]:9.1f}  "
+            f"π {result.policy[action]:.3f}"
         )
     return 0
 
@@ -417,6 +395,7 @@ def _command_selfplay(args: argparse.Namespace) -> int:
 
     import torch
 
+    from r2048.jobs import JobDir
     from r2048.nn.model import create_model, load_checkpoint
     from r2048.runtime.selfplay import SelfplayConfig, run_selfplay
 
@@ -460,7 +439,17 @@ def _command_selfplay(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
 
-    result = run_selfplay(config, model, device)
+    # 作业目录与数据批同名：一次跑谱的现场记录（status/log）和它产出的数据放在
+    # 两个并列的目录里，事后能一眼对上。
+    with JobDir(batch_id, "selfplay", params=config.__dict__) as job:
+        config.on_progress = job.callback()
+        result = run_selfplay(config, model, device)
+        job.finish(
+            manifest=result.manifest_path,
+            samples=result.samples,
+            episodes=result.episodes,
+            seconds=round(result.seconds, 3),
+        )
     stats = result.stats
     print(
         f"完成：样本 {result.samples}，局数 {result.episodes}，耗时 {result.seconds:.1f} 秒"

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +28,7 @@ import torch
 
 import r2048_core
 
+from r2048.jobs import finish_console, progress_payload
 from r2048.nn.model import load_checkpoint
 from r2048.protocol import build_protocol, protocol_hash
 from r2048.runtime.inference import BatchedEvaluator
@@ -55,6 +57,9 @@ class EvalConfig:
     label: str = ""
     jsonl: str = ""
     progress_every: float = 2.0
+    # 结构化进度回调（见 r2048.jobs）：评测可能跑几十分钟，外部观察者不该只能解析
+    # 那一行覆盖式打印。给了回调就不再打印，由调用方决定怎么呈现。
+    on_progress: Callable[[dict], None] | None = None
 
 
 @dataclass
@@ -212,17 +217,27 @@ def run_evaluation(config: EvalConfig) -> EvalResult:
         now = time.monotonic()
         if now - last_report >= config.progress_every and not advance["done"]:
             last_report = now
-            print(
-                f"\r{config.track} {len(results)}/{config.games} 局，"
-                f"当前均分 {np.mean([g.score for g in results]) if results else 0:.0f}",
-                end="",
-                flush=True,
+            payload = progress_payload(
+                "eval",
+                len(results),
+                config.games,
+                "games",
+                started,
+                line=(
+                    f"{config.track} {len(results)}/{config.games} 局，"
+                    f"当前均分 {np.mean([g.score for g in results]) if results else 0:.0f}"
+                ),
+                extra={"track": config.track, "model_id": model_id},
             )
+            if config.on_progress is None:
+                print("\r" + payload["line"], end="", flush=True)
+            else:
+                config.on_progress(payload)
         if advance["done"]:
             break
     seconds = time.monotonic() - started
-    if config.progress_every > 0:
-        print()
+    if config.progress_every > 0 and config.on_progress is None:
+        finish_console()
 
     results.sort(key=lambda game: game.episode)
     result = EvalResult(

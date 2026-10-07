@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import torch
 
 import r2048_core
 
+from r2048.jobs import finish_console, progress_payload
 from r2048.runtime.inference import BatchedEvaluator
 
 
@@ -42,6 +44,10 @@ class SelfplayConfig:
     shard_samples: int = 100000
     max_batch: int = 16384
     progress_every: float = 0.5
+    # 结构化进度回调（见 r2048.jobs）。给了回调就不再打印，由调用方决定怎么呈现——
+    # CLI 与将来的界面因此只在这一点上分叉。回调收到的 dict 每 0.5 秒一次，
+    # 一次自对弈几千次，所以回调本身要廉价（写文件要走原子替换，不要在这里做重活）。
+    on_progress: Callable[[dict], None] | None = None
 
 
 @dataclass
@@ -108,19 +114,34 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
         now = time.monotonic()
         if now - last_report >= config.progress_every:
             last_report = now
-            written = advance["samples_written"]
+            written = int(advance["samples_written"])
             rate = written / max(1e-9, now - started)
-            print(
-                f"\r自对弈 {written}/{config.samples} 条（{100.0 * written / config.samples:.1f}%），"
-                f"{rate:.0f} 样本/秒，批均值 {evaluator.rows / max(1, evaluator.batches):.0f} 行",
-                end="",
-                flush=True,
+            payload = progress_payload(
+                "selfplay",
+                written,
+                config.samples,
+                "samples",
+                started,
+                line=(
+                    f"自对弈 {written}/{config.samples} 条（{100.0 * written / config.samples:.1f}%），"
+                    f"{rate:.0f} 样本/秒，批均值 {evaluator.rows / max(1, evaluator.batches):.0f} 行"
+                ),
+                extra={
+                    "batch_id": config.batch_id,
+                    "forward_batches": evaluator.batches,
+                    "forward_rows": evaluator.rows,
+                    "episodes": int(advance["episodes_written"]),
+                },
             )
+            if config.on_progress is None:
+                print("\r" + payload["line"], end="", flush=True)
+            else:
+                config.on_progress(payload)
 
     manifest_path = engine.finish()
     seconds = time.monotonic() - started
-    if config.progress_every > 0:
-        print()
+    if config.progress_every > 0 and config.on_progress is None:
+        finish_console()
 
     stats = engine.stats()
     return SelfplayResult(

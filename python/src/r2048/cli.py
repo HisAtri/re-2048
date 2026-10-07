@@ -183,6 +183,62 @@ def _build_parser() -> argparse.ArgumentParser:
     selfplay.add_argument(
         "--control", default="", help="控制文件路径（默认 <数据批目录>/control，内容是 pause/stop）"
     )
+
+    merge = sub.add_parser(
+        "merge-halves",
+        help="把两个半模型拼成完整模型（价值取一边、策略取另一边）",
+        description=(
+            "双塔下价值头与策略头分开训练时，两个 run 各自只在一个头上是新的。"
+            "评测“这一轮的搜索强度”必须用这一轮的价值 + 这一轮的策略。"
+        ),
+    )
+    merge.add_argument("--value", required=True, help="提供非策略张量的 checkpoint")
+    merge.add_argument("--policy", required=True, help="提供策略张量的 checkpoint")
+    merge.add_argument("--output", required=True, help="合并后的 checkpoint 路径")
+    merge.add_argument("--note", default="", help="写进元数据的说明（为什么这样合）")
+
+    iterate = sub.add_parser(
+        "iterate",
+        help="一次迭代：跑谱 → 训练 → 评测 → 评分",
+        description=(
+            "薄驱动：四步各自都是对既有入口的一次调用，每步做完在迭代目录留一个标记，"
+            "重跑时跳过已完成的步骤。--steps 只跑其中几步，--force 重做已完成的步骤。"
+            "训练数据集 = --config 里 datasets 声明的池子 + 这一轮新产出的数据（按 --data-weight）。"
+        ),
+    )
+    iterate.add_argument("--name", required=True, help="迭代名（例如 c3）：产物路径与评测标签都由它派生")
+    iterate.add_argument("--config", required=True, help="训练配置文件（YAML：datasets + train）")
+    iterate.add_argument("--output", default="", help="迭代目录（默认 $R2048_OUTPUT_DIR/iters/<name>）")
+    iterate.add_argument(
+        "--steps",
+        default="",
+        help="要跑的步骤，逗号分隔（默认全部四个：selfplay,train,evaluate,rate）",
+    )
+    iterate.add_argument("--force", action="store_true", help="重做已经完成的步骤")
+    iterate.add_argument(
+        "--init-checkpoint",
+        default="",
+        help="上一轮的完整模型：跑谱用它当对手，训练用它当起点。不给则用纯 MCTS 当教师（首轮）",
+    )
+    iterate.add_argument("--samples", type=int, default=0, help="跑谱目标样本数（> 0）")
+    iterate.add_argument("--data-seed", type=int, default=0, help="跑谱的种子")
+    iterate.add_argument("--data-weight", type=float, default=1.0, help="新数据在训练池里的权重")
+    iterate.add_argument("--simulations", type=int, default=64, help="跑谱/评测共用的模拟数")
+    iterate.add_argument("--lanes", type=int, default=64)
+    iterate.add_argument("--in-flight", type=int, default=8)
+    iterate.add_argument("--c-puct", type=float, default=1.5)
+    iterate.add_argument("--device", default="cuda")
+    iterate.add_argument("--eval-games", type=int, default=400)
+    iterate.add_argument("--eval-seed", type=int, default=0, help="评测种子（各臂对齐开局用）")
+    iterate.add_argument(
+        "--baseline",
+        action="append",
+        default=[],
+        help="基线臂：random 或 mcts<模拟数>（可重复；默认 random 与 mcts64）",
+    )
+    iterate.add_argument(
+        "--anchor", action="append", default=[], help="刷新锚点，形如 track=model_id（可重复）"
+    )
     return parser
 
 
@@ -529,6 +585,59 @@ def _command_selfplay(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_merge_halves(args: argparse.Namespace) -> int:
+    from r2048.workflows.merge import merge_halves
+
+    result = merge_halves(args.value, args.policy, args.output, note=args.note)
+    print(
+        f"合并完成：策略张量 {result.policy_tensors} 个、价值张量 {result.value_tensors} 个，"
+        f"标识 {result.model_id}",
+        file=sys.stderr,
+    )
+    # stdout 只放可被脚本消费的结果（ADR 0008）：合并后的 checkpoint 路径。
+    print(result.path)
+    return 0
+
+
+def _command_iterate(args: argparse.Namespace) -> int:
+    from r2048.iterate import DEFAULT_BASELINES, STEPS, IterateConfig, run_iteration
+
+    steps = tuple(part.strip() for part in args.steps.split(",") if part.strip()) or STEPS
+    anchors: dict[str, str] = {}
+    for entry in args.anchor:
+        track, _, model_id = entry.partition("=")
+        if not track or not model_id:
+            raise SystemExit(f"--anchor 必须是 track=model_id 的形状，收到 {entry!r}")
+        anchors[track] = model_id
+    config = IterateConfig(
+        name=args.name,
+        config_path=args.config,
+        output=args.output,
+        steps=steps,
+        force=args.force,
+        init_checkpoint=args.init_checkpoint,
+        samples=args.samples,
+        data_seed=args.data_seed,
+        data_weight=args.data_weight,
+        simulations=args.simulations,
+        lanes=args.lanes,
+        in_flight=args.in_flight,
+        c_puct=args.c_puct,
+        device=args.device,
+        eval_games=args.eval_games,
+        eval_seed=args.eval_seed,
+        baselines=tuple(args.baseline) or DEFAULT_BASELINES,
+        anchors=anchors,
+    )
+    result = run_iteration(config)
+    for step, produced in result.steps.items():
+        print(f"{step}: {produced}")
+    print(f"评分 {result.rating_json}")
+    # stdout 只放可被脚本消费的结果：这一次迭代产出的完整模型路径（没有训练步骤时为空）。
+    print(result.steps.get("train", {}).get("model", ""))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "version":
@@ -547,6 +656,10 @@ def main(argv: list[str] | None = None) -> int:
         return _command_probe(args)
     if args.command == "selfplay":
         return _command_selfplay(args)
+    if args.command == "merge-halves":
+        return _command_merge_halves(args)
+    if args.command == "iterate":
+        return _command_iterate(args)
     raise SystemExit(f"未知子命令: {args.command}")
 
 

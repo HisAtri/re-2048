@@ -92,6 +92,52 @@ def check_train_section(path: str | Path, section: dict) -> None:
         raise ValueError(f"{path} 的 {TRAIN_SECTION} 小节出现未知字段 {unknown}")
 
 
+# 字段类型的期望值：由 TrainConfig 的默认值推出来，不再手写一份清单。
+_TYPE_NAMES = {bool: "布尔", int: "整数", float: "浮点", str: "字符串"}
+# YAML 1.1 的坑：`1e-3` 不是浮点数，而是**字符串**（必须写成 `1.0e-3`）。
+# 这类错误读取时不会报错，会一路走到 torch 的优化器构造里才炸，报的是
+# "'<=' not supported between instances of 'float' and 'str'"——与配置毫无关系。
+FLOAT_HINT = "（YAML 1.1 里 `1e-3` 是字符串，要写成 `1.0e-3`）"
+
+
+def train_section_payload(path: str | Path, section: dict) -> dict:
+    """校验并规范化 `train:` 小节，返回可直接构造 TrainConfig 的 dict。
+
+    做两件事，都属于"配置层该管的"：
+    * **拒绝拼错的键**（未知字段）：被静默忽略的键等于"改了半天没生效"；
+    * **拒绝类型不对的值**：YAML 不会替你检查，而错误的类型会在很深的地方以
+      看不懂的形式炸出来（见 FLOAT_HINT）。
+    合法的整数在需要浮点的字段上会被接受并转换（`lr: 3` 是一个自然的写法）。
+    """
+    check_train_section(path, section)
+    payload: dict = {}
+    for field in fields(TrainConfig):
+        if field.name not in section:
+            continue
+        value = section[field.name]
+        if field.name == "datasets":
+            # 数据集有专门的小节（要写权重与上限），写在 train 里只会被当成原始 dict 传下去。
+            raise ValueError(f"{path}: 数据集请写在顶层 {DATASETS_SECTION} 小节，不要放在 {TRAIN_SECTION} 里")
+        default = field.default
+        if default is None:  # 运行期字段（回调），已由 check_train_section 拦下
+            continue
+        if isinstance(value, bool) and type(default) is not bool:
+            raise ValueError(
+                f"{path} 的 {field.name} 应当是{_TYPE_NAMES[type(default)]}，收到布尔值 {value!r}"
+            )
+        if type(default) is float and isinstance(value, int):
+            payload[field.name] = float(value)
+            continue
+        if not isinstance(value, type(default)):
+            hint = FLOAT_HINT if type(default) is float and isinstance(value, str) else ""
+            raise TypeError(
+                f"{path} 的 {field.name} 应当是{_TYPE_NAMES[type(default)]}，"
+                f"收到 {type(value).__name__} {value!r}{hint}"
+            )
+        payload[field.name] = value
+    return payload
+
+
 def build_train_config(args: argparse.Namespace) -> TrainConfig:
     """把 `--config` / `--data` / 命令行合并成一个 TrainConfig。
 
@@ -102,9 +148,10 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
     if getattr(args, "config", ""):
         config_path = Path(args.config)
         file_config = load_config(config_path)
-        check_train_section(config_path, file_config.get(TRAIN_SECTION, {}))
+        payload: dict = train_section_payload(config_path, file_config.get(TRAIN_SECTION, {}))
+    else:
+        payload = {}
 
-    payload: dict = dict(file_config.get(TRAIN_SECTION, {}))
     cli_data = getattr(args, "data", "")
     if cli_data:
         payload["datasets"] = [DatasetSpec(path=cli_data)]

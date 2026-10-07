@@ -205,6 +205,43 @@ make py ARGS="train --config train.yaml --output $R2048_OUTPUT_DIR/runs/value-w1
 * **暂停的是"计算的粒度"**：被打断那一轮的日志只统计续跑跑过的那一截
   （训练损失与验证指标的 tail 平均），后续各轮与最终权重不受影响。
 
+### 一次迭代
+
+跑谱 / 训练 / 评测 / 评分各自仍是独立命令，`iterate` 只是把它们按顺序串起来，
+每一步做完在迭代目录留一个标记（见 ADR 0023）：
+
+```bash
+# 首轮：没有上一轮模型 → 用纯 MCTS 当教师产出数据
+make py ARGS="iterate --name c1 --config train.yaml --samples 1000000 --data-seed 20261014 \
+  --simulations 64 --device cuda --eval-games 400 --eval-seed 20262053"
+
+# 之后各轮：用上一轮的完整模型 NN 自对弈
+make py ARGS="iterate --name c3 --init-checkpoint $R2048_OUTPUT_DIR/runs/c2-policy/model.pt \
+  --config train.yaml --samples 1000000 --data-seed 20261016 --data-weight 1.0 \
+  --simulations 64 --device cuda --eval-games 400 --eval-seed 20262053 --anchor search=c2-nnmcts64"
+```
+
+四步各做什么：
+
+| 步骤 | 做什么 | 产物 |
+|---|---|---|
+| `selfplay` | 有 `--init-checkpoint` 就 NN 自对弈，否则纯 MCTS 当教师 | `<输出根>/data/<批次号>/` |
+| `train` | 价值 run → 策略 run（冻结价值）→ 合并成这一轮的完整模型 | `<迭代目录>/runs/{value,policy-head,policy}/` |
+| `evaluate` | 三条 NN 臂 + 基线臂，全部用同一套协议与 `--eval-seed` | `<迭代目录>/eval/*.jsonl` |
+| `rate` | 追加进评分池、按需刷新锚点、写出评分 | `<迭代目录>/rating.json` |
+
+几条要点：
+
+* **可中断重来**：重跑时跳过已完成的步骤；`--steps evaluate,rate --force` 只重做指定的几步
+  （只跑后面的步骤时，前面几步的产物路径从标记里读）。
+* **训练数据集 = YAML 的 `datasets` + 这一轮新产出的数据**（按 `--data-weight` 加权混合）。
+  首轮 YAML 里可以不写任何来源。
+* **基线臂每次都重评**（默认 `random` 与 `mcts64`）：它们是评分池锚点的数据来源。
+* **合并半模型**单独也有了命令，用来手工拼装或排查：
+  `make py ARGS="merge-halves --value runs/a/model.pt --policy runs/b/model.pt --output runs/c/model.pt"`。
+* **YAML 里的类型会被检查**：`lr: 1e-3` 在 YAML 1.1 里是**字符串**（要写 `1.0e-3`），
+  这种错误以前会一路走到 torch 里才炸，现在在读取时就指名报错。
+
 ## 性能记录（本机实测，16 核 WSL2 + 直通 GPU）
 
 | 场景 | 参数 | 结果 |

@@ -14,9 +14,8 @@ import random
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
-
 import r2048_core
+import torch
 
 from r2048.nn.encode import encode_boards
 from r2048.nn.model import load_checkpoint
@@ -94,9 +93,7 @@ def probe_position(
         scores.append(int(outcome["score"]))
 
     with torch.no_grad():
-        value, logits = model(
-            encode_boards(torch.from_numpy(np.stack(rows)).to(torch.long).to(target))
-        )
+        value, logits = model(encode_boards(torch.from_numpy(np.stack(rows)).to(torch.long).to(target)))
     afterstate_values = (value[1:] * scale).tolist()
     logits = logits[0].float().cpu()
     masked = torch.where(

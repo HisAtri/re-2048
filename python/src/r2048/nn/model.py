@@ -55,10 +55,12 @@ class DualHeadResNet(nn.Module):
         )
         self.trunk = nn.Sequential(*(ResidualBlock(channels) for _ in range(blocks)))
         flat = channels * 4 * 4
-        self.value_head = nn.Sequential(nn.Flatten(), nn.Linear(flat, head_width), nn.ReLU(),
-                                        nn.Linear(head_width, 1))
-        self.policy_head = nn.Sequential(nn.Flatten(), nn.Linear(flat, head_width), nn.ReLU(),
-                                         nn.Linear(head_width, 4))
+        self.value_head = nn.Sequential(
+            nn.Flatten(), nn.Linear(flat, head_width), nn.ReLU(), nn.Linear(head_width, 1)
+        )
+        self.policy_head = nn.Sequential(
+            nn.Flatten(), nn.Linear(flat, head_width), nn.ReLU(), nn.Linear(head_width, 4)
+        )
 
     def forward(self, encoded: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """返回 (归一化价值, 四方向 logits)。
@@ -90,8 +92,9 @@ class DualTowerResNet(nn.Module):
     已经验收过的价值表示。旧版的对照实验证实这不是锦上添花：见模块开头的数字。
     """
 
-    def __init__(self, channels: int = 64, shared_blocks: int = 3, tower_blocks: int = 3,
-                 head_width: int = 256) -> None:
+    def __init__(
+        self, channels: int = 64, shared_blocks: int = 3, tower_blocks: int = 3, head_width: int = 256
+    ) -> None:
         super().__init__()
         self.channels = channels
         self.shared_blocks = shared_blocks
@@ -105,10 +108,12 @@ class DualTowerResNet(nn.Module):
         self.value_tower = nn.Sequential(*(ResidualBlock(channels) for _ in range(tower_blocks)))
         self.policy_tower = nn.Sequential(*(ResidualBlock(channels) for _ in range(tower_blocks)))
         flat = channels * 4 * 4
-        self.value_head = nn.Sequential(nn.Flatten(), nn.Linear(flat, head_width), nn.ReLU(),
-                                        nn.Linear(head_width, 1))
-        self.policy_head = nn.Sequential(nn.Flatten(), nn.Linear(flat, head_width), nn.ReLU(),
-                                         nn.Linear(head_width, 4))
+        self.value_head = nn.Sequential(
+            nn.Flatten(), nn.Linear(flat, head_width), nn.ReLU(), nn.Linear(head_width, 1)
+        )
+        self.policy_head = nn.Sequential(
+            nn.Flatten(), nn.Linear(flat, head_width), nn.ReLU(), nn.Linear(head_width, 4)
+        )
 
     def forward(self, encoded: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         shared = self.shared(self.stem(encoded))
@@ -170,8 +175,9 @@ def freeze_value_path(model: nn.Module) -> list[str]:
     return frozen
 
 
-def save_checkpoint(path: str, model: DualHeadResNet, metadata: dict[str, Any],
-                    optimizer: torch.optim.Optimizer | None = None) -> None:
+def save_checkpoint(
+    path: str, model: DualHeadResNet, metadata: dict[str, Any], optimizer: torch.optim.Optimizer | None = None
+) -> None:
     payload: dict[str, Any] = {
         "checkpoint_version": 1,
         "model": model.state_dict(),
@@ -196,8 +202,9 @@ def load_checkpoint(path: str, device: torch.device) -> tuple[DualHeadResNet, di
     metadata = payload.get("metadata", {})
     expected_rules = payload.get("rules_version", metadata.get("rules_version", 1))
     if int(expected_rules) != int(r2048_core.RULES_VERSION):
-        raise ValueError(f"checkpoint 的规则版本 {expected_rules} 与当前内核 "
-                         f"{r2048_core.RULES_VERSION} 不一致")
+        raise ValueError(
+            f"checkpoint 的规则版本 {expected_rules} 与当前内核 {r2048_core.RULES_VERSION} 不一致"
+        )
     if metadata.get("input_encoding", INPUT_ENCODING) != INPUT_ENCODING:
         raise ValueError(f"checkpoint 的输入编码与当前实现不一致: {metadata.get('input_encoding')}")
     scale = float(metadata.get("score_scale", SCORE_SCALE))
@@ -211,8 +218,9 @@ def load_checkpoint(path: str, device: torch.device) -> tuple[DualHeadResNet, di
     return model, metadata
 
 
-def encode_and_forward(model: DualHeadResNet, boards, device: torch.device,
-                       policy_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+def encode_and_forward(
+    model: DualHeadResNet, boards, device: torch.device, policy_mask: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """把 (N,16) 棋盘一次前向，返回 (value, logits)。
 
     policy_mask 非空时把非法方向的 logits 置为 -inf，避免它们进入 softmax。

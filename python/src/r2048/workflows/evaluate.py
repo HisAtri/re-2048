@@ -24,9 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-import torch
-
 import r2048_core
+import torch
 
 from r2048.jobs import finish_console, progress_payload
 from r2048.nn.model import load_checkpoint
@@ -185,13 +184,13 @@ def run_evaluation(config: EvalConfig) -> EvalResult:
         "simulations": config.simulations if config.track == "nn_mcts" else 1,
         "in_flight_per_lane": config.in_flight,
         "c_puct": config.c_puct,
-        "temperature": 0.0,          # 评测必须确定性选招，不引入采样噪声
+        "temperature": 0.0,  # 评测必须确定性选招，不引入采样噪声
         "temperature_moves": 0,
         "cache_entries": config.cache_entries,
         "score_scale": float(r2048_core.SCORE_SCALE),
         "seed": config.seed,
         "decision_mode": TRACKS[config.track],
-        "collect_samples": 0,        # 评测不写训练数据
+        "collect_samples": 0,  # 评测不写训练数据
         "episodes_target": config.games,
     }
     engine = r2048_core.BatchedEngine(engine_config, "", "", model_id, 0, 0)
@@ -207,12 +206,13 @@ def run_evaluation(config: EvalConfig) -> EvalResult:
             values, logits = evaluator.evaluate(advance["request_kinds"], advance["boards"])
             engine.submit(advance["request_ids"], values, logits)
         for episode, steps, tiles, score in zip(
-            advance["episode_ids"], advance["episode_steps"], advance["episode_tiles"], advance["episode_scores"]
+            advance["episode_ids"],
+            advance["episode_steps"],
+            advance["episode_tiles"],
+            advance["episode_scores"],
         ):
             results.append(
-                GameResult(
-                    episode=int(episode), score=int(score), max_exponent=int(tiles), steps=int(steps)
-                )
+                GameResult(episode=int(episode), score=int(score), max_exponent=int(tiles), steps=int(steps))
             )
         now = time.monotonic()
         if now - last_report >= config.progress_every and not advance["done"]:
@@ -325,9 +325,7 @@ def compare(
     candidate_rows = load_jsonl(candidate_path)
     shared = sorted(set(baseline_rows) & set(candidate_rows))
     if len(shared) < 2:
-        raise ValueError(
-            "两组记录没有足够的共同局号：配对比较要求同 seed、同局数（不同局的成绩不能配对）"
-        )
+        raise ValueError("两组记录没有足够的共同局号：配对比较要求同 seed、同局数（不同局的成绩不能配对）")
     baseline = np.array([baseline_rows[episode]["score"] for episode in shared], dtype=np.float64)
     candidate = np.array([candidate_rows[episode]["score"] for episode in shared], dtype=np.float64)
     result = {

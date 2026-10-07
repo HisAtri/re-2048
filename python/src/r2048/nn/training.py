@@ -26,17 +26,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
+import r2048_core
 import torch
 from torch.nn import functional as F
-
-import r2048_core
 
 from r2048.data.dataset import Batch, BatchStream, batch_manifest_summary, open_batch
 from r2048.data.shards import CANDIDATE_TARGET_DEFINITION
 from r2048.jobs import finish_console, progress_payload
 from r2048.nn.augment import augment_joint, augment_policy, augment_value
-import r2048_core
-
 from r2048.nn.encode import BOARD_CELLS, encode_boards
 from r2048.nn.model import (
     DUAL_TOWER_ARCHITECTURE,
@@ -83,7 +80,7 @@ class TrainConfig:
     max_samples: int = 0
     device: str = "cuda"
     seed: int = 0
-    amp: str = "off"          # off | bf16
+    amp: str = "off"  # off | bf16
     channels_last: bool = True
     compile: bool = False
     log_every: int = 50
@@ -257,10 +254,18 @@ class _Metrics:
         return float(self.best_hit / self.best_total) if float(self.best_total) > 0 else float("nan")
 
     def candidate_regret(self) -> float:
-        return float(self.regret / self.best_total * self.score_scale) if float(self.best_total) > 0 else float("nan")
+        return (
+            float(self.regret / self.best_total * self.score_scale)
+            if float(self.best_total) > 0
+            else float("nan")
+        )
 
     def value_mae(self) -> float:
-        return float(self.value_abs.item() / self.value_count * self.score_scale) if self.value_count else float("nan")
+        return (
+            float(self.value_abs.item() / self.value_count * self.score_scale)
+            if self.value_count
+            else float("nan")
+        )
 
     def policy_ce(self) -> float:
         return self._policy_ce_sum / self.policy_count if self.policy_count else float("nan")
@@ -382,14 +387,10 @@ def _run_epoch(
                 values = values.float()
                 logits = logits.float()
                 if want_value:
-                    value_loss, value_pred = _value_loss(
-                        values[count:], batch, use_candidates, config
-                    )
+                    value_loss, value_pred = _value_loss(values[count:], batch, use_candidates, config)
                     loss = loss + config.value_weight * value_loss
                     if use_candidates:
-                        metrics.add_candidates(
-                            value_pred, batch.candidate_value, batch.candidate_weight
-                        )
+                        metrics.add_candidates(value_pred, batch.candidate_value, batch.candidate_weight)
                     else:
                         metrics.add_value(value_pred, batch.value_target)
                 if want_policy:
@@ -409,9 +410,7 @@ def _run_epoch(
                     value_loss, value_pred = _value_loss(values, batch, use_candidates, config)
                     loss = loss + config.value_weight * value_loss
                     if use_candidates:
-                        metrics.add_candidates(
-                            value_pred, batch.candidate_value, batch.candidate_weight
-                        )
+                        metrics.add_candidates(value_pred, batch.candidate_value, batch.candidate_weight)
                     else:
                         metrics.add_value(value_pred, batch.value_target)
                 if want_policy:
@@ -525,7 +524,9 @@ def run_training(config: TrainConfig) -> TrainResult:
     val_stream = (
         BatchStream(reader, val_indices, config.batch_size, seed=config.seed) if val_indices.size else None
     )
-    architecture = source_metadata.get("architecture", config.architecture or default_architecture(config.mode))
+    architecture = source_metadata.get(
+        "architecture", config.architecture or default_architecture(config.mode)
+    )
 
     run_dir = Path(config.output)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -554,7 +555,16 @@ def run_training(config: TrainConfig) -> TrainResult:
     best_checkpoint = ""
     for epoch in range(start_epoch, config.epochs):
         train_loss, train_metrics, train_seconds = _run_epoch(
-            model, train_stream, optimizer, scheduler, config, device, amp_dtype, score_scale, rng, epoch,
+            model,
+            train_stream,
+            optimizer,
+            scheduler,
+            config,
+            device,
+            amp_dtype,
+            score_scale,
+            rng,
+            epoch,
             label="训练",
         )
         nan = float("nan")
@@ -562,7 +572,16 @@ def run_training(config: TrainConfig) -> TrainResult:
         candidate_mae, pair_agreement, best_hit, regret = nan, nan, nan, nan
         if val_stream is not None:
             val_loss, val_metrics, _ = _run_epoch(
-                model, val_stream, None, scheduler, config, device, amp_dtype, score_scale, rng, epoch,
+                model,
+                val_stream,
+                None,
+                scheduler,
+                config,
+                device,
+                amp_dtype,
+                score_scale,
+                rng,
+                epoch,
                 label="验证",
             )
             val_mae, val_ce, val_agreement, val_records = (
@@ -642,7 +661,8 @@ def run_training(config: TrainConfig) -> TrainResult:
                     "data_build_id": reader.manifest.build_id,
                     "config_digest": config_digest(config),
                     "value_target": (
-                        "candidate" if entry.val_candidate_best_hit == entry.val_candidate_best_hit
+                        "candidate"
+                        if entry.val_candidate_best_hit == entry.val_candidate_best_hit
                         else "trajectory"
                     ),
                     "candidate_target_definition": CANDIDATE_TARGET_DEFINITION,

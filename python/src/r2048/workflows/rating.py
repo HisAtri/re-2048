@@ -148,9 +148,7 @@ def tile_reach_per_10k(rows: list[dict], exponents: tuple[int, ...] = (11, 12, 1
     if count == 0:
         return {}
     return {
-        str(1 << exponent): round(
-            10_000.0 * sum(1 for row in rows if row["max_exp"] >= exponent) / count, 1
-        )
+        str(1 << exponent): round(10_000.0 * sum(1 for row in rows if row["max_exp"] >= exponent) / count, 1)
         for exponent in exponents
     }
 
@@ -180,9 +178,7 @@ def save_anchors(path: str | Path, rows: list[dict], spec: dict[str, str]) -> di
         matched = [row for row in rows if row["track"] == track and row["model_id"] == model_id]
         if not matched:
             raise ValueError(f"锚点 {model_id} 在 track {track} 下没有评测记录")
-        protocols = {
-            json.dumps(row.get("protocol"), sort_keys=True, ensure_ascii=False) for row in matched
-        }
+        protocols = {json.dumps(row.get("protocol"), sort_keys=True, ensure_ascii=False) for row in matched}
         if len(protocols) != 1:
             raise ValueError(
                 f"锚点 {model_id} 在 track {track} 下的记录跨了 {len(protocols)} 个协议，"
@@ -228,8 +224,13 @@ def compute_ratings(rows: list[dict], anchors: dict, lam: float = RATING_LAMBDA)
         for model_id, model_rows in sorted(by_model.items()):
             stats = summarize(model_rows)
             rating = RATING_CENTER + lam * (stats["L"] - anchor["L_ref"])
-            ci = Z95 * lam * math.sqrt(
-                stats["sigma"] ** 2 / max(1, stats["n"]) + anchor["sigma_ref"] ** 2 / max(1, anchor["n_ref"])
+            ci = (
+                Z95
+                * lam
+                * math.sqrt(
+                    stats["sigma"] ** 2 / max(1, stats["n"])
+                    + anchor["sigma_ref"] ** 2 / max(1, anchor["n_ref"])
+                )
             )
             models[model_id] = {
                 **stats,
@@ -254,7 +255,9 @@ def compute_ratings(rows: list[dict], anchors: dict, lam: float = RATING_LAMBDA)
             }
         )
     for blocks in result.values():
-        blocks.sort(key=lambda block: ((block["protocol"] or {}).get("simulations") or 0, block["protocol_hash"]))
+        blocks.sort(
+            key=lambda block: ((block["protocol"] or {}).get("simulations") or 0, block["protocol_hash"])
+        )
     return result
 
 
@@ -333,5 +336,8 @@ def count_openings() -> dict:
             rotated = np.fliplr(rotated)
         return tuple(int(cell) for cell in rotated.reshape(16))
 
-    orbits = {min(transform(board, rotation, reflection) for rotation in range(4) for reflection in range(2)) for board in boards}
+    orbits = {
+        min(transform(board, rotation, reflection) for rotation in range(4) for reflection in range(2))
+        for board in boards
+    }
     return {"distinct_boards": len(boards), "d4_orbits": len(orbits)}

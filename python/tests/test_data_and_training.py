@@ -14,12 +14,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import r2048_core
 import torch
 
-import r2048_core
-
-from r2048.data.dataset import Batch, BatchStream, make_split, open_batch
-from r2048.data.shards import RECORD_BYTES, BatchReader, read_manifest
+from r2048.data.dataset import Batch, BatchStream, make_split
+from r2048.data.shards import BatchReader
 from r2048.nn.augment import apply_boards, augment_policy, transform_policy_targets
 from r2048.nn.training import TrainConfig, policy_loss, run_training
 
@@ -335,8 +334,9 @@ def test_augmentation_commutes_with_rules(rotation: int, reflection: int) -> Non
         # 用规则核对：原局面在 UP 上的 afterstate 变换后，必须等于变换后的局面在
         # “变换后方向”上的 afterstate。这一条把棋盘变换与方向标签绑在一起。
         expected_afterstate = manual_transform(torch.from_numpy(_apply(board, 0)[0]))
-        actual_afterstate, _, _ = _apply(np.asarray(transformed[index].numpy(), dtype=np.uint8),
-                                        expected_direction)
+        actual_afterstate, _, _ = _apply(
+            np.asarray(transformed[index].numpy(), dtype=np.uint8), expected_direction
+        )
         assert np.array_equal(actual_afterstate, expected_afterstate), (
             f"rotation={rotation} reflection={reflection} 时增强与规则不交换"
         )

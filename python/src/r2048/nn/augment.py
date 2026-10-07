@@ -15,7 +15,9 @@ import torch
 BOARD_CELLS = 16
 
 
-def _sample_transforms(count: int, rng: torch.Generator, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def _sample_transforms(
+    count: int, rng: torch.Generator, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
     rotations = torch.randint(0, 4, (count,), generator=rng, device=device)
     reflections = torch.randint(0, 2, (count,), generator=rng, device=device)
     return rotations, reflections
@@ -49,9 +51,7 @@ def transform_policy_targets(
     return new_mask, new_visits
 
 
-def augment_value(
-    afterstates: torch.Tensor, rng: torch.Generator
-) -> torch.Tensor:
+def augment_value(afterstates: torch.Tensor, rng: torch.Generator) -> torch.Tensor:
     """价值样本：只变换棋盘。"""
     rotations, reflections = _sample_transforms(afterstates.shape[0], rng, afterstates.device)
     return apply_boards(afterstates, rotations, reflections)

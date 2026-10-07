@@ -233,5 +233,6 @@ compile_commands.json
 # 本地机器画像与临时脚本
 benchmarks/machines.json
 
-# ZCode 会话目录（工具本地状态，不属于项目）
+# ZCode 会话目录与工具本地状态（不属于项目）
 .zcode/
+.zcodeignore

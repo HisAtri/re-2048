@@ -100,8 +100,21 @@ def test_cpp_writer_satisfies_the_contract(tmp_path: Path) -> None:
         pytest.skip("未设置 R2048_CLI：通过 make test 运行，或先 make build")
     jsonl = tmp_path / "random.jsonl"
     subprocess.run(
-        [cli, "evaluate", "--policy", "random", "--games", "4", "--seed", "11",
-         "--label", "random", "--jsonl", str(jsonl), "--quiet"],
+        [
+            cli,
+            "evaluate",
+            "--policy",
+            "random",
+            "--games",
+            "4",
+            "--seed",
+            "11",
+            "--label",
+            "random",
+            "--jsonl",
+            str(jsonl),
+            "--quiet",
+        ],
         check=True,
         capture_output=True,
     )

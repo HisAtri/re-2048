@@ -10,9 +10,8 @@ from __future__ import annotations
 from typing import Protocol
 
 import numpy as np
-import torch
-
 import r2048_core
+import torch
 
 from r2048.nn.encode import encode_boards
 

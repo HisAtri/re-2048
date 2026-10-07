@@ -16,9 +16,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import torch
-
 import r2048_core
+import torch
 
 from r2048.nn.model import create_model
 from r2048.runtime.selfplay import SelfplayConfig, run_selfplay

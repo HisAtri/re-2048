@@ -52,16 +52,16 @@ def _random_boards(rng: random.Random, count: int) -> list[tuple[int, ...]]:
 
 def _edge_boards() -> list[tuple[int, ...]]:
     boards = [
-        tuple([0] * 16),                                   # 空盘
-        tuple([1] * 16),                                   # 满盘同值：一次移动连锁合并
-        tuple([1, 2] * 8),                                 # 满盘交错：完全无法移动
-        tuple([MAX_TEST_EXPONENT] * 16),                   # 极大指数满盘
-        (1, 1, 0, 0) + (0,) * 12,                          # 跨半区合并（左端）
-        (0, 0, 1, 1) + (0,) * 12,                          # 跨半区合并（右端）
-        (0,) + (1, 1, 1) + (0,) * 12,                      # 跨半区合并优先级的关键用例
-        (2, 2, 2, 0) + (0,) * 12,                          # 合并后不再参与本回合合并
+        tuple([0] * 16),  # 空盘
+        tuple([1] * 16),  # 满盘同值：一次移动连锁合并
+        tuple([1, 2] * 8),  # 满盘交错：完全无法移动
+        tuple([MAX_TEST_EXPONENT] * 16),  # 极大指数满盘
+        (1, 1, 0, 0) + (0,) * 12,  # 跨半区合并（左端）
+        (0, 0, 1, 1) + (0,) * 12,  # 跨半区合并（右端）
+        (0,) + (1, 1, 1) + (0,) * 12,  # 跨半区合并优先级的关键用例
+        (2, 2, 2, 0) + (0,) * 12,  # 合并后不再参与本回合合并
         (2, 2, 2, 2) + (0,) * 12,
-        (0,) * 12 + (1, 0, 1, 0),                          # 间隔块压缩
+        (0,) * 12 + (1, 0, 1, 0),  # 间隔块压缩
         (5, 0, 5, 0) + (0,) * 12,
     ]
     # 每条线（行与列）的全部组合：指数取自 0..4，覆盖半区内部与跨半区的所有形态。
@@ -89,9 +89,7 @@ def _write_vectors(path: Path, boards: list[tuple[int, ...]]) -> None:
             handle.write(RECORD_PREFIX.pack(*board))
             for action in reference.ACTIONS:
                 outcome = reference.move(board, action)
-                handle.write(
-                    OUTCOME.pack(*outcome.board, outcome.score, 1 if outcome.valid else 0)
-                )
+                handle.write(OUTCOME.pack(*outcome.board, outcome.score, 1 if outcome.valid else 0))
 
 
 def test_cpp_rules_match_reference(tmp_path: Path) -> None:
@@ -107,7 +105,6 @@ def test_cpp_rules_match_reference(tmp_path: Path) -> None:
         check=False,
     )
     assert completed.returncode == 0, (
-        f"C++ 侧规则与参考实现不一致（{len(boards)} 条向量）：\n"
-        f"{completed.stdout}\n{completed.stderr}"
+        f"C++ 侧规则与参考实现不一致（{len(boards)} 条向量）：\n{completed.stdout}\n{completed.stderr}"
     )
     assert "通过" in completed.stdout

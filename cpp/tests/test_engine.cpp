@@ -231,10 +231,67 @@ TEST(engine_advance_waits_when_budget_is_full) {
     engine.finish();
 }
 
-TEST(engine_parallel_search_threads_keep_invariants) {
-    // 多线程推进 lane 时必须守住的不变量：请求数守恒（一条都不能丢、不能重复回填）、
-    // 样本数恰好等于目标、局号连续。**不要求逐字节相同**——lane 的处理顺序会变，
-    // 请求因此被分进不同的前向批次，而批组成本来就会改变叶值（ADR 0017）。
+TEST(engine_two_engines_share_one_sink) {
+    // 多线程搜索的产出侧契约：K 个引擎（各持一份叶子缓存）**共享一个写入侧**，于是它们
+    // 产出的必须是**同一批**数据——一个批次号、一份清单、一套连续局号，样本数恰好等于目标。
+    // 这条不成立的话，多线程搜索就会把一批数据拆成 K 份（用户明确否掉的那种"很乱"）。
+    TempDir dir("shared_sink");
+    EngineConfig config;
+    config.lanes = 4;              // 每个引擎 4 条 lane
+    config.lanes_total = 8;        // 整批 8 条（清单与协议参数记这个）
+    config.simulations = 8;
+    config.in_flight_per_lane = 2;
+    config.search_threads = 2;     // Python 侧的搜索线程数，进协议参数
+    config.cache_entries = 1 << 12;
+    config.seed = 4242;
+
+    BatchedEngine first(config, dir.sub("batch"), "shared", "synthetic", 3000, 1000);
+    const std::shared_ptr<SampleSink> sink = first.sink();
+    expect_true(sink != nullptr, "第一个引擎应当自建写入侧");
+    BatchedEngine second(config, dir.sub("batch"), "shared", "synthetic", 3000, 1000, sink);
+    expect_true(second.sink() == sink, "第二个引擎必须共用同一个写入侧");
+
+    BatchedEngine* engines[2] = {&first, &second};
+    bool done[2] = {false, false};
+    for (uint64_t rounds = 0; rounds < 200000 && !(done[0] && done[1]); rounds++) {
+        for (int i = 0; i < 2; i++) {
+            if (done[i]) continue;
+            const BatchedEngine::Advance advance = engines[i]->advance(4096);
+            if (!advance.request_ids.empty()) {
+                std::vector<float> values(advance.request_ids.size(), 0.0f);
+                std::vector<float> logits(advance.request_ids.size() * kNumActions, 0.0f);
+                engines[i]->submit(advance.request_ids.data(), values.data(), logits.data(),
+                                   advance.request_ids.size());
+            } else if (advance.done) {
+                done[i] = true;
+            }
+        }
+    }
+    expect_true(done[0] && done[1], "两个引擎都要跑到收尾");
+    expect_equal_u64(sink->written_samples(), 3000, "共享写入侧的样本数必须恰好等于目标");
+    expect_true(sink->written_episodes() > 0, "必须真的产出局");
+
+    first.finish();  // 幂等：第二次收尾不会重复写
+    const BatchManifest manifest = read_manifest(dir.sub("batch"));
+    expect_equal_u64(manifest.samples, 3000, "清单里的样本数等于目标");
+    expect_true(manifest.episodes > 0, "清单里有局");
+    // 清单记的是**整批**的并发数与协议参数，而不是某一个引擎的。
+    expect_equal_u64(manifest.meta.workers, 8, "workers 记整批的 lane 数（8）而不是单个引擎的（4）");
+    std::string lanes_param, threads_param;
+    for (const auto& entry : manifest.meta.params) {
+        if (entry.first == "lanes") lanes_param = entry.second;
+        if (entry.first == "search_threads") threads_param = entry.second;
+    }
+    expect_true(lanes_param == "8", "协议参数 lanes 也记整批的 8");
+    expect_true(threads_param == "2", "协议参数 search_threads 记搜索线程数");
+    expect_true(sink->stop_requested(), "收尾后写入侧必须处于停车状态");
+}
+
+TEST(engine_records_search_threads_and_conserves_requests) {
+    // 引擎**内部不再并行**推进 lane（试过，实测负收益，见 ADR 0027）：并行走 K 个各自持有
+    // 叶子缓存的引擎 + 一个合并推理线程（ADR 0029）。这里守的是与之配套的两件事：
+    // 请求数守恒（一条都不能丢、不能重复回填）与清单如实记下搜索线程数（它改变调度，
+    // 所以是协议参数）。
     TempDir dir("threads");
     EngineConfig config;
     config.lanes = 16;

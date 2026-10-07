@@ -89,12 +89,16 @@ class SelfplayResult:
         return self.forward_rows / self.forward_batches if self.forward_batches > 0 else 0.0
 
 
-def phase_summary(phases: dict, evaluator: BatchedEvaluator, elapsed: float) -> dict:
-    """相位占比与"GPU 真正忙了多久"。
+def phase_summary(phases: dict, evaluator: BatchedEvaluator, elapsed: float, threads: int = 1) -> dict:
+    """相位汇总：谁在等谁、GPU 真正忙了多久。
 
-    `advance` 是 C++ 树搜索（单线程），`evaluate` 是编码+前向+取回，`submit` 是回填。
-    `gpu_busy_rate` 用 CUDA event 量到的执行时间除以墙钟——它是"这段流水线到底把 GPU
-    用起来没有"的唯一直接判据（利用率采样是外部的、会漏掉短核函数）。
+    `advance` 是 C++ 树搜索、`evaluate` 是编码+前向+取回、`submit` 是回填。
+    单线程驱动下三段是**串行**的，占比之和 ≈ 1；多线程驱动（`threads > 1`）下搜索与推理
+    **重叠**，所以占比之和会超过 1——两个比率的含义因此是：
+
+    * `gpu_busy_rate`：GPU 真正执行的时间（CUDA event）占墙钟比。它是"这段流水线把 GPU 用起来
+      没有"的唯一直接判据（nvidia-smi 的采样会漏掉短核函数）；
+    * `search_busy_rate`：搜索线程的忙碌之和 / 线程数（1.0 = 每个搜索线程都在干活）。
     """
     total = max(1e-9, elapsed)
     return {
@@ -106,6 +110,8 @@ def phase_summary(phases: dict, evaluator: BatchedEvaluator, elapsed: float) -> 
         "submit_share": round(phases["submit"] / total, 3),
         "gpu_seconds": round(evaluator.gpu_seconds, 3),
         "gpu_busy_rate": round(evaluator.gpu_seconds / total, 3),
+        "search_busy_rate": round(phases.get("search_busy", phases["advance"]) / (total * threads), 3),
+        "threads": threads,
         "encode_seconds": round(evaluator.seconds["encode"], 3),
         "forward_launch_seconds": round(evaluator.seconds["forward"], 3),
         "collect_seconds": round(evaluator.seconds["collect"], 3),
@@ -139,6 +145,12 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
         # 所以必须进数据来源记录，也让续跑能发现"换了设备/改了批大小"。
         "provenance": {"device": device.type, "max_batch": str(config.max_batch)},
     }
+    if config.search_threads > 1:
+        # K 个搜索引擎 + 合并推理线程（ADR 0029）。单线程路径保持原样：默认行为不变。
+        from r2048.runtime.parallel_search import run_parallel_selfplay
+
+        return run_parallel_selfplay(config, model, device)
+
     engine = r2048_core.BatchedEngine(
         engine_config,
         str(config.data_dir),

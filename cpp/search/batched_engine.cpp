@@ -84,31 +84,25 @@ struct BatchedEngine::Impl {
     };
 
     Impl(const EngineConfig& config_in, std::string data_dir_in, std::string batch_id_in,
-         std::string model_id_in, uint64_t samples_target_in, uint64_t shard_samples_in)
+         std::string model_id_in, uint64_t samples_target_in, uint64_t shard_samples_in,
+         std::shared_ptr<SampleSink> sink_in)
         : config(config_in),
           data_dir(std::move(data_dir_in)),
           batch_id(std::move(batch_id_in)),
           model_id(std::move(model_id_in)),
-          samples_target(samples_target_in) {
+          samples_target(samples_target_in),
+          sink(std::move(sink_in)) {
         if (config.lanes == 0) throw std::runtime_error("lane 数必须大于 0");
         if (config.simulations == 0) throw std::runtime_error("模拟次数必须大于 0");
         if (config.simulations > 0xFFFF) throw std::runtime_error("模拟次数上限为 65535");
         control.set_path(config.control_path);
         if (config.collect_samples) {
-            if (config.resume) {
-                // 续跑：编号接着清单里的局数，所以写入器必须先于 lane 初始化。
-                writer = std::make_unique<ShardWriter>(
-                    ShardWriter::resume(data_dir, shard_samples_in, build_meta()));
-            } else {
-                if (!dir_is_usable_as_output(data_dir)) {
-                    throw std::runtime_error("输出目录已存在且非空，拒绝覆盖: " + data_dir +
-                                             "（续跑请加 --continue，新起一批请换一个目录）");
-                }
-                ensure_dir(data_dir);
-                writer = std::make_unique<ShardWriter>(data_dir, shard_samples_in, build_meta());
+            if (!sink) {
+                sink = std::make_shared<SampleSink>(data_dir, build_meta(), samples_target_in,
+                                                   shard_samples_in, config.resume);
             }
-            next_episode.store(writer->next_episode());
-            next_episode_to_write = writer->next_episode();
+            // lane 的起始局号从共享写入侧取：续跑时接着清单里的局数，新批从 0 开始。
+            next_episode.store(sink->peek_next_episode());
         }
         // 表长取 2 的幂，容量至少是配置值的一倍（保持低负载因子）。
         size_t capacity = 64;
@@ -128,12 +122,14 @@ struct BatchedEngine::Impl {
         meta.simulations = config.decision_mode == kDecisionSearch ? config.simulations : 0;
         meta.temperature_moves = config.temperature_moves;
         meta.seed = config.seed;
-        meta.workers = config.lanes;  // 产出这批数据的并发对局数（协议参数，见 ADR 0003）
+        // 并发对局数记**整批**的值：多线程搜索时它 = 各引擎 lanes 之和（见 ADR 0003/0029）。
+        meta.workers = config.lanes_total > 0 ? config.lanes_total : config.lanes;
         meta.samples_target = samples_target;
         meta.model_id = model_id;
         // 这些参数会改变搜索树的演化，因此属于数据生成协议的一部分，必须记录下来。
         meta.params.emplace_back("c_puct", std::to_string(config.c_puct));
-        meta.params.emplace_back("lanes", std::to_string(config.lanes));
+        meta.params.emplace_back("lanes", std::to_string(config.lanes_total > 0 ? config.lanes_total
+                                                                                 : config.lanes));
         meta.params.emplace_back("in_flight_per_lane", std::to_string(config.in_flight_per_lane));
         meta.params.emplace_back("search_threads", std::to_string(config.search_threads));
         meta.params.emplace_back("temperature", std::to_string(config.temperature));
@@ -293,7 +289,9 @@ struct BatchedEngine::Impl {
     void start_episode(Lane& lane) {
         // 必须是原子取号：lane 是并行推进的，普通自增会丢更新，
         // 于是局号出现空洞，而写入侧按局号顺序落盘，会永远等一个不会再出现的局号。
-        lane.episode = next_episode.fetch_add(1);
+        // 局号从共享写入侧取：K 个引擎共用一套编号，而"第 N 局的内容"只由 (种子, 局号) 决定，
+        // 所以共享编号不会让两局撞车，反而保证这批数据的内容与调度无关（ADR 0007/0020）。
+        lane.episode = sink ? sink->next_episode() : next_episode.fetch_add(1);
         lane.board = opening_board(config.seed, lane.episode);
         lane.legal_mask = legal_mask(lane.board);
         lane.step = 0;
@@ -712,11 +710,12 @@ struct BatchedEngine::Impl {
             outcome.score = lane.total_score;
             if (config.collect_samples) {
                 std::vector<Sample> samples = lane.recorder.finish();
-                std::lock_guard<std::mutex> lock(bookkeeping_mutex);
-                samples_produced += samples.size();
-                completed[lane.episode] = std::move(samples);
-                if (stop_on_samples_target()) stop_all.store(true);
-                finished_outcomes.push_back(outcome);
+                {
+                    std::lock_guard<std::mutex> lock(bookkeeping_mutex);
+                    finished_outcomes.push_back(outcome);
+                }
+                // 落盘与样本目标的判定都在共享写入侧：K 个引擎并发提交，落盘顺序由局号决定。
+                if (sink) sink->submit_episode(lane.episode, std::move(samples));
             } else {
                 std::lock_guard<std::mutex> lock(bookkeeping_mutex);
                 finished_outcomes.push_back(outcome);
@@ -732,83 +731,35 @@ struct BatchedEngine::Impl {
 
     // 是否按样本目标停止。**样本目标为 0 表示不限量**：此时只有控制通道能叫停，
     // 绝不能让 `0 >= 0` 这种比较把一批数据判成“目标已达成”。
-    bool stop_on_samples_target() const {
-        return config.episodes_target == 0 && samples_target > 0 && samples_produced >= samples_target;
-    }
+    // 这次运行是否该停车：本引擎自己的标志，或者共享写入侧叫停（样本目标达成，
+    // 或者控制通道的指令被某个引擎读到并广播了出来）。**车道循环必须用这个判断**——
+    // 只用本引擎的 stop_all 会让"样本目标"这条停车理由在多引擎下彻底失效。
+    bool stopping() const { return stop_all.load() || (sink && sink->stop_requested()); }
 
     // 目标是否真的达成了（决定收尾时写 complete 还是 paused/stopped）。
     bool target_reached() const {
         if (config.episodes_target > 0) return stat_episodes.load() >= config.episodes_target;
-        if (samples_target > 0) return written_samples() >= samples_target;
-        return false;
+        return sink && sink->target_reached();
     }
 
     // 按局号顺序写盘：写入内容因此与 lane 调度顺序完全无关。
-    void flush_completed() {
-        while (true) {
-            const auto found = completed.find(next_episode_to_write);
-            if (found == completed.end()) break;
-            std::vector<Sample> samples = std::move(found->second);
-            completed.erase(found);
-
-            if (config.episodes_target == 0 && samples_target > 0 &&
-                written_samples() >= samples_target) {
-                stop_all = true;
-                break;
-            }
-            if (config.episodes_target == 0 && samples_target > 0 &&
-                written_samples() + samples.size() > samples_target) {
-                // 最后一个不完整的局被截断：样本数恰好等于目标条数，
-                // 且截断只依赖目标，与线程数、调度顺序无关。
-                // 不限量（目标为 0）时没有截断可言：一局要么整局落盘，要么不落。
-                samples.resize(static_cast<size_t>(samples_target - written_samples()));
-                stop_all = true;
-            }
-            writer->add_episode(next_episode_to_write, samples);
-            next_episode_to_write++;
-            if (config.episodes_target == 0 && samples_target > 0 &&
-                written_samples() >= samples_target) {
-                stop_all = true;
-            }
-        }
-    }
-
     void pump_all(uint32_t max_requests) {
         std::atomic<bool> progressed_flag{false};
-        const uint32_t threads = std::max(
-            1u, std::min<uint32_t>(config.search_threads, static_cast<uint32_t>(lanes.size())));
         for (int round = 0; round < kMaxPumpRounds; round++) {
             progressed_flag.store(false);
-            if (threads <= 1) {
-                pump_lane_range(0, lanes.size(), max_requests, progressed_flag);
-            } else {
-                // 按 lane 分块并行。**批大小与线程数无关**：每条 lane 的在途预算由
-                // in_flight_per_lane 决定，谁先被处理都不会多发一条请求；变的只是请求的
-                // 排列顺序，也就是它们被分到哪一批前向里（批组成依赖，见 ADR 0017）。
-                // 线程按轮创建：一轮是个位数毫秒，创建几个线程的开销可忽略，
-                // 换来的是不用维护线程池与它的生命周期。
-                const size_t chunk = (lanes.size() + threads - 1) / threads;
-                std::vector<std::thread> pool;
-                pool.reserve(threads - 1);
-                for (uint32_t worker = 1; worker < threads; worker++) {
-                    const size_t begin = std::min(lanes.size(), static_cast<size_t>(worker) * chunk);
-                    const size_t stop = std::min(lanes.size(), begin + chunk);
-                    if (begin >= stop) break;
-                    pool.emplace_back([this, begin, stop, max_requests, &progressed_flag] {
-                        pump_lane_range(begin, stop, max_requests, progressed_flag);
-                    });
-                }
-                pump_lane_range(0, std::min(lanes.size(), chunk), max_requests, progressed_flag);
-                for (std::thread& worker : pool) worker.join();
-            }
+            pump_lane_range(0, lanes.size(), max_requests, progressed_flag);
             if (pending_request_count() >= max_requests) break;
             if (!progressed_flag.load()) break;
         }
     }
 
-    // 推进 [begin, stop) 这段 lane。**这是唯一被并行化的地方**：lane 之间互相独立
-    // （各自的树与搜索状态），共享的只有叶子缓存、请求队列与统计计数，它们在上面这些
-    // 访问点上都已在锁或原子之下。
+    // 推进 [begin, stop) 这段 lane：单线程顺序推进。
+    //
+    // **这里刻意不并行**：试过把 lane 分到多个线程，实测每加一倍线程吞吐就掉一截
+    // （197k → 172k → 154k → 137k 模拟/秒）——每次叶子查找都要拿一次全局 cache_mutex，
+    // 而一条 lane 的一步搜索只有几微秒，锁争用吃掉了并行收益（见 ADR 0027）。
+    // 并行的正确做法是 K 个**各自持有叶子缓存**的引擎 + 一个合并推理线程（ADR 0029），
+    // 那种并行在 Python 侧驱动，不由这里承担。
     void pump_lane_range(size_t begin, size_t stop, uint32_t max_requests,
                          std::atomic<bool>& progressed_flag) {
         for (size_t lane_index = begin; lane_index < stop; lane_index++) {
@@ -819,7 +770,7 @@ struct BatchedEngine::Impl {
                     if (lane.needs_new_episode) {
                         // 换局处才是合法的停车点：目标达成后不再开新局，
                         // 但已经开始的局一定走完。
-                        if (stop_all.load()) {
+                        if (stopping()) {
                             lane.finished = true;
                             break;
                         }
@@ -883,7 +834,7 @@ struct BatchedEngine::Impl {
         return true;
     }
 
-    uint64_t written_samples() const { return writer ? writer->samples_written() : 0; }
+    uint64_t written_samples() const { return sink ? sink->written_samples() : 0; }
 
     size_t pending_request_count() {
         std::lock_guard<std::mutex> lock(bookkeeping_mutex);
@@ -919,18 +870,16 @@ struct BatchedEngine::Impl {
     std::string batch_id;
     std::string model_id;
     uint64_t samples_target;
-    std::unique_ptr<ShardWriter> writer;
+    std::shared_ptr<SampleSink> sink;  // 共享写入侧（多线程搜索时 K 个引擎指向同一个）
     std::vector<Lane> lanes;
 
     // 以下成员受 bookkeeping_mutex 保护（会被并行推进的 lane 访问）
     std::mutex bookkeeping_mutex;
     std::vector<Request> requests;                 // 已发出、尚未交给 Python
     std::map<uint64_t, Request> in_flight;         // 已交给 Python、等待 submit
-    std::map<uint32_t, std::vector<Sample>> completed;
     std::vector<EpisodeResult> finished_outcomes;  // 待回传给 Python 的已结束局
     uint64_t next_request_id = 1;
     uint64_t request_limit = 0;  // 本轮 advance 的请求预算上限（见 issue_requests 的硬闸）
-    uint64_t samples_produced = 0;
     std::atomic<bool> stop_all{false};
     Control control;
     ControlCommand requested_stop = ControlCommand::kNone;  // 这次是被谁叫停的（决定清单状态）
@@ -951,14 +900,21 @@ struct BatchedEngine::Impl {
 
     EngineStats stats;  // 只在 finish() 里做一次快照
     std::atomic<uint32_t> next_episode{0};
-    uint32_t next_episode_to_write = 0;
     bool finished = false;
 };
 
 BatchedEngine::BatchedEngine(const EngineConfig& config, std::string data_dir, std::string batch_id,
                              std::string model_id, uint64_t samples_target, uint64_t shard_samples)
+    : BatchedEngine(config, std::move(data_dir), std::move(batch_id), std::move(model_id),
+                    samples_target, shard_samples, nullptr) {}
+
+BatchedEngine::BatchedEngine(const EngineConfig& config, std::string data_dir, std::string batch_id,
+                             std::string model_id, uint64_t samples_target, uint64_t shard_samples,
+                             std::shared_ptr<SampleSink> sink)
     : impl_(std::make_unique<Impl>(config, std::move(data_dir), std::move(batch_id), std::move(model_id),
-                                   samples_target, shard_samples)) {}
+                                   samples_target, shard_samples, std::move(sink))) {}
+
+const std::shared_ptr<SampleSink>& BatchedEngine::sink() const { return impl_->sink; }
 
 BatchedEngine::~BatchedEngine() = default;
 
@@ -982,9 +938,12 @@ BatchedEngine::Advance BatchedEngine::advance(uint32_t max_requests) {
     // 控制通道：pause/stop 只是把 stop_all 立起来，停车点仍然只有“局与局之间”，
     // 正在进行的局一定走完（否则清单需要的局号会出现空洞，写入侧就永远卡在缺口上）。
     // 轮询在 Control 内部节流，所以放在这个热路径上是安全的。
-    if (!impl.stop_all.load()) {
+    if (!impl.stopping()) {
         const ControlCommand command = impl.control.poll();
         if (command != ControlCommand::kNone) {
+            // 控制文件是一次性消费的，只有一个引擎能读到；所以读到就广播给共享写入侧，
+            // 让 K 个引擎一起在下一个合法的停车点上停。
+            if (impl.sink) impl.sink->request_stop(command);
             impl.requested_stop = command;
             impl.stop_all.store(true);
             log_status("收到 %s：正在停车（进行中的局会走完，已产出的数据会被提交）",
@@ -1016,21 +975,20 @@ BatchedEngine::Advance BatchedEngine::advance(uint32_t max_requests) {
         std::memcpy(out.boards.data() + i * kBoardCells, batch[i].board, kBoardCells);
     }
 
-    impl.flush_completed();
     {
         std::lock_guard<std::mutex> lock(impl.bookkeeping_mutex);
         out.episodes = std::move(impl.finished_outcomes);
         impl.finished_outcomes.clear();
     }
     out.samples_written = impl.written_samples();
-    out.episodes_written = impl.writer ? impl.writer->episodes_written() : 0;
+    out.episodes_written = impl.sink ? impl.sink->written_episodes() : 0;
     // done 的条件必须包含“所有 lane 都已收工”：目标达成后 lane 只会在局与局之间停下，
     // 因此还可能有正在跑的局没写完；此时返回 done 会让调用方提前退出，批次就会短于目标条数。
     // 按局数停止的评测运行不看 stop_all（它由样本目标触发），而以“目标局数都已结束”为条件。
     const bool target_reached =
         impl.config.episodes_target > 0
             ? impl.stat_episodes.load() >= impl.config.episodes_target
-            : impl.stop_all.load();
+            : impl.stopping();
     out.done = target_reached && impl.requests.empty() && impl.all_lanes_finished();
     return out;
 }
@@ -1154,12 +1112,11 @@ BatchedEngine::DebugState BatchedEngine::debug_state() const {
     state.queued_requests = impl.requests.size();
     state.in_flight_requests = impl.in_flight.size();
     state.next_episode = impl.next_episode.load();
-    state.next_episode_to_write = impl.next_episode_to_write;
-    state.completed_buffered = impl.completed.size();
-    for (const auto& entry : impl.completed) state.completed_keys.push_back(entry.first);
-    state.samples_produced = impl.samples_produced;
+    state.next_episode_to_write = impl.sink ? impl.sink->written_episodes() : 0;
+    state.completed_buffered = impl.sink ? impl.sink->buffered_episodes() : 0;
+    state.samples_produced = impl.sink ? impl.sink->produced_samples() : 0;
     state.samples_written = impl.written_samples();
-    state.stop_all = impl.stop_all.load();
+    state.stop_all = impl.stopping();
     state.reissues = impl.stat_reissues.load();
     return state;
 }
@@ -1168,35 +1125,29 @@ void BatchedEngine::request_stop() {
     Impl& impl = *impl_;
     impl.requested_stop = ControlCommand::kStop;
     impl.stop_all.store(true);
+    // 也告诉共享写入侧：多线程搜索时别的引擎还在跑，它们看的是同一个停车标志。
+    if (impl.sink) impl.sink->request_stop(ControlCommand::kStop);
 }
 
-bool BatchedEngine::stop_requested() const { return impl_->stop_all.load(); }
+bool BatchedEngine::stop_requested() const { return impl_->stopping(); }
 
 FinishResult BatchedEngine::finish() {
     Impl& impl = *impl_;
     if (impl.finished) throw std::runtime_error("引擎已经收尾过了");
-    if (impl.writer == nullptr) {
+    if (impl.sink == nullptr) {
         throw std::runtime_error("本次运行关闭了样本收集（评测模式），没有数据批需要收尾");
     }
     impl.stop_all.store(true);
-    impl.flush_completed();
 
-    // 终态：跑满目标是 complete，否则如实记下这次是怎么停的。
-    // “停在哪”直接决定这批数据能不能被 --continue 接着写。
-    BatchState state = BatchState::kStopped;
-    if (impl.target_reached()) {
-        state = BatchState::kComplete;
-    } else if (impl.requested_stop == ControlCommand::kPause) {
-        state = BatchState::kPaused;
-    }
-
-    const BatchManifest manifest = impl.writer->finish(state);
+    // 收尾与终态判定（complete / paused / stopped）都在共享写入侧，而且是**幂等**的：
+    // 多线程搜索时哪个引擎先收尾都能把整批数据落完，其他引擎随后调用不会重复写。
+    const BatchManifest manifest = impl.sink->finish();
     impl.finished = true;
     impl.stats = stats();
 
     FinishResult result;
-    result.manifest_path = impl.data_dir + "/manifest.json";
-    result.state = state;
+    result.manifest_path = impl.sink->manifest_path();
+    result.state = impl.sink->state();
     result.samples = manifest.samples;
     result.episodes = manifest.episodes;
     return result;

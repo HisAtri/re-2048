@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/version.h"
+#include "dataio/sample_sink.h"
 #include "dataio/shard.h"  // BatchState：收尾时要回报这一批停在什么状态
 
 namespace r2048 {
@@ -37,10 +38,14 @@ struct EngineConfig {
     float c_puct = 1.5f;             // PUCT 探索系数
     uint32_t temperature_moves = 30; // 开局多少步按访问分布采样
     float temperature = 1.0f;        // 访问数开 1/T 次幂后采样；0 表示直接取最大
-    // `advance` 里推进 lane 用的线程数。**默认 1 = 与并行化之前完全一致**：lane 的处理
-    // 顺序、每批请求的组成都不变，所以旧数据、既有对照都不受影响。>1 时按 lane 分块并行，
-    // 批组成会随调度变化（ADR 0017 的批组成依赖），因此它是一个协议参数。
+    // 搜索线程数（= K 个引擎，各持一份叶子缓存，共用一个写入侧与一个合并推理线程）。
+    // C++ 侧**不再读它**——并行由 Python 侧驱动（见 ADR 0029）；保留在配置里是因为它会改变
+    // 调度与批组成（ADR 0017），因此必须进协议参数与数据来源身份。
     uint32_t search_threads = 1;
+    // 清单里记的"产出一批数据的并发对局数"：多线程搜索时它 = 各引擎 lanes 之和，
+    // 而单个引擎的 lanes 只是它自己那份。0 = 就用 lanes（单引擎路径）。
+    // 它进协议参数与数据来源身份，所以必须是**整批**的值而不是某个引擎的值。
+    uint32_t lanes_total = 0;
     uint32_t cache_entries = 1 << 17;  // 推理缓存条目数（开放寻址表容量）
     float score_scale = kScoreScale;
     uint64_t seed = 0;
@@ -120,6 +125,15 @@ public:
 
     BatchedEngine(const EngineConfig& config, std::string data_dir, std::string batch_id,
                   std::string model_id, uint64_t samples_target, uint64_t shard_samples);
+
+    // 传入一个**共享的**写入侧：多线程搜索时 K 个引擎指向同一个 sink，于是它们产出的
+    // 是同一批数据（一个批次号、一份清单、一套连续局号）。传 nullptr 时引擎自建一个。
+    BatchedEngine(const EngineConfig& config, std::string data_dir, std::string batch_id,
+                  std::string model_id, uint64_t samples_target, uint64_t shard_samples,
+                  std::shared_ptr<SampleSink> sink);
+
+    // 本引擎使用的写入侧。多线程驱动时用它把第一个引擎建好的 sink 分给其余引擎。
+    const std::shared_ptr<SampleSink>& sink() const;
     ~BatchedEngine();
 
     BatchedEngine(const BatchedEngine&) = delete;

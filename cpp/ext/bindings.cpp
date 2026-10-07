@@ -49,6 +49,7 @@ r2048::EngineConfig engine_config_from_dict(const py::dict& dict) {
     config.simulations = get_uint("simulations", config.simulations);
     config.in_flight_per_lane = get_uint("in_flight_per_lane", config.in_flight_per_lane);
     config.search_threads = get_uint("search_threads", config.search_threads);
+    config.lanes_total = get_uint("lanes_total", config.lanes_total);
     config.c_puct = get_float("c_puct", config.c_puct);
     config.temperature_moves = get_uint("temperature_moves", config.temperature_moves);
     config.temperature = get_float("temperature", config.temperature);
@@ -126,15 +127,38 @@ values 是**归一化**价值（分数 / score_scale），C++ 侧换算回原始
 )";
     engine.def(py::init([](const py::dict& config, const std::string& data_dir,
                            const std::string& batch_id, const std::string& model_id,
-                           uint64_t samples_target, uint64_t shard_samples) {
+                           uint64_t samples_target, uint64_t shard_samples,
+                           std::shared_ptr<r2048::SampleSink> sink) {
                    return std::make_unique<r2048::BatchedEngine>(
                        engine_config_from_dict(config), data_dir, batch_id, model_id, samples_target,
-                       shard_samples);
+                       shard_samples, std::move(sink));
                }),
                py::arg("config"), py::arg("data_dir"), py::arg("batch_id"), py::arg("model_id"),
-               py::arg("samples_target"), py::arg("shard_samples"));
+               py::arg("samples_target"), py::arg("shard_samples"), py::arg("sink") = nullptr);
+
+    // 共享写入侧的只读接口：多线程驱动只看进度、收尾与停车标志，不直接放样本进去
+    // （样本由各引擎在一局结束时提交）。
+    py::class_<r2048::SampleSink, std::shared_ptr<r2048::SampleSink>>(m, "SampleSink")
+        .def("written_samples", &r2048::SampleSink::written_samples)
+        .def("produced_samples", &r2048::SampleSink::produced_samples)
+        .def("written_episodes", &r2048::SampleSink::written_episodes)
+        .def("stop_requested", &r2048::SampleSink::stop_requested)
+        .def("manifest_path", &r2048::SampleSink::manifest_path)
+        .def("finish", [](r2048::SampleSink& self) {
+            const r2048::BatchManifest manifest = self.finish();
+            py::dict out;
+            out["samples"] = manifest.samples;
+            out["episodes"] = manifest.episodes;
+            return out;
+        });
 
     engine.def(
+        "sink",
+        [](const r2048::BatchedEngine& self) -> std::shared_ptr<r2048::SampleSink> {
+            return self.sink();
+        },
+        "本引擎使用的共享写入侧（多线程驱动时把第一个引擎的 sink 分给其余引擎）。")
+        .def(
         "advance",
         [](r2048::BatchedEngine& self, uint32_t max_requests) {
             r2048::BatchedEngine::Advance advance;

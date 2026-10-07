@@ -10,6 +10,7 @@ set(R2048_CORE_SOURCES
     core/logging.cpp
     core/paths.cpp
     dataio/sample.cpp
+    dataio/sample_sink.cpp
     dataio/shard.cpp
     game/board.cpp
     game/rules.cpp

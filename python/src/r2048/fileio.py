@@ -38,5 +38,29 @@ def write_json_atomic(path: str | Path, payload: object) -> Path:
     return write_text_atomic(path, json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
 
 
+def save_torch_atomic(path: str | Path, payload: object) -> Path:
+    """`torch.save` 的原子版：先写 `<path>.tmp`，成功后覆盖。
+
+    训练 checkpoint 有几十 MB，而"进程被杀"正是断点续跑要面对的常态：
+    非原子写会留下一个**看起来存在**、读起来在随机位置崩掉的半截 checkpoint，
+    而它恰好是续跑唯一依赖的文件。
+
+    `torch` 在函数内导入：`fileio` 被 CLI 顶层引用，不该让每次调用命令行（包括 C++
+    子命令的封装）都先加载一次 torch。
+    """
+    import torch
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(target.name + TEMP_SUFFIX)
+    try:
+        torch.save(payload, temp)
+        os.replace(temp, target)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+    return target
+
+
 def read_json(path: str | Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))

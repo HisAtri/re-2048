@@ -578,3 +578,192 @@ def test_weight_zero_source_leaves_the_curve_identical(
     for key in left:
         assert torch.equal(left[key], right[key]), f"{key} 在权重 0 的来源存在时发生了变化"
     assert [m.train_loss for m in single.metrics] == [m.train_loss for m in with_zero.metrics]
+
+
+# --- P3b：断点续跑 -----------------------------------------------------------------
+
+
+class _Interrupt(BaseException):
+    """在指定位置打断训练（模拟进程被杀，但不涉及信号与子进程）。"""
+
+    def __init__(self, epoch: int, step: int) -> None:
+        super().__init__(f"在第 {epoch + 1} 轮第 {step} 步打断")
+        self.epoch = epoch
+        self.step = step
+
+
+def _interrupting_progress(epoch: int, done: int):
+    """进度回调：走到（第 epoch+1 轮，第 done 批完成）时抛异常。
+
+    回调是在落盘之后被调用的（`_run_epoch` 里先 `on_step` 再报进度），所以打断之后
+    `last.pt` 恰好停在这一批的边界上——这就是"被杀"最真实的形状。
+    """
+
+    def callback(payload: dict) -> None:
+        if int(payload["extra"]["epoch"]) == epoch + 1 and int(payload["done"]) == done:
+            raise _Interrupt(epoch, done)
+
+    return callback
+
+
+def test_resume_matches_one_shot_bitwise(batch_dir: Path, tmp_path: Path) -> None:
+    """A 一次跑完 4 轮 = B "跑到第 2 轮中途被杀 → --resume 跑完"，**逐张量相同**。
+
+    这条成立的前提是三样东西都被保存了：模型/优化器/调度器状态、**随机数状态**、
+    以及"这一轮已经训到第几批"。少任何一样，续跑都会在某个位置走上另一条轨迹。
+    判据取逐张量 `torch.equal`，不接受"接近"。
+    """
+    common = {
+        "mode": "value",
+        "epochs": 4,
+        "batch_size": 256,
+        "lr": 1e-3,
+        "val_fraction": 0.2,
+        "device": "cpu",
+        "seed": 5,
+        "max_samples": 2048,
+        "log_every": 1,
+    }
+
+    def line(name: str, **overrides) -> TrainConfig:
+        return TrainConfig(
+            datasets=[DatasetSpec(path=str(batch_dir))],
+            output=str(tmp_path / name),
+            **{**common, **overrides},
+        )
+
+    once = run_training(line("once"))
+
+    # 第一步：跑到第 2 轮第 3 批就被打断（每步都落盘，所以 checkpoint 正好在那个批边界上）。
+    # max_samples 2048 / batch 256 = 每轮 8 步，第 3 批**在轮内**，这样才测到"轮内续跑"。
+    with pytest.raises(_Interrupt):
+        run_training(line("resumed", save_every_steps=1, on_progress=_interrupting_progress(epoch=1, done=3)))
+
+    state = torch.load(tmp_path / "resumed" / "last.pt", weights_only=False, map_location="cpu")
+    assert state["checkpoint_version"] == 2
+    assert (state["epoch"], state["step_in_epoch"]) == (1, 3), "checkpoint 应停在打断的那一批边界上"
+    assert "rng" in state and "augment" in state["rng"], "随机数状态必须在 checkpoint 里"
+
+    # 第二步：同样的配置续跑（只多了 resume）。
+    result = run_training(line("resumed", resume=True))
+
+    left = torch.load(once.last_checkpoint, weights_only=False)["model"]
+    right = torch.load(result.last_checkpoint, weights_only=False)["model"]
+    assert left.keys() == right.keys()
+    for key in left:
+        assert torch.equal(left[key], right[key]), f"{key} 在续跑后与一次跑完不一致"
+
+    # 被打断的那一轮只统计到"续跑的那一截"，其余各轮的指标必须逐项相同。
+    assert len(result.metrics) == len(once.metrics) == 4
+    for index in (0, 2, 3):
+        assert result.metrics[index].train_loss == once.metrics[index].train_loss
+        assert result.metrics[index].val_value_mae == once.metrics[index].val_value_mae
+
+
+def test_resume_refuses_changed_data(batch_dir: Path, search_batch_dir: Path, tmp_path: Path) -> None:
+    """数据身份变了就必须拒绝续跑：换数据接着训是静默错误（划分与标签都变了，损失照样降）。"""
+    common = {
+        "mode": "value",
+        "epochs": 1,
+        "batch_size": 256,
+        "lr": 1e-3,
+        "device": "cpu",
+        "seed": 7,
+        "max_samples": 512,
+        # 两个批次都取 0.5：mcts 那批只有 12 局，0.2 有约 7% 的概率一局都进不了验证集
+        # （那会被"验证集为空"的闸门拦下，让这条测试变成在测概率）。
+        "val_fraction": 0.5,
+        "log_every": 0,
+    }
+
+    def line(data: Path, name: str, **overrides) -> TrainConfig:
+        return TrainConfig(
+            datasets=[DatasetSpec(path=str(data))], output=str(tmp_path / name), **{**common, **overrides}
+        )
+
+    run_training(line(batch_dir, "line"))
+
+    # 同一个 --output 里换成另一批数据：必须指名拒绝（说清是哪一项不同）。
+    with pytest.raises(ValueError, match="数据身份"):
+        run_training(line(search_batch_dir, "line", resume=True))
+
+    # 换数据 + 换目录 = 一条新线：resume 指向空目录时不会去读 last.pt，正常跑。
+    assert run_training(line(search_batch_dir, "line-2", resume=True)).metrics
+
+
+def test_resume_warns_about_config_change(batch_dir: Path, tmp_path: Path, capsys) -> None:
+    """配置变了要**说出来**（但仍然续跑）："把轮数调长"是正常操作，安静地改变才是问题。"""
+    common = {
+        "mode": "value",
+        "epochs": 2,
+        "batch_size": 256,
+        "lr": 1e-3,
+        "val_fraction": 0.2,
+        "device": "cpu",
+        "seed": 9,
+        "max_samples": 512,
+        "log_every": 0,
+    }
+
+    def line(**overrides) -> TrainConfig:
+        return TrainConfig(
+            datasets=[DatasetSpec(path=str(batch_dir))],
+            output=str(tmp_path / "line"),
+            **{**common, **overrides},
+        )
+
+    run_training(line())
+    result = run_training(line(resume=True, lr=2e-3))
+    printed = capsys.readouterr().out
+    assert "配置与上一段不同" in printed and "lr" in printed
+    assert result.metrics, "配置变化不是拒绝续跑的理由"
+
+
+def test_resume_keeps_best_selection(batch_dir: Path, tmp_path: Path) -> None:
+    """最佳值跨续跑保留：续跑不能把已经选出的最佳忘掉（否则一个更差的轮会覆盖 model.pt）。
+
+    判据的设定：续跑那一轮用 lr=0，于是它不改变任何参数——模型里没有 BatchNorm/Dropout
+    这类会自己漂移的状态（全是 GroupNorm），所以新一轮的验证误差与上一轮**完全相同**，
+    不构成"改善"。此时"沿用旧最佳"与"重启挑选"（把 best_metric 清成 None，于是第一轮
+    必定算作改善）会给出不同结果：只有前者不会重写最佳 checkpoint。
+    """
+    common = {
+        "mode": "value",
+        "epochs": 2,
+        "batch_size": 256,
+        "lr": 1e-3,
+        "val_fraction": 0.2,
+        "device": "cpu",
+        "seed": 11,
+        "max_samples": 2048,
+        "log_every": 0,
+    }
+
+    def line(**overrides) -> TrainConfig:
+        return TrainConfig(
+            datasets=[DatasetSpec(path=str(batch_dir))],
+            output=str(tmp_path / "line"),
+            **{**common, **overrides},
+        )
+
+    first = run_training(line())
+    state = torch.load(tmp_path / "line" / "last.pt", weights_only=False, map_location="cpu")
+    assert state["best_metric_kind"] == "val_value_mae" and state["best_metric"] is not None
+    # 前提：第一段的最后一轮就是最佳。这条测试的整个判据都建立在"新一轮不可能更好"上，
+    # 前提不成立时它应当直接失败，而不是悄悄变成一条什么都没测的测试。
+    assert state["best_metric"] == state["history"][-1]["val_value_mae"]
+    selected_digest = torch.load(first.best_checkpoint, weights_only=False, map_location="cpu")["metadata"][
+        "config_digest"
+    ]
+
+    second = run_training(line(resume=True, epochs=3, lr=0.0))
+    assert second.metrics[-1].epoch == 2
+    assert second.metrics[-1].val_value_mae == state["history"][-1]["val_value_mae"], (
+        "lr=0 的一轮应当给出与上一轮完全相同的验证指标"
+    )
+    resumed = torch.load(tmp_path / "line" / "last.pt", weights_only=False, map_location="cpu")
+    assert resumed["best_metric"] == state["best_metric"], "旧的最佳值必须被沿用，不能重启挑选"
+    assert (
+        torch.load(first.best_checkpoint, weights_only=False, map_location="cpu")["metadata"]["config_digest"]
+        == selected_digest
+    ), "没有改善时不应覆盖最佳 checkpoint（被覆盖说明最佳的选择被重启了）"

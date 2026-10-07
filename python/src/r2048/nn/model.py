@@ -16,6 +16,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from r2048.fileio import save_torch_atomic
 from r2048.nn.encode import INPUT_CHANNELS, INPUT_ENCODING, encode_boards
 
 # 两种结构都保留：
@@ -185,7 +186,9 @@ def save_checkpoint(
     }
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
-    torch.save(payload, path)
+    # 原子替换：checkpoint 被写一半时（进程被杀、磁盘满）读回必然崩，
+    # 而它往往是续跑唯一依赖的文件（见 fileio.save_torch_atomic）。
+    save_torch_atomic(path, payload)
 
 
 def load_checkpoint(path: str, device: torch.device) -> tuple[DualHeadResNet, dict[str, Any]]:

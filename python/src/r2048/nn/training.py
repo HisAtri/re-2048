@@ -30,8 +30,16 @@ import r2048_core
 import torch
 from torch.nn import functional as F
 
-from r2048.data.dataset import Batch, BatchStream, SourceMix, open_sources, source_summary
+from r2048.data.dataset import (
+    Batch,
+    BatchStream,
+    MultiSourceReader,
+    SourceMix,
+    open_sources,
+    source_summary,
+)
 from r2048.data.shards import CANDIDATE_TARGET_DEFINITION
+from r2048.fileio import save_torch_atomic
 from r2048.jobs import finish_console, progress_payload
 from r2048.nn.augment import augment_joint, augment_policy, augment_value
 from r2048.nn.encode import BOARD_CELLS, encode_boards
@@ -101,6 +109,9 @@ class TrainConfig:
     compile: bool = False
     log_every: int = 50
     resume: bool = False
+    # 每多少步写一次可续跑的 checkpoint（0 = 只用时间兜底，见 SAVE_INTERVAL_SECONDS）。
+    # 按步数保存能让"崩了之后丢多少"可预期（评测/小实验用），长跑则靠时间兜底。
+    save_every_steps: int = 0
     # 结构化进度回调（见 r2048.jobs）：训练动辄几十分钟到几小时，外部观察者
     # （脚本、界面）不该去解析那一行覆盖式打印。给了回调就不再打印。
     # 回调粒度与 log_every 一致——每步回调一次是没必要的开销（会按步写状态文件）。
@@ -174,6 +185,64 @@ def file_digest(path: str | Path) -> str:
 def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
     """torch.compile 会把原模块包一层 _orig_mod，取元数据与 state_dict 时要还原。"""
     return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+# 断点续跑的写入间隔上限（秒）。按步数保存是可选开关，但**默认必须有时间兜底**：
+# 一个 epoch 可能跑几小时，只在轮末落盘等于"崩一次白干一轮"（这正是 P3b 之前的行为）。
+SAVE_INTERVAL_SECONDS = 600.0
+# 续跑时"这一份 checkpoint 是什么时候写的"以外的字段：它们不是训练语义，
+# 变化不该触发警报（`resume` 就是用户在按的那个开关，保存间隔与停止在哪一步无关）。
+RESUME_VOLATILE_FIELDS = ("resume", "save_every_steps")
+
+
+def rng_state(rng: torch.Generator, device: torch.device) -> dict:
+    """把所有会消耗随机数的发生器状态抓下来。
+
+    缺任何一项，续跑出来的就不是同一条轨迹：增强的目标下标来自 `rng`，
+    模型里将来若加入 dropout/噪声则来自全局 torch 状态，numpy 侧同理。
+    """
+    state = {
+        "torch": torch.get_rng_state(),
+        "numpy": np.random.get_state(),
+        "augment": rng.get_state(),
+    }
+    if device.type == "cuda":
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng(state: dict, rng: torch.Generator, device: torch.device) -> None:
+    torch.set_rng_state(state["torch"])
+    np.random.set_state(state["numpy"])
+    rng.set_state(state["augment"])
+    if device.type == "cuda" and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def data_identity(reader: MultiSourceReader, config: TrainConfig) -> dict:
+    """续跑闸门里的**数据身份**：来源 + 权重 + 划分口径。
+
+    刻意**不含**样本数与路径：就地续跑会让批次一直增长（ADR 0020），换个目录挂同一份数据
+    也不该被当成换了数据。而权重与 split 口径变了就是真的换了池子（配额与划分都会不同），
+    必须拦住——"数据换了却接着训"是一类不会报错的静默错误。
+    """
+    return {
+        "sources": [[source.key, float(weight)] for source, weight in zip(reader.sources, reader.weights)],
+        "val_fraction": float(config.val_fraction),
+        "split_seed": int(config.split_seed),
+    }
+
+
+def config_differences(stored: dict, current: dict) -> list[str]:
+    """逐字段列出配置差异（"哪一项变了"比"摘要不同"可行动，见 ADR 0020 决策 7）。"""
+    differences = []
+    for key in sorted(set(stored) | set(current)):
+        if key in RESUME_VOLATILE_FIELDS:
+            continue
+        before, after = stored.get(key, "<缺>"), current.get(key, "<缺>")
+        if before != after:
+            differences.append(f"{key}: {before} → {after}")
+    return differences
 
 
 def _make_lr_lambda(config: TrainConfig, total_steps: int):
@@ -373,7 +442,19 @@ def _run_epoch(
     rng: torch.Generator,
     epoch: int,
     label: str,
+    skip: int = 0,
+    on_step: Callable[[int, int, float], None] | None = None,
 ) -> tuple[float, _Metrics, float]:
+    """跑一轮。
+
+    `skip` 是"这一轮已经训过的批数"（断点续跑用）：这些批**只能被跳过，不能被重训**，
+    否则参数会被更新两次，最终权重与一次跑完不再相同。跳过时**不增强**——
+    增强会消耗随机数，而 checkpoint 里的随机数状态正是"第 skip 批之前"的状态。
+    顺序由 `(seed, epoch)` 完全决定（`BatchStream`），所以"跳过前 skip 批"接下来看到的
+    就是当时那一批。
+
+    `on_step(epoch, done, loss)` 在每次优化器更新之后调用，供外层落盘使用。
+    """
     training = optimizer is not None
     model.train(training)
     metrics = _Metrics(device, score_scale)
@@ -388,6 +469,8 @@ def _run_epoch(
         stream.set_epoch(epoch)
     started = time.monotonic()
     for step, batch in enumerate(stream):
+        if step < skip:
+            continue
         batch = batch.to(device)
         if augment:
             if config.mode == "value":
@@ -466,6 +549,10 @@ def _run_epoch(
 
         loss_total += loss.detach().double()
         batches += 1
+        if training and on_step is not None:
+            # 落盘检查在统计之后、进度回调之前：回调可能抛异常（测试里的"杀掉"就是这样），
+            # 那时 checkpoint 必须已经反映刚刚完成的这一步。
+            on_step(epoch, step + 1, float(loss.detach()))
         if training and config.log_every and step % config.log_every == 0:
             elapsed = time.monotonic() - started
             seen = (step + 1) * config.batch_size
@@ -479,7 +566,7 @@ def _run_epoch(
                 "steps",
                 started,
                 line=(
-                    f"{label} epoch {epoch + 1} step {step + 1}/{len(stream)} loss {float(loss):.4f} "
+                    f"{label} epoch {epoch + 1} step {step + 1}/{len(stream)} loss {float(loss.detach()):.4f} "
                     f"{seen / max(1e-9, elapsed):.0f} 样本/秒{gpu}"
                 ),
                 extra={
@@ -606,18 +693,89 @@ def run_training(config: TrainConfig) -> TrainResult:
 
     run_dir = Path(config.output)
     run_dir.mkdir(parents=True, exist_ok=True)
+    # 每轮的批数：drop_last=False 时最后不足一批也算一步，所以直接用流长度（与调度器的
+    # `steps_per_epoch` 相差至多一步，那是既有口径，不在 P3b 里改）。
+    batches_per_epoch = len(train_stream)
+    step_in_epoch = 0
     start_epoch = 0
     history: list[EpochMetrics] = []
+    best_metric: float | None = None
+    best_metric_kind = ""
+    best_checkpoint = ""
+    identity = data_identity(reader, config)
+    if config.resume and not (run_dir / "last.pt").exists():
+        # 说了要接着跑、却什么也没接着，是必须说出来的一件事：安静地重头开始，
+        # 用户会以为自己在续跑（盘上还会多出一份"看起来是延续"的产物）。
+        print(f"--resume 指定了，但 {run_dir / 'last.pt'} 不存在：从头开始训练")
     if config.resume and (run_dir / "last.pt").exists():
         state = torch.load(run_dir / "last.pt", map_location=device, weights_only=False)
+        # 闸门一：数据身份。换数据接着训是静默错误（划分与标签口径都变了，
+        # 而损失照样下降），所以直接拒绝并说清是哪一项不同。
+        stored_identity = state.get("data_identity")
+        if stored_identity is not None and stored_identity != identity:
+            raise ValueError(
+                "拒绝续跑：数据身份与 last.pt 不一致。\n"
+                f"  上一段：{stored_identity}\n"
+                f"  这一次：{identity}\n"
+                "要换数据（来源或权重）就换一个 --output 新起一条训练线；"
+                "如果只是同一批数据长大了一些，身份不会变，可以直接续跑。"
+            )
+        # 闸门二：其余配置。允许"把轮数调长"这类改动，但必须让人看见。
+        differences = config_differences(dict(state.get("config", {})), config_payload(config))
+        if differences:
+            print("配置与上一段不同（数据身份未变，继续续跑）：")
+            for line in differences:
+                print(f"  {line}")
+
         _unwrap(model).load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
-        start_epoch = int(state["epoch"]) + 1
+        # 恢复调度器会把 `base_lrs` 一起恢复，于是配置里的 lr 会被悄悄忽略（实测：把 lr 从
+        # 1e-3 改成 1000 续跑，实际仍按 1e-3 训练，验证指标一模一样）。
+        # **状态从 checkpoint 恢复，超参以配置为准**：按配置重算当前步位置上的学习率，
+        # 而不是把 lr 直接设成 config.lr——调度器保存下来的 lr 已经是"基准 × 日程"的值，
+        # 直接覆盖会让第一步用错（少了日程因子）。同一个 lr 时这是恒等运算，不影响逐张量复现。
+        scheduler.base_lrs = [config.lr for _ in scheduler.base_lrs]
+        resumed_lambda = _make_lr_lambda(config, steps_per_epoch * config.epochs)
+        for group in optimizer.param_groups:
+            group["lr"] = config.lr * resumed_lambda(scheduler.last_epoch)
         history = [EpochMetrics(**entry) for entry in state.get("history", [])]
-        # 续训时不让旧的最佳干扰新一轮挑选（历史里可能来自另一套指标口径）。
-        best_metric = None
-        print(f"续训：从第 {start_epoch + 1} 轮继续（已有 {len(history)} 轮记录）")
+        # 恢复到"哪一轮、这一轮第几批"：同一个 globals 位置续跑，权重才会与一次跑完逐张量相同。
+        start_epoch = int(state.get("epoch", len(history) - 1 if history else 0))
+        step_in_epoch = int(state.get("step_in_epoch", 0))
+        if "global_step" not in state:
+            # P3b 之前的 checkpoint 只有轮末状态：没有随机数状态，也没有批内位置，
+            # 只能从下一轮的轮首接着跑（等价于以前的行为，不是逐张量可复现）。
+            start_epoch += 1
+            step_in_epoch = 0
+            print(f"续训：这份 checkpoint 没有随机数状态，从第 {start_epoch + 1} 轮轮首继续")
+        if step_in_epoch >= batches_per_epoch:
+            start_epoch += 1
+            step_in_epoch = 0
+        best_metric = state.get("best_metric")
+        best_metric_kind = str(state.get("best_metric_kind", ""))
+        # 续跑是接着这一条线跑，所以"当前的最佳 checkpoint"就是上一段选出来的那个文件。
+        # 不恢复它（保持空串）会让"这一段没有哪一轮更好"时的返回值丢掉一个真实存在的路径——
+        # 调用方（CLI、迭代编排）拿到的空路径会被当成"这条线没有最佳模型"。
+        if (run_dir / "model.pt").exists():
+            best_checkpoint = str(run_dir / "model.pt")
+        if "rng" in state:
+            restore_rng(state["rng"], rng, device)
+        resume_position = (
+            f"第 {start_epoch + 1} 轮第 {step_in_epoch + 1} 批"
+            if step_in_epoch
+            else f"第 {start_epoch + 1} 轮轮首"
+        )
+        print(f"续训：从{resume_position}继续（已有 {len(history)} 轮记录）")
+        stored_samples = state.get("data_samples")
+        current_samples = {source.key: source.samples for source in reader.sources}
+        if stored_samples is not None and stored_samples != current_samples:
+            # 批次原地增长（ADR 0020）是常态：来源身份没变，但池子变大会改变划分与每轮内容。
+            # 这不是错误，只是"续跑不等于一次跑完"的又一个来源，必须说出来。
+            print(
+                f"注意：数据来源的样本数与上一段不同 {stored_samples} → {current_samples}；"
+                "池子变了，划分与每轮内容可能与上一段不同（来源身份未变，不属于换数据）"
+            )
 
     print(reader.describe())
     print(split.describe())
@@ -628,10 +786,47 @@ def run_training(config: TrainConfig) -> TrainResult:
         f"冻结张量 {len(frozen)}，批 {config.batch_size}，设备 {device}{' bf16' if amp_dtype else ''}"
     )
 
-    # 主指标的方向取决于“这一轮用没用候选监督”，只有进入循环才知道，因此用 None 起步。
-    best_metric: float | None = None
-    best_checkpoint = ""
+    # 主指标的方向取决于“这一轮用没用候选监督”，只有进入循环才知道（`best_metric` 与
+    # `best_metric_kind` 已在续跑块里恢复，不能在这里清零——那等于每次续跑都重启最佳的选择）。
+    last_save = time.monotonic()
+
+    def save_last(epoch: int, done: int) -> None:
+        """写可续跑的 `last.pt`（原子替换）：轮内的位置 + 随机数状态 + 当前最佳值。
+
+        这是"崩一次只丢一个保存间隔"的全部依据，也是"续跑等于一次跑完"的依据：
+        它记录的是**批边界**上的状态，`_run_epoch` 的 `skip` 能精确回到那里。
+        """
+        nonlocal last_save
+        save_torch_atomic(
+            run_dir / "last.pt",
+            {
+                # 版本 2 = 带批内位置与随机数状态（版本 1 只在轮末写、只能从轮首续跑）。
+                "checkpoint_version": 2,
+                "epoch": epoch,
+                "step_in_epoch": done,
+                "global_step": epoch * batches_per_epoch + done,
+                "model": _unwrap(model).state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "history": [asdict(item) for item in history],
+                "config": config_payload(config),
+                "data_identity": identity,
+                "data_samples": {source.key: source.samples for source in reader.sources},
+                "best_metric": best_metric,
+                "best_metric_kind": best_metric_kind,
+                "rng": rng_state(rng, device),
+            },
+        )
+        last_save = time.monotonic()
+
+    def on_step(epoch: int, done: int, _loss: float) -> None:
+        by_steps = config.save_every_steps and done % config.save_every_steps == 0
+        if by_steps or time.monotonic() - last_save >= SAVE_INTERVAL_SECONDS:
+            save_last(epoch, done)
+
     for epoch in range(start_epoch, config.epochs):
+        # 只有续跑后的第一轮需要跳过：之后每一轮都从轮首开始。
+        skip = step_in_epoch if epoch == start_epoch else 0
         train_loss, train_metrics, train_seconds = _run_epoch(
             model,
             train_stream,
@@ -644,6 +839,8 @@ def run_training(config: TrainConfig) -> TrainResult:
             rng,
             epoch,
             label="训练",
+            skip=skip,
+            on_step=on_step,
         )
         nan = float("nan")
         val_loss, val_mae, val_ce, val_agreement, val_records = nan, nan, nan, nan, 0
@@ -695,11 +892,17 @@ def run_training(config: TrainConfig) -> TrainResult:
         # （旧版的结论：全局 MAE 无法替代同根候选排序，架构差别就藏在后者里）。
         # 有候选监督时用“最优候选命中率”，否则退回价值 MAE；策略模式看交叉熵。
         if config.mode == "policy":
-            primary, maximize = val_ce, False
+            primary, maximize, kind = val_ce, False, "val_policy_ce"
         elif not math.isnan(best_hit):  # 非 NaN 说明这一轮确实用了候选监督
-            primary, maximize = best_hit, True
+            primary, maximize, kind = best_hit, True, "val_candidate_best_hit"
         else:
-            primary, maximize = val_mae, False
+            primary, maximize, kind = val_mae, False, "val_value_mae"
+        if best_metric_kind and best_metric_kind != kind:
+            # 主指标换了口径（换了配方，或换了一批没有候选监督的数据）：旧的"最佳"不可比。
+            # 继续拿它比大小会安静地锁死最佳 checkpoint 的选择，所以丢弃并说明。
+            print(f"上一段的最佳值来自 {best_metric_kind}，本段是 {kind}：不沿用旧的最佳值")
+            best_metric, best_metric_kind = None, kind
+        best_metric_kind = kind
         print(
             f"第 {epoch + 1}/{config.epochs} 轮：训练损失 {train_loss:.4f}，验证损失 {val_loss:.4f} | "
             f"候选 MAE {candidate_mae:.1f} 分，成对排序一致率 {pair_agreement * 100:.1f}%，"
@@ -709,17 +912,6 @@ def run_training(config: TrainConfig) -> TrainResult:
         )
 
         model_state = _unwrap(model).state_dict()
-        torch.save(
-            {
-                "epoch": epoch,
-                "model": model_state,
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "history": [asdict(item) for item in history],
-                "config": config_payload(config),
-            },
-            run_dir / "last.pt",
-        )
         # `primary` 为 NaN 表示这一轮没算出主指标（例如验证集里没有可用样本），
         # 显式写出来而不是用 `x != x` 的自比较写法。
         improved = not math.isnan(primary) and (
@@ -763,7 +955,13 @@ def run_training(config: TrainConfig) -> TrainResult:
             )
             if config.init_checkpoint:
                 meta["source_checkpoint_sha256"] = file_digest(config.init_checkpoint)
-            torch.save({"checkpoint_version": 1, "model": model_state, "metadata": meta}, best_checkpoint)
+            save_torch_atomic(
+                best_checkpoint, {"checkpoint_version": 1, "model": model_state, "metadata": meta}
+            )
+
+        # 轮末的 last.pt 写在最佳值更新之后：它是"续跑从这里接着跑"的锚点，
+        # 里头的 best_metric 必须是这一轮挑选之后的值（否则续跑会把最佳选择的进度退回去）。
+        save_last(epoch, batches_per_epoch)
 
     train_json = str(run_dir / "train.json")
     Path(train_json).write_text(

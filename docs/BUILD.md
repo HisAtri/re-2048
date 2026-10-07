@@ -179,6 +179,32 @@ make py ARGS="train --config train.yaml --data $R2048_OUTPUT_DIR/data/new --outp
 * 训练日志逐来源报出训练/验证局数；`train.json` 与 checkpoint 元数据逐来源记身份与权重；
   **验证集为空直接报错**（除非显式 `val_fraction=0`）。
 
+### 训练断点续跑
+
+训练默认每约 10 分钟（或每 `--save-every-steps N` 步）在运行目录里原子写一次 `last.pt`，
+它停在**批边界**上（见 ADR 0022），因此多数情况下续跑与"一次跑完"逐张量相同：
+
+```bash
+make py ARGS="train --config train.yaml --output $R2048_OUTPUT_DIR/runs/value-w1 --save-every-steps 200"
+# 崩了、或者机器要还回去，直接接着跑（同一个 --output）
+make py ARGS="train --config train.yaml --output $R2048_OUTPUT_DIR/runs/value-w1 --resume"
+```
+
+几条要点：
+
+* **停在批边界、停在块边界**：`last.pt` 记录 `epoch` + `step_in_epoch` + 随机数状态
+  （torch / CUDA / numpy / D4 增强发生器），续跑跳过前 `step_in_epoch` 批（不重训、
+  也不增强——增强会消耗随机数）。判据是逐张量相等，实测 A 一次跑完 4 轮与
+  "第 2 轮第 3 批被杀 → `--resume`"的最终权重 `torch.equal`。
+* **数据身份变了会被拒绝**（来源身份 `source_key` / 权重 / `val_fraction` / `split_seed`）：
+  换数据接着训是静默错误，想换就换个 `--output` 新起一条线。批次**原地增长**不算换数据
+  （来源身份没变），只会在日志里提示池子大小变了。
+* **其他配置变了会逐字段打印**（"`epochs: 8 → 12`"）然后继续——把轮数调长是正常操作。
+* **`lr` 以配置为准**：恢复调度器会把基准学习率一起恢复，所以代码按配置重算当前步位置上的
+  学习率；同一个 `lr` 时这是恒等运算。
+* **暂停的是"计算的粒度"**：被打断那一轮的日志只统计续跑跑过的那一截
+  （训练损失与验证指标的 tail 平均），后续各轮与最终权重不受影响。
+
 ## 性能记录（本机实测，16 核 WSL2 + 直通 GPU）
 
 | 场景 | 参数 | 结果 |

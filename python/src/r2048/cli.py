@@ -89,7 +89,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="torch.compile（首次调用有编译开销）",
     )
     train.add_argument("--log-every", type=int, default=argparse.SUPPRESS)
-    train.add_argument("--resume", action="store_true", default=argparse.SUPPRESS)
+    train.add_argument(
+        "--resume",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="从 --output 里的 last.pt 接着跑（默认从最后一个保存点，含轮内）",
+    )
+    train.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="每多少步写一次可续跑的 checkpoint（0 = 只用时间兜底，约 10 分钟）",
+    )
 
     evaluate = sub.add_parser("eval", help="用 checkpoint 跑固定局数评测（三条 track）")
     evaluate.add_argument("--checkpoint", default="", help="模型 checkpoint（纯网络 track 必需）")

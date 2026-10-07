@@ -159,6 +159,9 @@ def _step_selfplay(config: IterateConfig, written: dict, job: JobDir) -> dict:
                 in_flight_per_lane=config.in_flight,
                 search_threads=config.search_threads,
                 c_puct=config.c_puct,
+                # 接上进度回调：相位汇总（谁在等谁、GPU 忙占比）要落到作业日志里，
+                # 而不是只打在终端上——跑完一轮还想回看时，终端已经滚掉了。
+                on_progress=config.on_progress,
             ),
             model,
             device,

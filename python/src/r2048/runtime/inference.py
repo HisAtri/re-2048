@@ -21,10 +21,17 @@ class ForwardModel(Protocol):
 
 
 class BatchedEvaluator:
-    def __init__(self, model: torch.nn.Module, device: torch.device, dtype: torch.dtype | None = None):
+    """一次前向覆盖一批请求。
+
+    **没有精度参数**：这里曾经有一个 `dtype` 形参，但它从未参与计算——谁传都会静默拿到
+    fp32。按 ADR 0025 的决策先不引入精度开关，所以参数一并删掉，而不是留一个空转的旋钮；
+    真要引入时，接线是一处 autocast（约 15 行）并把 dtype 名写进协议里的
+    `inference_precision`。
+    """
+
+    def __init__(self, model: torch.nn.Module, device: torch.device):
         self.model = model
         self.device = device
-        self.dtype = dtype
         self.batches = 0
         self.rows = 0
 

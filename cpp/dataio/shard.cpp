@@ -1,6 +1,7 @@
 #include "dataio/shard.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -367,10 +368,21 @@ ShardWriter ShardWriter::resume(const std::string& data_dir, uint64_t shard_samp
             if (bytes.size() != last.samples * kSampleBytes) {
                 throw std::runtime_error("末分片 " + last.path + " 的字节数与清单不符，拒绝续写");
             }
-            const Sample first = decode_sample(bytes.data());
-            const Sample final = decode_sample(bytes.data() + bytes.size() - kSampleBytes);
-            if (first.episode != last.first_episode || final.episode != last.last_episode) {
-                throw std::runtime_error("末分片 " + last.path + " 的局号与清单不符，拒绝续写");
+            // 只核对**跨度**（实际 min/max），不假设内容有序：同一写者的多局完赛顺序不定，
+            // 首/末记录未必是最小/最大局号——旧实现按首末记录比，多写者批次一到就误报
+            // "局号与清单不符，拒绝续写"（实测踩到）。
+            uint32_t lowest = UINT32_MAX;
+            uint32_t highest = 0;
+            for (uint64_t offset = 0; offset + kSampleBytes <= bytes.size(); offset += kSampleBytes) {
+                const uint32_t episode = decode_sample(bytes.data() + offset).episode;
+                lowest = std::min(lowest, episode);
+                highest = std::max(highest, episode);
+            }
+            if (lowest != last.first_episode || highest != last.last_episode) {
+                throw std::runtime_error("末分片 " + last.path + " 的局号跨度 [" +
+                                         std::to_string(lowest) + ", " + std::to_string(highest) +
+                                         "] 与清单声明的 [" + std::to_string(last.first_episode) +
+                                         ", " + std::to_string(last.last_episode) + "] 不符，拒绝续写");
             }
             writer.buffer_.assign(bytes.begin(), bytes.end());
             writer.buffered_first_episode_ = last.first_episode;
@@ -497,7 +509,7 @@ BatchManifest ShardWriter::snapshot(BatchState state) const {
     return manifest;
 }
 
-void ShardWriter::merge_into_manifest(BatchState state) {
+BatchManifest ShardWriter::merge_into_manifest(BatchState state) {
     state_ = state;
     ManifestLock lock(data_dir_);
     const std::string manifest_path = data_dir_ + "/manifest.json";
@@ -526,6 +538,7 @@ void ShardWriter::merge_into_manifest(BatchState state) {
     current.samples = 0;
     for (const ShardInfo& shard : current.shards) current.samples += shard.samples;
     write_manifest(data_dir_, current);
+    return current;
 }
 
 void ShardWriter::publish(BatchState state) { merge_into_manifest(state); }
@@ -536,8 +549,8 @@ uint32_t ShardWriter::episode_floor() const { return batch_max_episode_plus_one_
 
 BatchManifest ShardWriter::finish(BatchState state) {
     flush_shard();  // 末尾那一段不满的数据在这里落盘（它一定结束在一局的末尾）
-    publish(state);
-    return snapshot(state);
+    // 直接返回落盘的那份合并结果：这就是"只有一套账"。
+    return merge_into_manifest(state);
 }
 
 }  // namespace r2048

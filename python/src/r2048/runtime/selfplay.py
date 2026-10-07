@@ -172,6 +172,20 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
 
         return run_parallel_selfplay(config, model, device)
 
+    # 控制文件在多写者（--join）下是**粘住的**（不删），否则一条 stop 只能停住抢到它的那个
+    # 进程。代价是它留了下来：下一次续跑/加入会被它立刻又叫停。这不是错误（用户可能就是想
+    # 继续停着），但必须说出来——否则现象是"刚启动就停了"，看起来像 bug。
+    control_path = Path(config.control_path or (Path(config.data_dir) / "control"))
+    if control_path.exists():
+        leftover = control_path.read_text().strip()
+        if leftover:
+            print(
+                f"注意：控制文件 {control_path} 里还留着 {leftover!r}：这一批会立刻又被叫停。"
+                "多写者（--join）下控制文件不会自动删除，要接着跑请先删除它。",
+                file=sys.stderr,
+                flush=True,
+            )
+
     engine = r2048_core.BatchedEngine(
         engine_config,
         str(config.data_dir),

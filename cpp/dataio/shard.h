@@ -160,7 +160,9 @@ private:
     void flush_shard();
     void check_episode_order(uint32_t episode) const;
     // 清单更新：在文件锁下读-改-写，把自己新落的分片并进去（不然会覆盖别的写者）。
-    void merge_into_manifest(BatchState state);
+    // **返回合并后的那份**：返回值与落盘的内容必须同源，否则会出现"两套账"——
+    // 实测 finish 报的条数比清单少一个末片（snapshot 只算本写者的分片）。
+    BatchManifest merge_into_manifest(BatchState state);
     BatchManifest snapshot(BatchState state) const;
     uint64_t buffered_samples() const { return buffer_.size() / kSampleBytes; }
     uint64_t capacity_bytes() const { return shard_samples_ * kSampleBytes; }

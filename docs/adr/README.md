@@ -21,7 +21,8 @@ ADR 解释为什么整体是这个形状。
 | [0013](0013-iteration-results.md) | 两轮迭代实验结果：朴素自举会把价值头训坏 | 已采纳 |
 | [0014](0014-search-health-and-noise-floor.md) | 搜索健康度诊断与噪声底噪 | 已采纳 |
 | [0015](0015-candidate-level-supervision.md) | 候选级监督 | 已采纳 |
-| [0016](0016-protocol-variables-and-simulation-budget.md) | 评测协议的隐蔽变量、模拟预算与探索系数 | 已采纳（两项待实施） |
+| [0016](0016-protocol-variables-and-simulation-budget.md) | 评测协议的隐蔽变量、模拟预算与探索系数 | 已采纳（两项待实施，决策 5 归因已订正） |
+| [0017](0017-batch-scheduling-dependence.md) | 批组成不是浮点问题：在途模拟的调度依赖与强度代价 | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

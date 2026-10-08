@@ -292,3 +292,89 @@ def test_build_app_constructs_the_blocks() -> None:
         assert demo is not None
     finally:
         state.close()
+
+
+# ---- 界面接线（Gradio 组件层）-----------------------------------------------------
+#
+# 这一组防的是"构造时不报、一点就崩"的那类问题。Gradio 的坑很集中：
+#   ① 处理函数返回的个数与 `outputs` 申明的个数不一致；
+#   ② 生成器里用 `return` 交回视图——返回值被丢掉，界面表现为"点了没反应"。
+# 两条都不会在 `build_app()` 时暴露，只有真跑一次处理函数才会。
+
+
+def _dummy(component) -> object:
+    """给一个控件造一个"看起来合理"的输入值，好让处理函数走到它该走的分支。"""
+    import gradio as gr
+
+    label = getattr(component, "label", "") or ""
+    if label.startswith(("模型", "棋谱")):
+        return None  # 不给模型/棋谱：这一组测试不该真的拉起会话子进程
+    if isinstance(component, gr.Dropdown):
+        if not component.choices:
+            return None
+        # Gradio 把 choices 归一成 (label, value) 对，这里要取**值**而不是整个对。
+        first = component.choices[0]
+        return first[1] if isinstance(first, (tuple, list)) else first
+    if isinstance(component, (gr.Number, gr.Slider)):
+        return 0
+    if isinstance(component, gr.Checkbox):
+        return False
+    if isinstance(component, gr.Textbox):
+        return ""
+    return None
+
+
+def _fresh_app():
+    from r2048.webui.app import AppState, build_app
+
+    return build_app(AppState())
+
+
+def test_every_handler_matches_its_declared_outputs() -> None:
+    pytest.importorskip("gradio", reason="webui 是可选组件（ADR 0039）")
+    import inspect
+
+    demo, state = _fresh_app()
+    try:
+        checked = 0
+        for descriptor in demo.fns.values():
+            name = descriptor.fn.__name__
+            result = descriptor.fn(*[_dummy(component) for component in descriptor.inputs])
+            if inspect.isgenerator(result):
+                result = next(result, None)
+            if result is None:  # 生成器一次都没产出：上面那条"生成器不许 return"就属于这种情况
+                pytest.fail(f"{name} 是生成器但第一帧没有产出任何东西")
+            declared = len(descriptor.outputs)
+            if isinstance(result, (tuple, list)):
+                assert len(result) == declared, (
+                    f"{name} 返回了 {len(result)} 个值，但申明了 {declared} 个 outputs"
+                )
+            else:
+                # Gradio 也接受"单个值对应单个 output"（`gr.update(...)` 是 dict，不是序列）。
+                assert declared == 1, (
+                    f"{name} 只返回了一个 {type(result).__name__}，但申明了 {declared} 个 outputs"
+                )
+            checked += 1
+        assert checked >= 15, f"只核对了 {checked} 个处理函数，太少"
+    finally:
+        state.close()
+
+
+def test_run_and_stop_share_one_slot() -> None:
+    """运行与停止是**同一个位置的两个状态**，不同时存在；点下去才互换，手动控件同时置灰。"""
+    pytest.importorskip("gradio", reason="webui 是可选组件（ADR 0039）")
+
+    demo, state = _fresh_app()
+    try:
+        buttons = [b for b in demo.blocks.values() if type(b).__name__ == "Button"]
+        start = next(b for b in buttons if str(b.value).startswith("▶"))
+        stop = next(b for b in buttons if str(b.value).startswith("■"))
+        assert start.visible is True and stop.visible is False, "初始只该看到「自动执行」"
+
+        descriptor = next(d for d in demo.fns.values() if d.fn.__name__ == "on_auto_start")
+        first = next(descriptor.fn(*[_dummy(component) for component in descriptor.inputs]))
+        assert first[4]["visible"] is False, "开始执行后「自动执行」要藏起来"
+        assert first[5]["visible"] is True, "并露出「停止」"
+        assert all(update["interactive"] is False for update in first[6:]), "自动执行期间手动控件要置灰"
+    finally:
+        state.close()

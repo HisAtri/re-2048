@@ -253,6 +253,149 @@ def test_new_game_without_a_seed_picks_one_and_records_it() -> None:
     assert np.array_equal(session.board, records.apply(session.record).board)
 
 
+# ---- 2c. 规则正确性（回归）-------------------------------------------------------
+#
+# 这一组是**回归**：曾经有过两个很难看的 bug，都是"看起来正常、玩起来错"。
+#
+# ① 生成块固定在同一格、且永远只出 2。根因：会话每走一步都会重放并 `set_root`，而
+#    `set_root` 会把引擎的步号清零；生成块的随机流是 `derive(种子, …, 步号, …)`，
+#    步号恒为 0 → 每一步抽到同一个种子 → 同一格、同一个 90/10 结果。
+# ② 终局的那一步被丢掉。根因：`play()` 见到 `terminal` 就整条 return，于是棋谱比引擎
+#    少一步——界面显示的盘面落后一步却报"终局"，看起来就是"终局判定错了"。
+#
+# 两条都属于"不报错、只给出错误结果"，所以必须由测试钉住，而不是靠看一眼。
+
+
+def _drive(session: Session, moves: int = 5000) -> list[tuple[int, int]]:
+    """按固定顺序试四个方向落子，返回每步的（生成位置, 生成指数）。
+
+    用**显式方向**，所以完全不经过搜索——纯 C++ 的提交路径，几百步也是毫秒级。
+
+    `moves` 是**防御性的上限**：真正的终局根本用不到它（一局最多几千步），而一旦出现"走不完"
+    的退化，它能让测试干净地失败。这不是假想——bug ②（终局那一步被丢掉）的表现就是**挂住**：
+    会话的盘面永远停在终局之前，于是这个循环永远转下去（实测把 pytest 挂到超时）。
+    """
+    spawns: list[tuple[int, int]] = []
+    while not session.terminal() and not session.empty() and len(spawns) < moves:
+        for action in range(4):
+            try:
+                step = session.play(action)
+            except RuntimeError:
+                continue
+            spawns.append((int(step["spawn_index"]), int(step["spawn_exponent"])))
+            break
+        else:
+            break  # 四个方向都走不了：引擎已经报终局了，上面那个 while 会退出
+    return spawns
+
+
+def test_engine_step_advances_across_moves(checkpoint: str) -> None:
+    """**这条直接钉住 bug ① 的机制**：落子之后不能把引擎的步号清零。
+
+    生成块的随机流是 `derive(引擎种子, …, 步号, …)`；步号恒为 0 就意味着每一步抽到同一个
+    种子。这条比"位置看起来分散"结实得多——我先前写的那版位置检查在 bug 放回去之后**照样
+    通过**：`below(n)` 的返回值随空格数变化，所以"位置分散"能被骗过。断言步号本身骗不过去。
+    """
+    session = _session(checkpoint)
+    session.new_game(4242)
+    engine = session.require_engine()
+    for expected in (1, 2, 3):
+        for action in range(4):
+            try:
+                session.play(action)
+                break
+            except RuntimeError:
+                continue
+        else:
+            pytest.fail("开局几步之内不该无路可走")
+        assert engine.debug_state()["lanes"][0]["step"] == expected, (
+            f"落子后引擎步号应当是 {expected}；被清零说明会话在落子后又 set_root 了一次"
+        )
+
+
+def test_spawn_values_vary_within_one_game(checkpoint: str) -> None:
+    """90/10 要**在一局之内**逐步生效。
+
+    判据是"**某一局单独**同时出现 2 与 4"而不是"几局合起来出现过两种"：步号被清零时，
+    一整局抽到的是同一个种子，于是这一局的值恒定——可能是全 2、也可能是全 4。把几局的
+    结果合起来看，恰好会凑齐两种值，那个 bug 就漏过去了（我第一版就是这么写的，实测漏过）。
+    """
+    session = _session(checkpoint)
+    both_in_one_game = False
+    samples = 0
+    for seed in (1, 2, 3):
+        session.new_game(seed)
+        spawns = _drive(session)
+        values = {exponent for _, exponent in spawns}
+        samples += len(spawns)
+        assert values <= {1, 2}, "只会出 2（指数 1）或 4（指数 2）"
+        both_in_one_game = both_in_one_game or values == {1, 2}
+    assert samples >= 150, f"样本量太小（{samples} 步），判不出来"
+    assert both_in_one_game, (
+        "没有任何一局同时出现过 2 与 4：说明随机流没有随步号推进（每步抽到同一个种子）"
+    )
+
+
+def test_terminal_move_is_written_to_the_record(checkpoint: str) -> None:
+    """终局的那一步必须落在棋谱里——这条直接对着 bug ②。"""
+    session = _session(checkpoint)
+    session.new_game(20261009)
+    _drive(session)
+
+    assert session.terminal(), "这条用例要真的走到终局"
+    assert not session.empty()
+    assert session.legal_mask == 0
+    # 棋谱与盘面必须一致，而且末条命令是那一步的生成块（说明 move 也写进去了）。
+    replayed = records.apply(session.record)
+    assert np.array_equal(replayed.board, session.board)
+    assert replayed.move_count == session.moves
+    assert isinstance(session.record[-1], records.SetTile), "最后落下的那枚生成块要在棋谱里"
+    assert any(isinstance(c, records.Move) for c in session.record)
+    assert session.score == replayed.total_score
+    # 终局之后落子/分析要明确报终局，而不是静默走一步或给出空结果。
+    with pytest.raises(RuntimeError, match="终局"):
+        session.play(None)
+    with pytest.raises(RuntimeError, match="终局"):
+        session.analyze()
+
+
+def test_undo_from_a_terminal_position_restores_a_playable_board(checkpoint: str) -> None:
+    session = _session(checkpoint)
+    session.new_game(20261009)
+    _drive(session)
+    assert session.terminal()
+    assert session.undo() is True
+    assert not session.terminal(), "退回一步之后必须又能走"
+    assert session.legal_mask != 0
+    assert np.array_equal(session.board, records.apply(session.record).board)
+
+
+def test_empty_board_is_not_reported_as_terminal(checkpoint: str) -> None:
+    """"空"与"终局"都没有合法方向，但下一步动作完全不同——不能混成一句话。"""
+    session = _session(checkpoint)
+    assert session.empty() and not session.terminal()
+    state = session.state()
+    assert state["empty"] is True and state["terminal"] is False
+    with pytest.raises(RuntimeError, match="空"):
+        session.analyze()
+
+
+def test_same_seed_replays_the_same_game_exactly(checkpoint: str) -> None:
+    """可复现没有被上面两个修复破坏：同 seed + 同操作序列 → 同一局、逐字节同棋谱。"""
+    first = _session(checkpoint)
+    first.new_game(7)
+    spawns_first = _drive(first, moves=25)
+
+    second = _session(checkpoint)
+    second.new_game(7)
+    spawns_second = _drive(second, moves=25)
+
+    assert spawns_first == spawns_second
+    assert np.array_equal(first.board, second.board)
+    assert first.render() == second.render()
+    assert first.score == second.score
+
+
 # ---- 3. 协议 ---------------------------------------------------------------------
 
 

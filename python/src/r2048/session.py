@@ -131,7 +131,7 @@ class Session:
         self.last_report: AnalysisReport | None = None
         if self.config.checkpoint:
             self._load_model(self.config.checkpoint)
-        self._recompute()
+        self._replay()
         if self._model is not None:
             self._new_engine()
 
@@ -193,7 +193,7 @@ class Session:
 
     # ---- 盘面与棋谱 -------------------------------------------------------------
 
-    def _recompute(self) -> None:
+    def _replay(self) -> None:
         """按棋谱重放，得出全部派生状态。唯一的取数处——盘面与棋谱不可能不一致。"""
         result = records.apply(self.record)
         self.board = result.board
@@ -203,25 +203,42 @@ class Session:
         self.legal_mask = result.legal_mask
         self._tree_fresh = False  # 盘面变了，上一步的搜索结果作废
         self.last_report = None
+
+    def _adopt(self) -> None:
+        """重放，并**把引擎的根局面拉到这个盘面上**（外部改了盘面之后必须做）。
+
+        **正常落子之后绝不能调**：那时引擎自己已经把局面推进过去了，再 set_root 一次会把
+        它的步号清零，而生成块的随机流是 `derive(seed, …, 步号, …)`——步号恒为 0 意味着
+        每一步都抽到同一个种子，于是新块永远落在同一格、永远只出 2（这个 bug 实测过）。
+        所以"外部改盘面"（clear / set / 载入 / undo / 新开一局）走这里，落子走 `_replay`。
+        """
+        self._replay()
         if self._engine is not None:
             self._engine.set_root(self.board)
 
     def terminal(self) -> bool:
-        return self.legal_mask == 0
+        """真的终局：盘面上有块、但没有任何合法方向。
+
+        **空盘面不算终局**——那是"还没开始"。两者都没有合法方向，但对用户来说下一步动作完全
+        不同（一个要新开一局，一个要编辑），所以必须分开说。
+        """
+        return self.legal_mask == 0 and self.max_exponent > 0
+
+    def empty(self) -> bool:
+        return self.max_exponent == 0
 
     def _require_playable(self) -> None:
-        """空局面与终局都是"没有合法方向"，但要对用户说清是哪一种——两者的下一步动作不同。"""
         if self.legal_mask:
             return
-        if self.max_exponent == 0:
-            raise RuntimeError("当前盘面是空的：先摆几个块（set）再分析或落子")
+        if self.empty():
+            raise RuntimeError("当前盘面是空的：先「新开一局」或摆几个块（set）再分析或落子")
         raise RuntimeError("当前盘面已经没有合法方向（终局）")
 
     def reset(self) -> None:
         """清空盘面与棋谱（`clear`）。"""
         self.record = [records.Clear()]
         self.seed = 0
-        self._recompute()
+        self._adopt()
 
     def new_game(self, seed: int | None = None) -> int:
         """开一局标准 2048：两枚随机块（90% 出 2、10% 出 4）。
@@ -237,14 +254,20 @@ class Session:
         board = np.asarray(r2048_core.opening_board(value, 0), dtype=np.uint8)
         self.record = records.commands_for_board(board)
         self.seed = value
-        self._recompute()
+        self._replay()
+        # 生成块的随机流是 `derive(引擎种子, …, 步号)`。引擎种子若固定不变，每开一局都会得到
+        # 一模一样的生成序列（同一格、同一个 90/10 结果）。所以把这一局的种子交给引擎：
+        # "换个 seed 就是另一局"在生成块上也成立，而同一个 seed 仍然完全可复现。
+        self.config.seed = value
+        if self._engine is not None:
+            self._new_engine()  # 它自己会把根局面设上去
         return value
 
     def set_tile(self, index: int, exponent: int | None) -> None:
         """摆一块或清一块（棋谱里的 `set`）。合法性由 records.apply 判定。"""
         self.record.append(records.SetTile(index=index, exponent=exponent))
         try:
-            self._recompute()
+            self._adopt()
         except records.RecordApplyError:
             self.record.pop()  # 应用不了：棋谱维持原样，错误照样往上抛
             raise
@@ -265,24 +288,35 @@ class Session:
             self.analyze()
         before = list(self.record)
         step = engine.commit_step(-1 if action is None else int(action))
-        if int(step["action"]) < 0 or bool(step["terminal"]):
-            return {"action": -1, "terminal": True, "board": self.board.tolist(), "score": self.score}
-        self.record.append(records.Move(action=int(step["action"])))
+        chosen = int(step["action"])
+        if chosen < 0:
+            # 引擎没给出方向 = 进来时盘面就已经没有合法方向（终局）。什么都没动。
+            return {
+                "action": -1,
+                "terminal": True,
+                "spawn_index": -1,
+                "spawn_exponent": 0,
+                "board": self.board.tolist(),
+                "score": self.score,
+            }
+        # **终局的那一步也要写进棋谱。** 此前这里见到 `terminal` 就整条丢弃，于是棋谱比引擎
+        # 少一步：界面显示的盘面落后一步却报"终局"，看起来就是"终局判定错了"。
+        self.record.append(records.Move(action=chosen))
         if int(step["spawn_index"]) >= 0:
             self.record.append(
                 records.SetTile(index=int(step["spawn_index"]), exponent=int(step["spawn_exponent"]))
             )
         try:
-            self._recompute()
+            self._replay()  # 引擎自己已经把局面推进过去了，这里**不再** set_root（见 _adopt）
         except records.RecordApplyError:
             # 这一步会把局面带出键表（两个 2^17 合并出 2^18）：这种局面没有任何棋谱能表示它，
             # 所以在写进棋谱之前就拒绝，并把引擎也退回原局面（见 ADR 0036 决策 6）。
             self.record[:] = before
-            self._recompute()
+            self._adopt()
             raise
         return {
-            "action": int(step["action"]),
-            "terminal": bool(step["terminal"]),
+            "action": chosen,
+            "terminal": self.terminal(),
             "spawn_index": int(step["spawn_index"]),
             "spawn_exponent": int(step["spawn_exponent"]),
             "board": self.board.tolist(),
@@ -306,7 +340,7 @@ class Session:
         if last_move is None:
             return False
         del self.record[last_move:]
-        self._recompute()
+        self._adopt()
         return True
 
     # ---- 分析 -------------------------------------------------------------------
@@ -405,6 +439,7 @@ class Session:
             "max_face": (1 << self.max_exponent) if self.max_exponent else 0,
             "legal_mask": self.legal_mask,
             "terminal": self.terminal(),
+            "empty": self.empty(),
             "strategy": self.config.strategy,
             "model_id": str(self._metadata.get("model_id", "")),
             "device": self._device.type,
@@ -419,4 +454,4 @@ class Session:
         self.record = records.load(path)
         if not self.record:
             self.record = [records.Clear()]
-        self._recompute()
+        self._adopt()

@@ -66,8 +66,7 @@ r2048::EngineConfig engine_config_from_dict(const py::dict& dict) {
     // 但它们是数据来源记录的一部分，也让续跑时的参数闸门能发现"换了设备"。
     if (dict.contains("provenance")) {
         for (const auto& item : dict["provenance"].cast<py::dict>()) {
-            config.provenance.emplace_back(item.first.cast<std::string>(),
-                                           item.second.cast<std::string>());
+            config.provenance.emplace_back(item.first.cast<std::string>(), item.second.cast<std::string>());
         }
     }
     return config;
@@ -111,8 +110,7 @@ PYBIND11_MODULE(r2048_core, m) {
         },
         py::arg("board"), py::arg("action"));
 
-    m.def("legal_mask",
-          [](const U8Array& board) { return r2048::legal_mask(board_from_array(board)); });
+    m.def("legal_mask", [](const U8Array& board) { return r2048::legal_mask(board_from_array(board)); });
 
     py::class_<r2048::BatchedEngine> engine(m, "BatchedEngine");
     engine.doc() = R"(
@@ -126,13 +124,12 @@ C++ 侧绝不逐样本调用 Python：一次决策节点展开会同时需要 1 
 
 values 是**归一化**价值（分数 / score_scale），C++ 侧换算回原始分数。
 )";
-    engine.def(py::init([](const py::dict& config, const std::string& data_dir,
-                           const std::string& batch_id, const std::string& model_id,
-                           uint64_t samples_target, uint64_t shard_samples,
+    engine.def(py::init([](const py::dict& config, const std::string& data_dir, const std::string& batch_id,
+                           const std::string& model_id, uint64_t samples_target, uint64_t shard_samples,
                            std::shared_ptr<r2048::SampleSink> sink) {
-                   return std::make_unique<r2048::BatchedEngine>(
-                       engine_config_from_dict(config), data_dir, batch_id, model_id, samples_target,
-                       shard_samples, std::move(sink));
+                   return std::make_unique<r2048::BatchedEngine>(engine_config_from_dict(config), data_dir,
+                                                                 batch_id, model_id, samples_target,
+                                                                 shard_samples, std::move(sink));
                }),
                py::arg("config"), py::arg("data_dir"), py::arg("batch_id"), py::arg("model_id"),
                py::arg("samples_target"), py::arg("shard_samples"), py::arg("sink") = nullptr);
@@ -153,85 +150,142 @@ values 是**归一化**价值（分数 / score_scale），C++ 侧换算回原始
             return out;
         });
 
-    engine.def(
-        "sink",
-        [](const r2048::BatchedEngine& self) -> std::shared_ptr<r2048::SampleSink> {
-            return self.sink();
-        },
-        "本引擎使用的共享写入侧（多线程驱动时把第一个引擎的 sink 分给其余引擎）。")
+    engine
         .def(
-        "advance",
-        [](r2048::BatchedEngine& self, uint32_t max_requests) {
-            r2048::BatchedEngine::Advance advance;
-            {
-                // 树推进是纯 C++ 计算，期间释放 GIL：多线程驱动时不会互相卡住，
-                // 也让 Python 侧可以在这段时间里继续做别的事情（例如另一批推理）。
+            "sink",
+            [](const r2048::BatchedEngine& self) -> std::shared_ptr<r2048::SampleSink> {
+                return self.sink();
+            },
+            "本引擎使用的共享写入侧（多线程驱动时把第一个引擎的 sink 分给其余引擎）。")
+        .def(
+            "advance",
+            [](r2048::BatchedEngine& self, uint32_t max_requests) {
+                r2048::BatchedEngine::Advance advance;
+                {
+                    // 树推进是纯 C++ 计算，期间释放 GIL：多线程驱动时不会互相卡住，
+                    // 也让 Python 侧可以在这段时间里继续做别的事情（例如另一批推理）。
+                    py::gil_scoped_release release;
+                    advance = self.advance(max_requests);
+                }
+                py::dict result;
+                result["request_ids"] = py::array_t<uint64_t>(
+                    static_cast<py::ssize_t>(advance.request_ids.size()), advance.request_ids.data());
+                result["request_kinds"] = py::array_t<uint8_t>(
+                    static_cast<py::ssize_t>(advance.request_kinds.size()), advance.request_kinds.data());
+                const py::ssize_t rows = static_cast<py::ssize_t>(advance.request_ids.size());
+                result["boards"] = py::array_t<uint8_t>({rows, static_cast<py::ssize_t>(r2048::kBoardCells)},
+                                                        advance.boards.data());
+                // 已结束的局用并列数组回传：一次评测可能结束上千局，逐局构造 Python 对象
+                // 会把时间花在解释器上。
+                const size_t episode_count = advance.episodes.size();
+                std::vector<uint32_t> episode_ids(episode_count);
+                std::vector<uint32_t> episode_steps(episode_count);
+                std::vector<uint32_t> episode_tiles(episode_count);
+                std::vector<uint64_t> episode_scores(episode_count);
+                for (size_t i = 0; i < episode_count; i++) {
+                    episode_ids[i] = advance.episodes[i].episode;
+                    episode_steps[i] = advance.episodes[i].steps;
+                    episode_tiles[i] = advance.episodes[i].max_exponent;
+                    episode_scores[i] = advance.episodes[i].score;
+                }
+                result["episode_ids"] =
+                    py::array_t<uint32_t>(static_cast<py::ssize_t>(episode_count), episode_ids.data());
+                result["episode_steps"] =
+                    py::array_t<uint32_t>(static_cast<py::ssize_t>(episode_count), episode_steps.data());
+                result["episode_tiles"] =
+                    py::array_t<uint32_t>(static_cast<py::ssize_t>(episode_count), episode_tiles.data());
+                result["episode_scores"] =
+                    py::array_t<uint64_t>(static_cast<py::ssize_t>(episode_count), episode_scores.data());
+                result["done"] = advance.done;
+                result["samples_written"] = advance.samples_written;
+                result["episodes_written"] = advance.episodes_written;
+                return result;
+            },
+            py::arg("max_requests"));
+
+    engine
+        .def(
+            "abandon",
+            [](r2048::BatchedEngine& self) {
                 py::gil_scoped_release release;
-                advance = self.advance(max_requests);
-            }
-            py::dict result;
-            result["request_ids"] =
-                py::array_t<uint64_t>(static_cast<py::ssize_t>(advance.request_ids.size()),
-                                      advance.request_ids.data());
-            result["request_kinds"] =
-                py::array_t<uint8_t>(static_cast<py::ssize_t>(advance.request_kinds.size()),
-                                     advance.request_kinds.data());
-            const py::ssize_t rows = static_cast<py::ssize_t>(advance.request_ids.size());
-            result["boards"] = py::array_t<uint8_t>({rows, static_cast<py::ssize_t>(r2048::kBoardCells)},
-                                                    advance.boards.data());
-            // 已结束的局用并列数组回传：一次评测可能结束上千局，逐局构造 Python 对象
-            // 会把时间花在解释器上。
-            const size_t episode_count = advance.episodes.size();
-            std::vector<uint32_t> episode_ids(episode_count);
-            std::vector<uint32_t> episode_steps(episode_count);
-            std::vector<uint32_t> episode_tiles(episode_count);
-            std::vector<uint64_t> episode_scores(episode_count);
-            for (size_t i = 0; i < episode_count; i++) {
-                episode_ids[i] = advance.episodes[i].episode;
-                episode_steps[i] = advance.episodes[i].steps;
-                episode_tiles[i] = advance.episodes[i].max_exponent;
-                episode_scores[i] = advance.episodes[i].score;
-            }
-            result["episode_ids"] = py::array_t<uint32_t>(static_cast<py::ssize_t>(episode_count),
-                                                         episode_ids.data());
-            result["episode_steps"] = py::array_t<uint32_t>(static_cast<py::ssize_t>(episode_count),
-                                                           episode_steps.data());
-            result["episode_tiles"] = py::array_t<uint32_t>(static_cast<py::ssize_t>(episode_count),
-                                                           episode_tiles.data());
-            result["episode_scores"] = py::array_t<uint64_t>(static_cast<py::ssize_t>(episode_count),
-                                                            episode_scores.data());
-            result["done"] = advance.done;
-            result["samples_written"] = advance.samples_written;
-            result["episodes_written"] = advance.episodes_written;
-            return result;
-        },
-        py::arg("max_requests"));
+                self.abandon();
+            },
+            "把当前在途请求全部重新排队（调用方丢弃了一批前向时用）。")
+        .def(
+            "submit",
+            [](r2048::BatchedEngine& self, const U64Array& ids, const F32Array& values,
+               const F32Array& policy_logits) {
+                const size_t count = static_cast<size_t>(ids.size());
+                if (values.size() != static_cast<py::ssize_t>(count)) {
+                    throw std::runtime_error("values 的长度必须与 request_ids 相同");
+                }
+                if (policy_logits.ndim() != 2 || static_cast<size_t>(policy_logits.shape(0)) != count ||
+                    policy_logits.shape(1) != r2048::kNumActions) {
+                    throw std::runtime_error("policy_logits 的形状必须是 (N, 4)");
+                }
+                {
+                    py::gil_scoped_release release;
+                    self.submit(ids.data(), values.data(), policy_logits.data(), count);
+                }
+            },
+            py::arg("request_ids"), py::arg("values"), py::arg("policy_logits"));
+
+    // ---- 会话驱动：任意局面 + 逐步走（见 ADR 0037）--------------------------------
+    //
+    // 这一组要求引擎以 `lanes==1`、`collect_samples=false` 构造（C++ 侧会自己拒绝别的
+    // 配置）。它是"一个盘面、一步一步走"的形态，用来做交互式分析与人机对局。
+    engine.def(
+        "set_root",
+        [](r2048::BatchedEngine& self, const U8Array& board) { self.set_root(board_from_array(board)); },
+        py::arg("board"),
+        "把某个局面设为会话的当前根（摆棋 / 载入棋谱 / undo 之后调用）："
+        "重置搜索树、步号与累计得分。");
 
     engine.def(
-        "abandon",
-        [](r2048::BatchedEngine& self) {
-            py::gil_scoped_release release;
-            self.abandon();
+        "begin_analysis",
+        [](r2048::BatchedEngine& self, uint32_t simulations) { self.begin_analysis(simulations); },
+        py::arg("simulations"),
+        "从当前根重新开始一次分析，预算为 simulations 次模拟。跑满后 advance 返回 done，"
+        "且**不提交动作**：只分析与自动执行前先看一眼走的是同一条路。");
+
+    engine.def(
+        "report_root",
+        [](const r2048::BatchedEngine& self) {
+            const r2048::RootReport report = self.report_root();
+            py::dict out;
+            out["legal_mask"] = report.legal_mask;
+            out["visits"] =
+                py::array_t<uint16_t>(static_cast<py::ssize_t>(r2048::kNumActions), report.visits);
+            out["q_mean"] = py::array_t<float>(static_cast<py::ssize_t>(r2048::kNumActions), report.q_mean);
+            out["one_ply"] = py::array_t<float>(static_cast<py::ssize_t>(r2048::kNumActions), report.one_ply);
+            out["prior"] = py::array_t<float>(static_cast<py::ssize_t>(r2048::kNumActions), report.prior);
+            out["root_value"] = report.root_value;
+            out["simulations"] = report.simulations;
+            out["best_action"] = report.best_action;
+            return out;
         },
-        "把当前在途请求全部重新排队（调用方丢弃了一批前向时用）。")
-        .def(
-        "submit",
-        [](r2048::BatchedEngine& self, const U64Array& ids, const F32Array& values,
-           const F32Array& policy_logits) {
-            const size_t count = static_cast<size_t>(ids.size());
-            if (values.size() != static_cast<py::ssize_t>(count)) {
-                throw std::runtime_error("values 的长度必须与 request_ids 相同");
-            }
-            if (policy_logits.ndim() != 2 || static_cast<size_t>(policy_logits.shape(0)) != count ||
-                policy_logits.shape(1) != r2048::kNumActions) {
-                throw std::runtime_error("policy_logits 的形状必须是 (N, 4)");
-            }
-            {
-                py::gil_scoped_release release;
-                self.submit(ids.data(), values.data(), policy_logits.data(), count);
-            }
+        "读当前根的统计：每方向的访问数 / 边均值 Q / 一次性估计 r+A / 先验 / 根值。\n"
+        "这些数就是引擎选招时读的那些（同一次计算），因此面板与选招不会有两套口径。");
+
+    engine.def(
+        "commit_step",
+        [](r2048::BatchedEngine& self, int action) {
+            const r2048::StepResult step = self.commit_step(action);
+            py::dict out;
+            out["action"] = step.action;
+            out["board"] = py::array_t<uint8_t>(static_cast<py::ssize_t>(r2048::kBoardCells), step.board);
+            out["spawn_index"] = step.spawn_index;
+            out["spawn_exponent"] = step.spawn_exponent;
+            out["score_delta"] = step.score_delta;
+            out["total_score"] = step.total_score;
+            out["step"] = step.step;
+            out["terminal"] = step.terminal;
+            return out;
         },
-        py::arg("request_ids"), py::arg("values"), py::arg("policy_logits"));
+        py::arg("action"),
+        "走一步并提交：action>=0 为指定方向（玩家模式），action<0 由引擎按 decision_mode 选。\n"
+        "**生成块由引擎自己生成并回报**（spawn_index / spawn_exponent），"
+        "所以方块生成规则仍然只有 C++ 一处实现。");
 
     engine.def("stats", [](const r2048::BatchedEngine& self) {
         const r2048::EngineStats stats = self.stats();
@@ -289,13 +343,10 @@ values 是**归一化**价值（分数 / score_scale），C++ 侧换算回原始
     });
 
     engine.def(
-        "request_stop",
-        [](r2048::BatchedEngine& self) { self.request_stop(); },
+        "request_stop", [](r2048::BatchedEngine& self) { self.request_stop(); },
         "请求在下一个合法停车点（局与局之间）停下并收尾：正在进行的局一定走完。\n"
         "Python 侧收到 KeyboardInterrupt 时走这条路，尾部数据因此不会丢。");
-    engine.def("stop_requested", [](const r2048::BatchedEngine& self) {
-        return self.stop_requested();
-    });
+    engine.def("stop_requested", [](const r2048::BatchedEngine& self) { return self.stop_requested(); });
 
     engine.def(
         "finish",

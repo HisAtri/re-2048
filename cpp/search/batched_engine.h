@@ -27,17 +27,17 @@ enum DecisionMode : uint8_t {
 };
 
 struct EngineConfig {
-    uint32_t lanes = 8;              // 同时在跑的局数
-    uint32_t simulations = 64;       // 每步的模拟次数
+    uint32_t lanes = 8;         // 同时在跑的局数
+    uint32_t simulations = 64;  // 每步的模拟次数
     // 每个 lane 允许同时在途的模拟数。这是吞吐的关键旋钮：
     // 每次模拟都要先算一个叶子，如果在途只有 1 个，整条流水线就退化成
     // “算一个叶子 → 等一次 GPU 往返 → 再算下一个”，GPU 批次小到几行、CPU 全程等。
     // 允许在途多个之后，一次前向能覆盖 lanes × in_flight 个叶子（再乘上每个
     // 展开节点自带的 5 个局面），CPU 搜索与 GPU 推理才真正重叠起来。
     uint32_t in_flight_per_lane = 8;
-    float c_puct = 1.5f;             // PUCT 探索系数
-    uint32_t temperature_moves = 30; // 开局多少步按访问分布采样
-    float temperature = 1.0f;        // 访问数开 1/T 次幂后采样；0 表示直接取最大
+    float c_puct = 1.5f;              // PUCT 探索系数
+    uint32_t temperature_moves = 30;  // 开局多少步按访问分布采样
+    float temperature = 1.0f;         // 访问数开 1/T 次幂后采样；0 表示直接取最大
     // 搜索线程数（= K 个引擎，各持一份叶子缓存，共用一个写入侧与一个合并推理线程）。
     // C++ 侧**不再读它**——并行由 Python 侧驱动（见 ADR 0028）；保留在配置里是因为它会改变
     // 调度与批组成（ADR 0017），因此必须进协议参数与数据来源身份。
@@ -86,9 +86,9 @@ struct EngineStats {
 
     // 缓存命中率按“叶子求值无需请求”的比例计算：这是真正省掉的跨语言往返。
     double leaf_cache_rate() const {
-        return leaf_evaluations == 0 ? 0.0
-                                     : static_cast<double>(leaf_from_cache) /
-                                           static_cast<double>(leaf_evaluations);
+        return leaf_evaluations == 0
+                   ? 0.0
+                   : static_cast<double>(leaf_from_cache) / static_cast<double>(leaf_evaluations);
     }
 };
 
@@ -99,6 +99,34 @@ struct FinishResult {
     BatchState state = BatchState::kStopped;
     uint64_t samples = 0;
     uint32_t episodes = 0;
+};
+
+// 交互式会话的根局面报告：每个方向的访问数、边均值 Q、一次性估计（r + A）与先验，
+// 外加根节点对 V(s) 的估计。字段与 `finish_step` 决策时读的是同一批数——所以
+// "面板上看到的"与"引擎选招用到的"必然一致，不会出现两套口径。
+struct RootReport {
+    uint8_t legal_mask = 0;
+    uint16_t visits[kNumActions] = {0, 0, 0, 0};
+    // 含立即得分的边均值 Q；未访问的边退回一次性估计（与候选目标的写法一致）。
+    float q_mean[kNumActions] = {0, 0, 0, 0};
+    float one_ply[kNumActions] = {0, 0, 0, 0};
+    float prior[kNumActions] = {0, 0, 0, 0};
+    float root_value = 0.0f;
+    uint32_t simulations = 0;  // 根实际完成的模拟数（时间上限下可能小于预算）
+    int best_action = -1;      // 访问数最大；并列取编号更小者
+};
+
+// 一步提交的结果。**生成块由引擎自己生成并在这里回报**，所以"方块生成规则"仍然只有
+// C++ 一处实现——会话（含人机对局的玩家模式）不必在 Python 侧再实现一遍。
+struct StepResult {
+    int action = -1;
+    uint8_t board[kBoardCells] = {};
+    int spawn_index = -1;  // 生成的块落在哪一格；终局或异常时为 -1
+    uint8_t spawn_exponent = 0;
+    uint64_t score_delta = 0;
+    uint64_t total_score = 0;
+    uint32_t step = 0;
+    bool terminal = false;
 };
 
 // 批量 NN-MCTS 自对弈引擎：C++ 持有多局并发生成的全部状态，Python 只负责神经网络。
@@ -115,13 +143,13 @@ struct FinishResult {
 //   * 并行放在“CPU 搜索 ∥ GPU 推理”这条流水线上：lane 之间顺序推进，但在途多条模拟
 //     保证了每次前向都有几百行的批；实测 advance 只占管线时间约 5%（见 ADR 0003）。
 class BatchedEngine {
-public:
+ public:
     struct Advance {
         std::vector<uint64_t> request_ids;
         std::vector<uint8_t> request_kinds;
-        std::vector<uint8_t> boards;  // N×16 行优先的指数棋盘
+        std::vector<uint8_t> boards;          // N×16 行优先的指数棋盘
         std::vector<EpisodeResult> episodes;  // 自上次 advance 以来结束的局
-        bool done = false;            // 已完成目标，可以收尾
+        bool done = false;                    // 已完成目标，可以收尾
         uint64_t samples_written = 0;
         uint32_t episodes_written = 0;
     };
@@ -156,6 +184,37 @@ public:
     // 搜索继续推进不依赖这些叶子的模拟），所以引擎不再自动补发——那会把正在计算的批次
     // 当成丢失的重复发一遍。异常路径（Ctrl-C 落在前向里、回调抛异常）由调用方调它。
     void abandon();
+
+    // ---- 会话驱动：任意局面 + 逐步走（交互式分析与人机对局，见 ADR 0037）----------
+    //
+    // 与上面的**整局驱动互不影响**：并发跑局与评测的行为一字不变（既有调用点一行没改）。
+    // 这一组只对 lane 0 生效，并要求 `lanes == 1` 且 `collect_samples == false`（违反即抛），
+    // 因为会话是"一个盘面、一步一步走"的形态，而不是并发跑多局。
+    //
+    // 用法是三步循环：
+    //     set_root(board)                    // 外部改变了盘面（摆棋、导入、undo）
+    //     begin_analysis(budget) → 反复 advance/submit 直到 done
+    //     report_root()                      // 看分析（不提交）
+    //     commit_step(action)                // 走一步（action<0 = 由引擎从分析结果里选）
+    //
+    // 时间上限**不在这里**：它由调用方在 advance 循环里看表（到点就停手读 report_root），
+    // 于是 C++ 不需要引入墙钟代码。时间上限下 report_root 给出的是"到目前为止"的结果，
+    // 这由 `RootReport::simulations` 如实反映。
+
+    // 把某个局面设为会话的当前根（替换开局派生）：摆棋、载入棋谱、undo 之后调用。
+    // 会重置搜索树、步号与累计得分——它标记的是"盘面被外部改过"。
+    void set_root(const Board& board);
+
+    // 从**当前**根局面重新开始一次分析，预算为 simulations 次模拟；跑满后 advance 返回
+    // done 且**不提交动作**（这正是"只分析"与"自动执行前先看一眼"共用的那一步）。
+    void begin_analysis(uint32_t simulations);
+
+    // 读当前根局面的统计。不推进搜索；只在 begin_analysis 之后（或在时间上限处中断后）有意义。
+    RootReport report_root() const;
+
+    // 走一步并提交：action >= 0 为指定方向（玩家模式），action < 0 表示由引擎按
+    // `decision_mode` 从当前根（通常是刚分析完的那棵树）里选。
+    StepResult commit_step(int action);
 
     EngineStats stats() const;
 
@@ -202,7 +261,7 @@ public:
     // 达到目标或被叫停后收尾：写完最后一个分片并落 manifest，返回 manifest 路径与终态。
     FinishResult finish();
 
-private:
+ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

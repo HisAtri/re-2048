@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <unordered_set>
@@ -49,6 +50,24 @@ struct SyntheticDriver {
     }
 };
 
+// 驱动一次"会话分析"：begin_analysis 之后反复 advance/submit，直到引擎说 done。
+// 合成结果（价值恒 0、先验均匀）让报告里的数可以被精确断言。
+bool run_analysis(BatchedEngine& engine, uint32_t budget) {
+    engine.begin_analysis(budget);
+    for (uint64_t round = 0; round < 200000; round++) {
+        const BatchedEngine::Advance advance = engine.advance(4096);
+        const size_t count = advance.request_ids.size();
+        if (count > 0) {
+            std::vector<float> values(count, 0.0f);
+            std::vector<float> logits(count * kNumActions, 0.0f);
+            engine.submit(advance.request_ids.data(), values.data(), logits.data(), count);
+            continue;
+        }
+        return advance.done;
+    }
+    return false;
+}
+
 std::vector<uint8_t> read_binary_for_test(const std::string& path) {
     FILE* file = std::fopen(path.c_str(), "rb");
     if (file == nullptr) throw std::runtime_error("无法打开 " + path);
@@ -63,7 +82,7 @@ std::vector<uint8_t> read_binary_for_test(const std::string& path) {
 }
 
 class TempDir {
-public:
+ public:
     explicit TempDir(const std::string& name) {
         path_ = (std::filesystem::temp_directory_path() / ("r2048-engine-" + name)).string();
         std::filesystem::remove_all(path_);
@@ -74,7 +93,7 @@ public:
     }
     std::string sub(const std::string& name) const { return path_ + "/" + name; }
 
-private:
+ private:
     std::string path_;
 };
 
@@ -153,7 +172,6 @@ TEST(engine_is_deterministic_for_same_config) {
     expect_true(!hashes_first.empty(), "至少产出一个分片");
     expect_true(hashes_first == hashes_second, "同配置两次运行的每个分片哈希都相同");
 }
-
 
 TEST(engine_abandon_requeues_dropped_batch) {
     // 一次被丢掉的前向必须能被补救：Ctrl-C 恰好落在前向里、Python 侧回调抛异常、
@@ -249,11 +267,11 @@ TEST(engine_two_engines_share_one_sink) {
     // 这条不成立的话，多线程搜索就会把一批数据拆成 K 份（用户明确否掉的那种"很乱"）。
     TempDir dir("shared_sink");
     EngineConfig config;
-    config.lanes = 4;              // 每个引擎 4 条 lane
-    config.lanes_total = 8;        // 整批 8 条（清单与协议参数记这个）
+    config.lanes = 4;        // 每个引擎 4 条 lane
+    config.lanes_total = 8;  // 整批 8 条（清单与协议参数记这个）
     config.simulations = 8;
     config.in_flight_per_lane = 2;
-    config.search_threads = 2;     // Python 侧的搜索线程数，进协议参数
+    config.search_threads = 2;  // Python 侧的搜索线程数，进协议参数
     config.cache_entries = 1 << 12;
     config.seed = 4242;
 
@@ -427,8 +445,7 @@ TEST(engine_search_mode_is_unaffected_by_eval_switch) {
     expect_equal_u64(episodes, 2, "跑满两局");
     const EngineStats stats = engine.stats();
     expect_equal_u64(stats.samples, 0, "没有写入任何样本");
-    expect_true(stats.simulations == steps * config.simulations,
-                "搜索模式下模拟次数 = 步数 × 每步模拟次数");
+    expect_true(stats.simulations == steps * config.simulations, "搜索模式下模拟次数 = 步数 × 每步模拟次数");
 }
 
 TEST(engine_records_candidate_targets) {
@@ -449,19 +466,18 @@ TEST(engine_records_candidate_targets) {
     engine.finish();
 
     const BatchManifest manifest = read_manifest(dir.sub("batch"));
-    const std::vector<uint8_t> raw = read_binary_for_test(dir.sub("batch") + "/" + manifest.shards.front().path);
+    const std::vector<uint8_t> raw =
+        read_binary_for_test(dir.sub("batch") + "/" + manifest.shards.front().path);
     int checked = 0;
     for (size_t offset = 0; offset + kSampleBytes <= raw.size(); offset += kSampleBytes) {
         const Sample sample = decode_sample(raw.data() + offset);
         int legal = 0;
         for (int action = 0; action < kNumActions; action++) legal += (sample.legal_mask >> action) & 1;
-        expect_equal_u64(sample.candidates.count, static_cast<uint64_t>(legal),
-                         "候选数量等于合法方向数");
+        expect_equal_u64(sample.candidates.count, static_cast<uint64_t>(legal), "候选数量等于合法方向数");
         for (int action = 0; action < kNumActions; action++) {
             if (((sample.legal_mask >> action) & 1) == 0) continue;
             const MoveOutcome outcome = apply_move(sample.decision, action);
-            expect_true(sample.candidates.afterstate[action] == outcome.board,
-                        "候选 afterstate 与规则一致");
+            expect_true(sample.candidates.afterstate[action] == outcome.board, "候选 afterstate 与规则一致");
             expect_equal_u64(sample.candidates.reward[action], outcome.score, "候选立即得分与规则一致");
             // 候选访问数与主记录的根访问数必须一致：两者独立写入，交叉核对能发现
             // “候选块按错的边填”这类错位。
@@ -471,6 +487,200 @@ TEST(engine_records_candidate_targets) {
         }
     }
     expect_true(checked > 0, "至少要检查到一条候选");
+}
+
+// ---- 会话驱动：任意局面 + 逐步走（ADR 0037）--------------------------------------
+//
+// 这一组测的是"从外部给定的局面起搜、一步一步走"这条路径。它此前完全不存在：整局驱动
+// 每局都必须从 `opening_board` 派生，分析中间态也没有出口——而界面要回答的恰好是
+// "这个盘面怎么样""AI 在这里会怎么走"。既有的六条整局驱动用例一条没改，就是这条路径
+// 不影响它们的证据。
+
+TEST(engine_session_analyzes_an_arbitrary_root) {
+    EngineConfig config;
+    config.lanes = 1;  // 会话只对一个盘面工作
+    config.simulations = 16;
+    config.in_flight_per_lane = 4;
+    config.cache_entries = 1 << 12;
+    config.seed = 20261008;
+    config.temperature = 0.0f;       // 选招取最大访问数（不要开局采样），便于断言
+    config.collect_samples = false;  // 会话不落样本
+    BatchedEngine engine(config, "", "", "synthetic", 0, 0);
+
+    Board root = Board::empty();
+    root.tiles[0] = 1;
+    root.tiles[5] = 2;
+    root.tiles[10] = 3;
+    engine.set_root(root);
+
+    engine.begin_analysis(16);
+    bool saw_root = false;
+    uint64_t round = 0;
+    for (; round < 200000; round++) {
+        const BatchedEngine::Advance advance = engine.advance(4096);
+        for (size_t i = 0; i < advance.request_ids.size(); i++) {
+            Board requested;
+            std::memcpy(requested.tiles, advance.boards.data() + i * kBoardCells, kBoardCells);
+            if (requested == root) saw_root = true;
+        }
+        const size_t count = advance.request_ids.size();
+        if (count > 0) {
+            std::vector<float> values(count, 0.0f);
+            std::vector<float> logits(count * kNumActions, 0.0f);
+            engine.submit(advance.request_ids.data(), values.data(), logits.data(), count);
+            continue;
+        }
+        if (advance.done) break;
+        expect_true(false, "分析既没有请求也没有完成：引擎不可能自行前进");
+        break;
+    }
+    expect_true(round < 200000, "分析应当在有限轮次内跑满预算");
+    expect_true(saw_root, "给定的根局面必须真的被求值过（请求里要出现它）");
+
+    const RootReport report = engine.report_root();
+    expect_equal_u64(report.simulations, 16, "根上完成的模拟数等于预算");
+    uint32_t total = 0;
+    for (int action = 0; action < kNumActions; action++) total += report.visits[action];
+    // 访问数之和比预算少 1：**恰好一条模拟用来求值根本身**（它停在根上，一条边都没走过）。
+    // 这是"根节点还没被求值时只允许一条在途模拟"那条保护的结果（见 pump_lane_range），
+    // 与整局驱动同源；写成 `total + 1 == simulations` 就是在钉"只丢一条、不多丢"。
+    expect_equal_u64(static_cast<uint64_t>(total) + 1, report.simulations,
+                     "各方向访问数之和 = 模拟数 − 1（恰好一条模拟用于求值根）");
+    expect_equal_u64(report.legal_mask, legal_mask(root), "合法掩码来自给定的盘面");
+    expect_true(report.best_action >= 0, "预算跑满后必须有一个被访问的方向");
+}
+
+TEST(engine_session_commit_step_spawns_and_reports_it) {
+    // 玩家模式：按**给定**方向走一步。生成块由引擎自己生成并回报，所以"方块生成规则"
+    // 仍然只有 C++ 一处实现——Python 侧不需要再实现一遍 90%/10% 的那些细节。
+    EngineConfig config;
+    config.lanes = 1;
+    config.simulations = 8;
+    config.in_flight_per_lane = 2;
+    config.cache_entries = 1 << 12;
+    config.seed = 777;
+    config.collect_samples = false;
+    BatchedEngine engine(config, "", "", "synthetic", 0, 0);
+
+    Board root = Board::empty();
+    root.tiles[1] = 1;  // b1
+    root.tiles[3] = 1;  // d1：与 b1 同行，左移会合并
+    root.tiles[8] = 2;  // a3
+    engine.set_root(root);
+
+    const MoveOutcome expected = apply_move(root, kLeft);
+    expect_true(expected.valid, "这条用例的前提是左移合法");
+    const StepResult step = engine.commit_step(kLeft);
+    expect_equal_u64(static_cast<uint64_t>(step.action), static_cast<uint64_t>(kLeft),
+                     "回报的方向就是给定方向");
+    expect_equal_u64(step.score_delta, expected.score, "得分增量与规则一致");
+    expect_equal_u64(step.step, 1, "会话的步号从 1 开始");
+    expect_equal_u64(step.total_score, expected.score, "累计得分");
+    expect_true(!step.terminal, "盘面还很大，不该终局");
+
+    Board after;
+    std::memcpy(after.tiles, step.board, kBoardCells);
+    int differing = 0;
+    for (int cell = 0; cell < kBoardCells; cell++) {
+        if (after.tiles[cell] == expected.board.tiles[cell]) continue;
+        differing++;
+        expect_equal_u64(static_cast<uint64_t>(cell), static_cast<uint64_t>(step.spawn_index),
+                         "与 afterstate 不同的那格就是回报的生成位置");
+        expect_equal_u64(expected.board.tiles[cell], 0, "生成块落在空格上");
+        expect_equal_u64(after.tiles[cell], step.spawn_exponent, "回报的生成块数值");
+        expect_true(after.tiles[cell] == 1 || after.tiles[cell] == 2, "只会生成 2（指数 1）或 4（指数 2）");
+    }
+    expect_equal_u64(differing, 1, "一步之后与 afterstate 恰好只差生成的那一格");
+}
+
+TEST(engine_session_auto_choice_matches_the_report) {
+    // 面板上显示的"引擎选了哪个方向"必须与引擎真的走的那一步一致——两者读的是同一份根
+    // 统计。这条一旦不成立，界面就在骗人，而且骗得看不出来。
+    EngineConfig config;
+    config.lanes = 1;
+    config.simulations = 16;
+    config.in_flight_per_lane = 4;
+    config.cache_entries = 1 << 12;
+    config.seed = 4242;
+    config.temperature = 0.0f;  // 否则开局步按访问分布采样，就不等于 argmax
+    config.collect_samples = false;
+    BatchedEngine engine(config, "", "", "synthetic", 0, 0);
+
+    Board root = Board::empty();
+    root.tiles[0] = 1;
+    root.tiles[6] = 2;
+    root.tiles[11] = 3;
+    engine.set_root(root);
+    expect_true(run_analysis(engine, 16), "分析应当跑满预算");
+
+    const RootReport report = engine.report_root();
+    expect_true(report.best_action >= 0, "分析之后必须有一个最佳方向");
+    const StepResult step = engine.commit_step(-1);
+    expect_equal_u64(static_cast<uint64_t>(step.action), static_cast<uint64_t>(report.best_action),
+                     "引擎自己选的方向必须等于面板上显示的最佳方向");
+    expect_true(!step.terminal, "这一步不该把盘面走死");
+}
+
+TEST(engine_session_terminal_step_does_not_open_a_new_game) {
+    // 会话里终局就是收工：绝不能因为 `needs_new_episode` 让 pump 去开新局——那会把用户
+    // 面前的残局悄悄换成一副随机开局，而看起来只是"棋盘忽然变了"。
+    EngineConfig config;
+    config.lanes = 1;
+    config.simulations = 8;
+    config.cache_entries = 1 << 10;
+    config.collect_samples = false;
+    BatchedEngine engine(config, "", "", "synthetic", 0, 0);
+
+    // 相邻两格互不相同且没有空格：无合并、无移动 → 终局。
+    const uint8_t pattern[kBoardCells] = {1, 2, 1, 2, 2, 1, 2, 1, 1, 2, 1, 2, 2, 1, 2, 1};
+    Board terminal = Board::empty();
+    for (int cell = 0; cell < kBoardCells; cell++) terminal.tiles[cell] = pattern[cell];
+    expect_equal_u64(legal_mask(terminal), 0, "这条用例的前提是该局面真的终局");
+
+    engine.set_root(terminal);
+    const StepResult step = engine.commit_step(-1);
+    expect_true(step.terminal, "终局局面必须回报终局");
+    expect_true(step.action == -1, "终局没有动作");
+    expect_equal_u64(step.spawn_index, static_cast<uint64_t>(-1), "终局不生成块");
+
+    // 终局之后再跑一轮：既不该有新请求（那会指向别的盘面），也不该冒出一局新对局。
+    const BatchedEngine::Advance advance = engine.advance(4096);
+    expect_true(advance.request_ids.empty(), "终局后不该再产生请求");
+    expect_true(advance.episodes.empty(), "终局后不该冒出一局新的对局");
+
+    // 重新摆一个盘面（set_root）之后又能工作——终局是可恢复的，不是卡死。
+    Board fresh = Board::empty();
+    fresh.tiles[5] = 1;
+    engine.set_root(fresh);
+    const StepResult resumed = engine.commit_step(kDown);
+    expect_true(!resumed.terminal, "换成正常盘面后应当能继续走");
+    expect_equal_u64(resumed.step, 1, "set_root 会把步号复位");
+}
+
+TEST(engine_session_rejects_batch_configurations) {
+    // 会话是"一个盘面、一步一步走"，与并发跑局互斥。配错时必须立刻拒绝：静默接受会让
+    // 调用方以为自己在逐步走，实际引擎却在并发跑局（而且多 lane 下"当前盘面"根本不是单数）。
+    TempDir dir("session-guard");
+    EngineConfig multi;
+    multi.lanes = 2;
+    multi.simulations = 8;
+    multi.cache_entries = 1 << 10;
+    multi.collect_samples = false;
+    BatchedEngine wide(multi, "", "", "synthetic", 0, 0);
+    expect_contains(catch_message([&] { wide.set_root(Board::empty()); }), "lanes==1",
+                    "多 lane 配置必须被拒绝");
+    expect_contains(catch_message([&] { wide.begin_analysis(4); }), "lanes==1", "同上");
+    expect_contains(catch_message([&] { wide.report_root(); }), "lanes==1", "同上");
+    expect_contains(catch_message([&] { wide.commit_step(-1); }), "lanes==1", "同上");
+
+    EngineConfig sampling;
+    sampling.lanes = 1;
+    sampling.simulations = 8;
+    sampling.cache_entries = 1 << 10;
+    sampling.collect_samples = true;  // 错的：会话不落样本
+    BatchedEngine collector(sampling, dir.sub("batch"), "guard", "synthetic", 100, 100);
+    expect_contains(catch_message([&] { collector.set_root(Board::empty()); }), "不落样本",
+                    "落样本的配置必须被拒绝");
 }
 
 }  // namespace r2048::tests

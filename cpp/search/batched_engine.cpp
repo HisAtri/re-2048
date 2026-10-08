@@ -6,10 +6,10 @@
 #include <cmath>
 #include <cstring>
 #include <map>
-#include <unordered_map>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 
 #include "core/control.h"
 #include "core/fileio.h"
@@ -60,6 +60,15 @@ struct BatchedEngine::Impl {
         uint32_t leaf = 0;
     };
 
+    // 一次动作提交的结果（会话要用：生成块落在哪、生成块多大、这一步得多少分、是否终局）。
+    struct AppliedStep {
+        int action = -1;
+        int spawn_index = -1;
+        uint8_t spawn_exponent = 0;
+        uint64_t score_delta = 0;
+        bool terminal = false;
+    };
+
     struct Lane {
         uint32_t episode = 0;
         Board board;
@@ -99,15 +108,16 @@ struct BatchedEngine::Impl {
         control.set_sticky(config.join);  // 多写者：一条 stop 要停整批（见 Control::set_sticky）
         if (config.collect_samples) {
             if (config.resume && config.join) {
-                throw std::runtime_error("--continue 与 --join 互斥：前者是顺序续写上一段，"
-                                         "后者是加入别人正在写的批次");
+                throw std::runtime_error(
+                    "--continue 与 --join 互斥：前者是顺序续写上一段，"
+                    "后者是加入别人正在写的批次");
             }
             if (!sink) {
-                const SampleSink::Mode mode = config.join    ? SampleSink::Mode::kJoin
+                const SampleSink::Mode mode = config.join     ? SampleSink::Mode::kJoin
                                               : config.resume ? SampleSink::Mode::kResume
                                                               : SampleSink::Mode::kNew;
                 sink = std::make_shared<SampleSink>(data_dir, build_meta(), samples_target_in,
-                                                   shard_samples_in, mode);
+                                                    shard_samples_in, mode);
             }
             // lane 的起始局号从共享写入侧取：续跑时接着清单里的局数，新批从 0 开始。
             next_episode.store(sink->peek_next_episode());
@@ -136,8 +146,8 @@ struct BatchedEngine::Impl {
         meta.model_id = model_id;
         // 这些参数会改变搜索树的演化，因此属于数据生成协议的一部分，必须记录下来。
         meta.params.emplace_back("c_puct", std::to_string(config.c_puct));
-        meta.params.emplace_back("lanes", std::to_string(config.lanes_total > 0 ? config.lanes_total
-                                                                                 : config.lanes));
+        meta.params.emplace_back("lanes",
+                                 std::to_string(config.lanes_total > 0 ? config.lanes_total : config.lanes));
         meta.params.emplace_back("in_flight_per_lane", std::to_string(config.in_flight_per_lane));
         meta.params.emplace_back("search_threads", std::to_string(config.search_threads));
         meta.params.emplace_back("temperature", std::to_string(config.temperature));
@@ -169,8 +179,7 @@ struct BatchedEngine::Impl {
     };
 
     size_t cache_slot_of(const uint8_t* board, uint8_t kind) const {
-        const uint64_t mixed =
-            board_hash(board) ^ (static_cast<uint64_t>(kind) * 0x9e3779b97f4a7c15ull);
+        const uint64_t mixed = board_hash(board) ^ (static_cast<uint64_t>(kind) * 0x9e3779b97f4a7c15ull);
         // 用高位做索引：乘法型混合器的高位熵更好。
         return static_cast<size_t>(mixed >> 32) & cache_mask;
     }
@@ -205,7 +214,8 @@ struct BatchedEngine::Impl {
         if (found == fresh_answers.end()) return false;
         if (value != nullptr) *value = found->second.value;
         if (logits != nullptr) {
-            for (int action = 0; action < kNumActions; action++) logits[action] = found->second.logits[action];
+            for (int action = 0; action < kNumActions; action++)
+                logits[action] = found->second.logits[action];
         }
         return true;
     }
@@ -267,8 +277,7 @@ struct BatchedEngine::Impl {
 
     // ---------------- 对局与搜索树 ----------------
 
-    uint32_t add_node(Lane& lane, const Board& board, NodeKind kind, uint32_t parent,
-                      uint8_t parent_action) {
+    uint32_t add_node(Lane& lane, const Board& board, NodeKind kind, uint32_t parent, uint8_t parent_action) {
         Node node;
         node.board = board;
         node.kind = static_cast<uint8_t>(kind);
@@ -290,7 +299,9 @@ struct BatchedEngine::Impl {
     }
 
     // 贪心模式不做树搜索，只需要把根局面求值一次（拿到先验与各 afterstate 的价值）。
+    // 分析模式下预算由会话给（只分析、以及自动执行前先看一眼，都走同一条路）。
     uint32_t effective_simulations() const {
+        if (analysis_active) return analysis_budget;
         return config.decision_mode == kDecisionSearch ? config.simulations : 1;
     }
 
@@ -335,8 +346,6 @@ struct BatchedEngine::Impl {
         }
         return cache_get(node.board, kRequestValue, nullptr, nullptr);
     }
-
-
 
     // 发出这个叶子缺失的请求。
     //
@@ -613,14 +622,22 @@ struct BatchedEngine::Impl {
         }
     }
 
-    void finish_step(Lane& lane) {
+    // 把根的边访问数压进 u16。选招（按访问分布采样）与样本记录（候选块的访问数）用的是
+    // 同一份数，所以抽出来——两处各算一遍的话，口径迟早会分叉。
+    static void root_visits_u16(const Node& root, uint16_t out[kNumActions]) {
+        for (int action = 0; action < kNumActions; action++) {
+            out[action] = static_cast<uint16_t>(std::min<uint32_t>(root.edge_visits[action], 0xFFFF));
+        }
+    }
+
+    // 选出这一步要走的方向。与提交分开（apply_action），是为了让会话能"按指定动作提交"
+    // （玩家模式）而仍然走同一条提交路径——规则与方块生成因此只有一处实现（ADR 0037）。
+    int select_action(const Lane& lane) const {
         const Node& root = lane.nodes[0];
         uint16_t visits[kNumActions] = {0, 0, 0, 0};
+        root_visits_u16(root, visits);
         uint32_t total_visits = 0;
-        for (int action = 0; action < kNumActions; action++) {
-            visits[action] = static_cast<uint16_t>(std::min<uint32_t>(root.edge_visits[action], 0xFFFF));
-            total_visits += visits[action];
-        }
+        for (int action = 0; action < kNumActions; action++) total_visits += visits[action];
 
         int action = -1;
         if (config.decision_mode == kDecisionValueGreedy) {
@@ -676,9 +693,20 @@ struct BatchedEngine::Impl {
             }
         }
         if (action < 0) throw std::runtime_error("无法为本步选出任何方向");
+        return action;
+    }
 
+    // 应用一个动作：移动 → 生成块 → 步进 → 终局判定。返回生成块的位置与数值、得分增量
+    // 与终局标志——会话要用它们（玩家模式落子后要知道生成了什么，界面要显示出来）。
+    AppliedStep apply_action(Lane& lane, int action) {
+        AppliedStep applied;
+        applied.action = action;
         const MoveOutcome move = apply_move(lane.board, action);
         if (config.collect_samples) {
+            // 决策时的根统计：候选标签就是从这些数来的。会话不落样本，所以这段只在整局驱动里跑。
+            const Node& root = lane.nodes[0];
+            uint16_t visits[kNumActions] = {0, 0, 0, 0};
+            root_visits_u16(root, visits);
             // 候选级监督：为每个合法方向写一条候选目标 A(u_a) = Q̄(a) − r(s,a)。
             // 引擎每条边的 Q 累加的是 r + A，因此减掉立即得分就是该候选 afterstate 的价值，
             // 与价值头的预测对象同构。未被搜索访问的边退回一次性估计（它的访问数是 0，
@@ -700,13 +728,23 @@ struct BatchedEngine::Impl {
             lane.recorder.add(lane.board, move.board, action, lane.legal_mask,
                               static_cast<uint32_t>(move.score), visits, &candidates);
         }
+        applied.score_delta = move.score;
         lane.total_score += move.score;
         const int exponent = move.board.max_exponent();
         lane.max_exponent = exponent > lane.max_exponent ? exponent : lane.max_exponent;
         lane.board = move.board;
+        // 留一份 afterstate 用于比对生成块：spawn_tile 只在空格落子，所以两盘只差一格。
+        const Board afterstate = move.board;
 
         Rng rng(derive_seed(config.seed, kSaltEnvironment, lane.episode, lane.step + 1, 0));
         spawn_tile(lane.board, rng);
+        for (int cell = 0; cell < kBoardCells; cell++) {
+            if (lane.board.tiles[cell] != afterstate.tiles[cell]) {
+                applied.spawn_index = cell;
+                applied.spawn_exponent = lane.board.tiles[cell];
+                break;
+            }
+        }
 
         lane.step++;
         lane.legal_mask = legal_mask(lane.board);
@@ -732,10 +770,15 @@ struct BatchedEngine::Impl {
             // 只在这里（一局结束时）允许停下：正在进行的局必须走完，
             // 否则会留下“清单需要的局号永远不出现”的空洞，写入侧就会卡在半途。
             lane.needs_new_episode = true;
-            return;
+            applied.terminal = true;
+            return applied;
         }
         reset_tree(lane);
+        return applied;
     }
+
+    // 整局驱动的一步：选方向 + 提交。既有调用点（pump_lane_range）因此一行没改。
+    void finish_step(Lane& lane) { apply_action(lane, select_action(lane)); }
 
     // 是否按样本目标停止。**样本目标为 0 表示不限量**：此时只有控制通道能叫停，
     // 绝不能让 `0 >= 0` 这种比较把一批数据判成“目标已达成”。
@@ -774,62 +817,69 @@ struct BatchedEngine::Impl {
             Lane& lane = lanes[lane_index];
             if (lane.finished) continue;
             bool progressed = false;
-                while (!lane.finished) {
-                    if (lane.needs_new_episode) {
-                        // 换局处才是合法的停车点：目标达成后不再开新局，
-                        // 但已经开始的局一定走完。
-                        if (stopping()) {
-                            lane.finished = true;
-                            break;
-                        }
-                        if (config.episodes_target > 0 && next_episode.load() >= config.episodes_target) {
-                            lane.finished = true;
-                            break;
-                        }
-                        start_episode(lane);
-                    }
-                    // 先把结果已就绪的挂起模拟结算掉，再继续铺设新的模拟。
-                    if (resolve_ready(lane) > 0) progressed = true;
-
-                    if (lane.simulations_done >= effective_simulations()) {
-                        finish_step(lane);
-                        progressed = true;
-                        continue;
-                    }
-                    // 根节点还没被求值时只允许一条在途模拟：否则第一轮会把 in_flight 条
-                    // 模拟全派到同一个新鲜根上，它们都停在根上求值、一条边都没走过——
-                    // 这些模拟既没参与搜索，也让根访问数之和少于模拟次数（实测
-                    // in_flight=8 时只有 56/64，等于每个决策步浪费 12.5% 的预算）。
-                    const bool root_unexpanded = !lane.nodes.empty() && lane.nodes[0].state != kEvaluated;
-                    if (lane.pending.size() >= config.in_flight_per_lane ||
-                        (root_unexpanded && !lane.pending.empty()) ||
-                        lane.pending.size() >= effective_simulations() - lane.simulations_done) {
-                        // 在途已满。这里必须处理一种会死锁的情形：缓存把某个挂起模拟
-                        // 需要的结果挤掉了，于是它永远不会就绪，而 lane 又因为“在途已满”
-                        // 不再开工。因此在没有任何在途请求时，为未就绪的挂起模拟补发请求。
-                        if (lane.outstanding == 0) {
-                            std::vector<uint32_t> missing_leaves;
-                            {
-                                std::lock_guard<std::mutex> lock(cache_mutex);
-                                for (const Pending& pending : lane.pending) {
-                                    if (!needs_satisfied(lane, pending.leaf)) {
-                                        missing_leaves.push_back(pending.leaf);
-                                    }
-                                }
-                            }
-                            for (const uint32_t leaf : missing_leaves) {
-                                issue_requests(lane, lane_index, leaf);
-                            }
-                            if (!missing_leaves.empty()) {
-                                progressed = true;
-                                stat_reissues.fetch_add(missing_leaves.size());
-                            }
-                        }
+            while (!lane.finished) {
+                if (lane.needs_new_episode) {
+                    // 换局处才是合法的停车点：目标达成后不再开新局，
+                    // 但已经开始的局一定走完。
+                    if (stopping()) {
+                        lane.finished = true;
                         break;
                     }
-                    start_simulation(lane, lane_index);
-                    progressed = true;
+                    if (config.episodes_target > 0 && next_episode.load() >= config.episodes_target) {
+                        lane.finished = true;
+                        break;
+                    }
+                    start_episode(lane);
                 }
+                // 先把结果已就绪的挂起模拟结算掉，再继续铺设新的模拟。
+                if (resolve_ready(lane) > 0) progressed = true;
+
+                if (lane.simulations_done >= effective_simulations()) {
+                    if (analysis_active) {
+                        // 分析：跑满预算就停在报告处，**不提交动作、不生成块**（ADR 0037）。
+                        // 这里不会留下任何未回填的请求——在途模拟的派发本来就受剩余预算
+                        // 限制（见下面 pending.size() 的那个判断），跑满时 pending 必为空。
+                        analysis_ready = true;
+                        break;
+                    }
+                    finish_step(lane);
+                    progressed = true;
+                    continue;
+                }
+                // 根节点还没被求值时只允许一条在途模拟：否则第一轮会把 in_flight 条
+                // 模拟全派到同一个新鲜根上，它们都停在根上求值、一条边都没走过——
+                // 这些模拟既没参与搜索，也让根访问数之和少于模拟次数（实测
+                // in_flight=8 时只有 56/64，等于每个决策步浪费 12.5% 的预算）。
+                const bool root_unexpanded = !lane.nodes.empty() && lane.nodes[0].state != kEvaluated;
+                if (lane.pending.size() >= config.in_flight_per_lane ||
+                    (root_unexpanded && !lane.pending.empty()) ||
+                    lane.pending.size() >= effective_simulations() - lane.simulations_done) {
+                    // 在途已满。这里必须处理一种会死锁的情形：缓存把某个挂起模拟
+                    // 需要的结果挤掉了，于是它永远不会就绪，而 lane 又因为“在途已满”
+                    // 不再开工。因此在没有任何在途请求时，为未就绪的挂起模拟补发请求。
+                    if (lane.outstanding == 0) {
+                        std::vector<uint32_t> missing_leaves;
+                        {
+                            std::lock_guard<std::mutex> lock(cache_mutex);
+                            for (const Pending& pending : lane.pending) {
+                                if (!needs_satisfied(lane, pending.leaf)) {
+                                    missing_leaves.push_back(pending.leaf);
+                                }
+                            }
+                        }
+                        for (const uint32_t leaf : missing_leaves) {
+                            issue_requests(lane, lane_index, leaf);
+                        }
+                        if (!missing_leaves.empty()) {
+                            progressed = true;
+                            stat_reissues.fetch_add(missing_leaves.size());
+                        }
+                    }
+                    break;
+                }
+                start_simulation(lane, lane_index);
+                progressed = true;
+            }
             if (progressed) progressed_flag.store(true);
             if (pending_request_count() >= max_requests) break;  // 预算用完就停手（与线程数无关）
         }
@@ -871,6 +921,115 @@ struct BatchedEngine::Impl {
         }
     }
 
+    // ---- 会话驱动（任意局面 + 逐步走，见 ADR 0037）--------------------------------
+    //
+    // 只有这几条入口会用到这些方法，而它们都先过 require_session_mode()：会话是
+    // "一个盘面、一步一步走"，与并发跑局互斥。整局驱动因此完全不受影响。
+    void require_session_mode() const {
+        if (config.lanes != 1 || config.collect_samples) {
+            throw std::runtime_error(
+                "会话驱动要求 lanes==1 且不落样本：它是\"一个盘面逐步走\"的形态，与并发跑局互斥");
+        }
+    }
+
+    void set_root(const Board& board) {
+        require_session_mode();
+        analysis_active = false;
+        analysis_ready = false;
+        Lane& lane = lanes[0];
+        lane.board = board;
+        lane.legal_mask = legal_mask(board);
+        lane.step = 0;
+        lane.total_score = 0;
+        lane.max_exponent = board.max_exponent();
+        lane.finished = false;
+        lane.needs_new_episode = false;
+        reset_tree(lane);
+    }
+
+    void begin_analysis(uint32_t simulations) {
+        require_session_mode();
+        if (simulations == 0) throw std::runtime_error("分析预算必须大于 0");
+        analysis_budget = simulations;
+        analysis_active = true;
+        analysis_ready = false;
+        Lane& lane = lanes[0];
+        lane.finished = false;
+        // 清掉可能残留的"换局"信号：分析永远不开新局（见 stop_session_lane）。
+        lane.needs_new_episode = false;
+        reset_tree(lane);
+    }
+
+    // 会话里的终局 = 收工：既不再推进，也绝不能让 pump 去开新局——那会把用户面前的残局
+    // 悄悄换成一副随机开局。`needs_new_episode` 在整局驱动里是"该换局了"的信号，
+    // 在这里必须一并清掉，否则下一次 begin_analysis 会把它读成"去开局"。
+    void stop_session_lane(Lane& lane) {
+        lane.finished = true;
+        lane.needs_new_episode = false;
+    }
+
+    RootReport report_root() const {
+        require_session_mode();
+        RootReport report;
+        const Lane& lane = lanes[0];
+        report.legal_mask = lane.legal_mask;
+        report.simulations = lane.simulations_done;
+        if (lane.nodes.empty()) return report;
+        const Node& root = lane.nodes[0];
+        for (int action = 0; action < kNumActions; action++) {
+            report.visits[action] =
+                static_cast<uint16_t>(std::min<uint32_t>(root.edge_visits[action], 0xFFFF));
+            report.one_ply[action] = root.one_ply[action];
+            report.prior[action] = root.prior[action];
+            // 未访问的边退回一次性估计，与候选目标的写法一致（见 finish_step 里的注释）。
+            report.q_mean[action] =
+                root.edge_visits[action] > 0
+                    ? root.edge_q_sum[action] / static_cast<float>(root.edge_visits[action])
+                    : root.one_ply[action];
+        }
+        report.root_value = root.visits > 0 ? root.value_sum / static_cast<float>(root.visits) : 0.0f;
+        uint16_t best_visits = 0;
+        for (int action = 0; action < kNumActions; action++) {
+            if (report.visits[action] > best_visits) {
+                best_visits = report.visits[action];
+                report.best_action = action;
+            }
+        }
+        return report;
+    }
+
+    StepResult commit_step(int action) {
+        require_session_mode();
+        analysis_active = false;
+        analysis_ready = false;
+        Lane& lane = lanes[0];
+        StepResult result;
+        if (lane.legal_mask == 0) {
+            // 终局：没有合法方向。把局面原样回报并标志终局，等调用方 set_root 换局面。
+            stop_session_lane(lane);
+            result.terminal = true;
+        } else {
+            if (action >= kNumActions) {
+                throw std::runtime_error("方向编号超出范围（0..3，或传 -1 让引擎按 decision_mode 选）");
+            }
+            const int chosen = action >= 0 ? action : select_action(lane);
+            if ((lane.legal_mask & (1u << chosen)) == 0) {
+                throw std::runtime_error("指定的方向在当前盘面上不合法");
+            }
+            const AppliedStep applied = apply_action(lane, chosen);
+            result.action = applied.action;
+            result.spawn_index = applied.spawn_index;
+            result.spawn_exponent = applied.spawn_exponent;
+            result.score_delta = applied.score_delta;
+            result.terminal = applied.terminal;
+            if (applied.terminal) stop_session_lane(lane);  // 同上：终局不开新局
+        }
+        std::memcpy(result.board, lane.board.tiles, kBoardCells);
+        result.total_score = lane.total_score;
+        result.step = lane.step;
+        return result;
+    }
+
     // ---------------- 成员 ----------------
 
     EngineConfig config;
@@ -909,12 +1068,19 @@ struct BatchedEngine::Impl {
     EngineStats stats;  // 只在 finish() 里做一次快照
     std::atomic<uint32_t> next_episode{0};
     bool finished = false;
+
+    // ---- 会话驱动（见 ADR 0037）----
+    // 全默认关闭，所以整局驱动的行为一字不变：只有 set_root / begin_analysis /
+    // commit_step 会打开它们，而那三个入口自己就会拒绝 lanes != 1 或 collect_samples 的配置。
+    bool analysis_active = false;  // 正处于一次分析：跑满预算就停在报告处，不提交
+    bool analysis_ready = false;   // 预算已跑满，report_root 可读
+    uint32_t analysis_budget = 1;
 };
 
 BatchedEngine::BatchedEngine(const EngineConfig& config, std::string data_dir, std::string batch_id,
                              std::string model_id, uint64_t samples_target, uint64_t shard_samples)
-    : BatchedEngine(config, std::move(data_dir), std::move(batch_id), std::move(model_id),
-                    samples_target, shard_samples, nullptr) {}
+    : BatchedEngine(config, std::move(data_dir), std::move(batch_id), std::move(model_id), samples_target,
+                    shard_samples, nullptr) {}
 
 BatchedEngine::BatchedEngine(const EngineConfig& config, std::string data_dir, std::string batch_id,
                              std::string model_id, uint64_t samples_target, uint64_t shard_samples,
@@ -922,7 +1088,9 @@ BatchedEngine::BatchedEngine(const EngineConfig& config, std::string data_dir, s
     : impl_(std::make_unique<Impl>(config, std::move(data_dir), std::move(batch_id), std::move(model_id),
                                    samples_target, shard_samples, std::move(sink))) {}
 
-const std::shared_ptr<SampleSink>& BatchedEngine::sink() const { return impl_->sink; }
+const std::shared_ptr<SampleSink>& BatchedEngine::sink() const {
+    return impl_->sink;
+}
 
 BatchedEngine::~BatchedEngine() = default;
 
@@ -993,11 +1161,15 @@ BatchedEngine::Advance BatchedEngine::advance(uint32_t max_requests) {
     // done 的条件必须包含“所有 lane 都已收工”：目标达成后 lane 只会在局与局之间停下，
     // 因此还可能有正在跑的局没写完；此时返回 done 会让调用方提前退出，批次就会短于目标条数。
     // 按局数停止的评测运行不看 stop_all（它由样本目标触发），而以“目标局数都已结束”为条件。
-    const bool target_reached =
-        impl.config.episodes_target > 0
-            ? impl.stat_episodes.load() >= impl.config.episodes_target
-            : impl.stopping();
-    out.done = target_reached && impl.requests.empty() && impl.all_lanes_finished();
+    const bool target_reached = impl.config.episodes_target > 0
+                                    ? impl.stat_episodes.load() >= impl.config.episodes_target
+                                    : impl.stopping();
+    if (impl.analysis_active) {
+        // 会话的分析：跑满分析预算就是"这一次完成"，与整局驱动的 done（目标局数达成）不是同一件事。
+        out.done = impl.analysis_ready && impl.requests.empty();
+    } else {
+        out.done = target_reached && impl.requests.empty() && impl.all_lanes_finished();
+    }
     return out;
 }
 
@@ -1084,6 +1256,22 @@ void BatchedEngine::submit(const uint64_t* ids, const float* values, const float
     }
 }
 
+void BatchedEngine::set_root(const Board& board) {
+    impl_->set_root(board);
+}
+
+void BatchedEngine::begin_analysis(uint32_t simulations) {
+    impl_->begin_analysis(simulations);
+}
+
+RootReport BatchedEngine::report_root() const {
+    return impl_->report_root();
+}
+
+StepResult BatchedEngine::commit_step(int action) {
+    return impl_->commit_step(action);
+}
+
 EngineStats BatchedEngine::stats() const {
     Impl& impl = *impl_;
     EngineStats stats;
@@ -1137,7 +1325,9 @@ void BatchedEngine::request_stop() {
     if (impl.sink) impl.sink->request_stop(ControlCommand::kStop);
 }
 
-bool BatchedEngine::stop_requested() const { return impl_->stopping(); }
+bool BatchedEngine::stop_requested() const {
+    return impl_->stopping();
+}
 
 FinishResult BatchedEngine::finish() {
     Impl& impl = *impl_;

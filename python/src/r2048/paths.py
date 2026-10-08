@@ -35,6 +35,19 @@ def eval_dir() -> Path:
     return output_root() / "eval"
 
 
+def records_dir() -> Path:
+    """棋谱：人造或引擎产出的对局记录（文本，见 ADR 0036）。
+
+    它与 `data/` 的区别是身份：`data/` 是训练数据批（定长样本记录，按批次归档），
+    棋谱是**可读可手写的对局记录**，用来复盘、导入导出、当棋盘编辑器的载体。
+    """
+    return output_root() / "records"
+
+
+def record_path(name: str) -> Path:
+    return records_dir() / f"{name}.txt"
+
+
 def ensure(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path

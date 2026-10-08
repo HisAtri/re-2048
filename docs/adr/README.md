@@ -44,6 +44,7 @@ ADR 解释为什么整体是这个形状。
 | [0036](0036-record-text-format.md) | 棋谱文本格式：一行一命令、生成块显式化、值域键表、解析与应用分两层 | 已采纳 |
 | [0037](0037-engine-arbitrary-root-and-step-drive.md) | 引擎的任意局面与逐步驱动（会话模式）：在批引擎上加 set_root / begin_analysis / report_root / commit_step | 已采纳 |
 | [0038](0038-session-process-and-text-protocol.md) | 会话进程与文本协议（三层结构）：一行一命令、空行结束应答、棋谱是唯一事实源 | 已采纳 |
+| [0039](0039-webui-structure-and-dependencies.md) | WebUI 结构与依赖归属：Gradio 子包 + 可选依赖组、只跟会话说话、清单层不手输路径 | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

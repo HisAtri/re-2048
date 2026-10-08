@@ -15,6 +15,12 @@ dev = [
     "pytest>=8.3,<9",
     "ruff>=0.9",
 ]
+# WebUI 是**可选**组件（见 ADR 0039）：跑谱、训练、评测、推理都不需要它，所以不进
+# `[project].dependencies`——那会让每次 `make env` 都拖进一整套 Web 栈。
+# 装它：`uv sync --group webui`；跑它：`make webui`。
+webui = [
+    "gradio>=5,<6",
+]
 
 [build-system]
 requires = ["hatchling"]

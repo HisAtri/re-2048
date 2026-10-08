@@ -28,7 +28,7 @@ export R2048_CLI              := $(BIN)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help env-check env configure build test test-cpp test-py lint fmt run py bench clean
+.PHONY: help env-check env configure build test test-cpp test-py lint fmt run py bench webui clean
 
 help:
 	@echo "re-2048 构建入口"
@@ -39,6 +39,7 @@ help:
 	@echo "  make test       跑 C++ 与 Python 全部测试"
 	@echo "  make run ARGS=\"generate --policy random ...\"  运行 C++ CLI"
 	@echo "  make py  ARGS=\"...\"                          运行 Python 侧（python -m r2048）"
+	@echo "  make webui      启动 Gradio 交互界面（可选组件，见 ADR 0039）"
 	@echo "  make fmt        格式化 C++（clang-format）与 Python（ruff）"
 	@echo "  make clean      删除构建目录（不动数据）"
 	@echo ""
@@ -116,6 +117,11 @@ py:
 
 bench: build
 	$(BIN) bench $(ARGS)
+
+# WebUI 是可选组件（ADR 0039）：gradio 在 `webui` 依赖组里，因而不进核心依赖。
+# `uv run --group webui` 会按需把它装进环境。默认只绑 127.0.0.1；换端口用 ARGS="--port 8000"。
+webui: build
+	cd $(ROOT) && PYTHONPATH=$(PYEXT) uv run --group webui python -m r2048 webui $(ARGS)
 
 clean:
 	rm -rf $(BUILD)

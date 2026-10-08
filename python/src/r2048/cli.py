@@ -332,6 +332,18 @@ def _build_parser() -> argparse.ArgumentParser:
     session.add_argument("--in-flight", type=int, default=4, help="每 lane 在途模拟数（批大小旋钮）")
     session.add_argument("--cache-entries", type=int, default=1 << 16)
     session.add_argument("--seed", type=int, default=0)
+
+    webui = sub.add_parser(
+        "webui",
+        help="启动 Gradio 交互界面（可选组件：需要 webui 依赖组，见 ADR 0039）",
+        description=(
+            "交互分析界面：计算/分析、棋盘编辑器、复盘三个标签页。它只跟会话进程说话"
+            "（`r2048 session`），自己不做棋规、不选招。默认只绑 127.0.0.1。"
+        ),
+    )
+    webui.add_argument("--host", default="127.0.0.1", help="监听地址（默认只绑本机）")
+    webui.add_argument("--port", type=int, default=7860)
+    webui.add_argument("--share", action="store_true", help="生成公网链接（默认不对外暴露）")
     return parser
 
 
@@ -795,6 +807,28 @@ def _command_session(args: argparse.Namespace) -> int:
     return serve(session, sys.stdin, sys.stdout)
 
 
+def _command_webui(args: argparse.Namespace) -> int:
+    """启动 Gradio 界面。gradio 在可选依赖组里，没装就给一条能照做的提示。"""
+    try:
+        from r2048.webui.app import build_app
+    except ImportError as error:  # pragma: no cover - 只在没装 webui 组时走到
+        raise SystemExit(
+            "WebUI 是可选组件（ADR 0039）：先 `uv sync --group webui` 装上 gradio，或直接用 `make webui`"
+        ) from error
+
+    demo, state = build_app()
+    try:
+        demo.launch(
+            server_name=args.host,
+            server_port=args.port,
+            share=args.share,
+            show_api=False,
+        )
+    finally:
+        state.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "version":
@@ -819,6 +853,8 @@ def main(argv: list[str] | None = None) -> int:
         return _command_iterate(args)
     if args.command == "session":
         return _command_session(args)
+    if args.command == "webui":
+        return _command_webui(args)
     raise SystemExit(f"未知子命令: {args.command}")
 
 

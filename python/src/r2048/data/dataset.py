@@ -362,6 +362,7 @@ class Batch:
     # --- 候选级监督（schema v2）：每个合法方向一条，按方向下标对齐 ---
     candidate_afterstate: torch.Tensor  # (B, 4, 16) uint8
     candidate_value: torch.Tensor  # (B, 4) float32：A(u_a) = Q̄(a) − r(s,a)（已归一化）
+    candidate_reward: torch.Tensor  # (B, 4) float32：r(s,a)，与 candidate_value 同量纲
     candidate_visits: torch.Tensor  # (B, 4) float32：该候选边的根访问数
     candidate_weight: torch.Tensor  # (B, 4) float32：sqrt(访问数)，非法/未访达/无候选处为 0
 
@@ -381,9 +382,18 @@ class Batch:
             episode=self.episode.to(device),
             candidate_afterstate=self.candidate_afterstate.to(device),
             candidate_value=self.candidate_value.to(device),
+            candidate_reward=self.candidate_reward.to(device),
             candidate_visits=self.candidate_visits.to(device),
             candidate_weight=self.candidate_weight.to(device),
         )
+
+    def candidate_q(self) -> torch.Tensor:
+        """Q(s,a) = r(s,a) + A(u_a)：每个合法候选一条，非法/无候选处为 0。
+
+        候选块存的正是这两项，所以每个根的**完整动作值向量**是重建的、不是新信息——
+        策略改进算子（π̃ ∝ π̂·exp(Â/β)）因此能在训练侧就地实现，不必重新跑谱。
+        """
+        return self.candidate_reward + self.candidate_value
 
     @property
     def has_candidates(self) -> bool:
@@ -476,6 +486,9 @@ class BatchStream:
             candidate_afterstate=torch.from_numpy(np.ascontiguousarray(records["candidate_afterstate"])),
             candidate_value=torch.from_numpy(
                 (records["candidate_value"].astype(np.float32) / self.score_scale).copy()
+            ),
+            candidate_reward=torch.from_numpy(
+                (records["candidate_reward"].astype(np.float32) / self.score_scale).copy()
             ),
             candidate_visits=torch.from_numpy(records["candidate_visits"].astype(np.float32).copy()),
             # 权重 = sqrt(访问数) × 合法性（见 ADR 0015）。未访问过的候选权重为 0，

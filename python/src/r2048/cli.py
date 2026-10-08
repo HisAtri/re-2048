@@ -63,7 +63,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="价值回归用候选目标还是主轨迹回报（auto：有候选监督就用候选）",
     )
     train.add_argument("--value-weight", type=float, default=argparse.SUPPRESS)
+    train.add_argument(
+        "--value-selection",
+        default=argparse.SUPPRESS,
+        choices=["best_hit", "q_best_hit"],
+        help="价值头 checkpoint 的挑选口径：best_hit = A 口径命中率（默认）；q_best_hit = r+A 口径",
+    )
     train.add_argument("--policy-weight", type=float, default=argparse.SUPPRESS)
+    train.add_argument(
+        "--value-ranking-weight",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Q 空间的同根成对排序项权重（0 = 关，默认）；与 Huber 同量纲，见 ADR 0035",
+    )
+    train.add_argument(
+        "--policy-target",
+        default=argparse.SUPPRESS,
+        choices=["visits", "improved"],
+        help="策略目标：visits = 搜索根访问分布（纯蒸馏，默认）；improved = 一步策略改进 π̃∝π̂·exp(Â/β)",
+    )
+    train.add_argument(
+        "--improve-beta",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="改进目标的温度（无量纲，乘在同根 Â 的 std 上；β→∞ 退化为 visits 口径）",
+    )
+    train.add_argument(
+        "--improve-floor",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="改进目标里 π̂ 的均匀伪访问数（让搜索未访问的候选也能拿到质量）",
+    )
     train.add_argument("--val-fraction", type=float, default=argparse.SUPPRESS)
     train.add_argument("--split-seed", type=int, default=argparse.SUPPRESS)
     train.add_argument(

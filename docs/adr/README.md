@@ -37,6 +37,10 @@ ADR 解释为什么整体是这个形状。
 | [0029](0029-one-batch-many-writers.md) | 一个数据批、多个写者（跨进程并发跑谱） | 已采纳 |
 | [0030](0030-value-label-ordering-collapse.md) | MCTS 退化：价值标签的同根排序塌缩；改续弈策略被证实（退化不复现，深度不是杠杆） | 已采纳（三版处方被实测否掉，第四版被证实） |
 | [0031](0031-why-parallel-selfplay-is-not-reproducible.md) | 并行跑谱不可复现的原因：挂起不回填（不是缓存） | 已采纳 |
+| [0032](0032-advantage-weighted-policy-improvement.md) | 策略改进算子（Â 加权一步改进）首轮实测：不改善、强推变差；归一化尺度在弱信号处反而推得更狠 | 已采纳（负结果；默认仍是 visits） |
+| [0033](0033-continuous-selfplay-monitoring.md) | 连续自举五轮的监控：没有劣化、仍未收敛，进步全在价值头而非策略头 | 已采纳 |
+| [0034](0034-a-versus-r-plus-a-ranking.md) | 候选排序的两套口径：引擎用 r + A、训练与离线指标用 A；两者之差必须报出来 | 已采纳（换挑选口径实测为空实验：权重逐位相同；真正会变的是 Q 空间的排序项） |
+| [0035](0035-q-space-pairwise-ranking-loss.md) | Q 空间的同根成对排序项：贪心判决 +19%（显著），256 模拟的搜索不动 | 已采纳（机制在瞄准的口径上生效；默认关闭） |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

@@ -80,6 +80,23 @@ make py ARGS="train --data <批> --output <run> --mode value --value-target traj
 checkpoint 的挑选也按“最优候选命中率”而不是全局 MAE——全局 MAE 无法替代同根候选排序。
 数据里没有候选（随机策略批次）时自动退回主轨迹 MC 回报口径。
 
+### 策略改进算子（`--policy-target improved`，见 ADR 0032）
+
+策略目标默认就是搜索的根访问分布（纯蒸馏，不动点是教师）。`improved` 把它换成一步改进
+`π̃ ∝ π̂·exp(Â/(β·同根 std))`，其中 `Â = Q − Σπ̂Q` 由候选块里的 `r + A(u)` 重建：
+
+```bash
+# β 无量纲（乘在同根 Â 的 std 上）；β→∞ 与 visits 口径逐样本等价，可用作 A/B 的对照臂
+make py ARGS="train --data <搜索批> --output <run> --mode policy --freeze-value \
+  --init-checkpoint <价值半> --policy-target improved --improve-beta 1.0"
+# 跑对局之前先审计算子动了多少（KL / 熵 / 决策改变率 / 机制锚点）
+python scripts/advantage_probe.py --batch <批> --sweep <批> --betas 0.5,1,2
+```
+
+**默认仍是 `visits`**：ADR 0032 的首轮实测里没有任何臂超过控制臂，强推（β=0.25）在纯策略臂上
+显著更差（−509）。改 β 之前先看探针的输出：决策改变率在弱信号批次上会自动变大（6% → 16%），
+那是这个归一化尺度的已知缺陷，不是"推得不够"。
+
 路径可用环境变量覆盖：`make BUILD=/data/build build`、`R2048_OUTPUT_DIR=/data/runs ...`。
 
 ## C++ CLI 一览

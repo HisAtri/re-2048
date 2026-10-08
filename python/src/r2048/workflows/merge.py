@@ -118,6 +118,11 @@ def merge_halves(
             "model_id": policy_id,
             "training_target": policy_target,
             "config_digest": policy_meta.get("config_digest", ""),
+            # 策略头学的是哪个目标（visits / improved）以及它的温度：合并件是评测与跑谱真正
+            # 加载的东西，而"这份策略头是纯蒸馏还是被一步改进过"只从 model_id 里看不出来
+            # （见 ADR 0032）。既然合并件的 metadata 以价值半为底，就必须显式带过来。
+            "policy_target": policy_meta.get("policy_target", "none"),
+            "improve_beta": policy_meta.get("improve_beta"),
         },
         "note": note,
     }

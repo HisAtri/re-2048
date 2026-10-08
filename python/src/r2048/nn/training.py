@@ -4,6 +4,9 @@
 
 * **标签**：价值回归的标签是 afterstate 的 MC 回报（`mc_return`，不含产生该 afterstate 的
   那次合并得分）；策略目标是搜索根访问分布 `visits / simulations`。两者语义不同，不能互相派生。
+* **策略目标默认是"访问分布"本身**（纯蒸馏）：不动点就是教师。要越过教师，用
+  `--policy-target improved`——一步策略改进 π̃ ∝ π̂·exp(Â/(β·同根 std))，见
+  `improved_policy_target()` 与 ADR 0032。
 * **按整局划分训练/验证**：同一局的相邻局面高度相似，按样本随机划分会让验证指标虚高。
 * **策略损失排除无搜索样本**：`visits` 全 0 的记录没有策略目标，把它们当成“均匀分布”
   训练等于教网络输出均匀先验（旧版实测这条路与随机打平）。
@@ -55,11 +58,22 @@ VALUE_MODES = ("value",)
 POLICY_MODES = ("policy",)
 JOINT_MODES = ("joint", "dual")
 ALL_MODES = VALUE_MODES + POLICY_MODES + JOINT_MODES
+# 策略目标的两种口径：visits = 搜索根访问分布（纯蒸馏，不动点是教师）；
+# improved = 一步策略改进（π̃ ∝ π̂·exp(Â/β)），见 improved_policy_target()。
+POLICY_TARGETS = ("visits", "improved")
+# 价值头 checkpoint 的挑选口径：best_hit = A 口径最优候选命中率（历史口径，默认）；
+# q_best_hit = r+A 口径（与引擎的选择值同口径）。见 ADR 0034/0035。
+VALUE_SELECTIONS = ("best_hit", "q_best_hit")
 
 
 def default_architecture(mode: str) -> str:
     """双塔是联合训练里被实测验证过的那一臂（旧版 ADR 0011）；单头训练用共享结构即可。"""
     return DUAL_TOWER_ARCHITECTURE if mode == "dual" else SHARED_ARCHITECTURE
+
+
+def trains_policy(mode: str) -> bool:
+    """这个配方训不训策略头（决定 checkpoint 里该不该记 `policy_target`）。"""
+    return mode in POLICY_MODES or mode in JOINT_MODES
 
 
 @dataclass(frozen=True)
@@ -100,7 +114,25 @@ class TrainConfig:
     # candidate：强制候选；trajectory：强制主轨迹（用于复现旧结果）。
     value_target: str = "auto"
     policy_weight: float = 1.0
+    # 策略目标口径（见 improved_policy_target）：visits = 纯蒸馏（默认，历史口径）；
+    # improved = 一步策略改进 π̃ ∝ π̂·exp(Â/(β·scale))。
+    policy_target: str = "visits"
+    # β 是**无量纲**的（乘在同根 Â 的标准差上）。离线审计（scripts/advantage_probe.py）
+    # 在 greedy 教师批上的量级：β=1 改变 6% 的决策、KL 0.10；β=0.25 改变 9%、KL 0.30。
+    improve_beta: float = 1.0
+    # π̂ 上的均匀伪访问数：让搜索未访问过的候选也能拿到质量。0 = 严格乘法重加权。
+    improve_floor: float = 0.0
     val_fraction: float = 0.05
+    # Q 空间的同根成对排序损失权重（0 = 关）。Q = r + A 是引擎的选择值：把 r 加在
+    # 预测与目标两边**不改变预测误差**（所以 Huber 在两种口径下逐值相同），但会改变
+    # **成对的标签**——在 r6 的批上 12.9% 的根给出不同的 argmax（ADR 0034）。因此
+    # "在 Q 空间做排序监督"与"在 A 空间做"不是同一件事，而 Q 空间的排序目标恰好是
+    # 教师自己的边均值 Q：对搜索输出最忠实的蒸馏。见 ADR 0035。
+    value_ranking_weight: float = 0.0
+    # 价值头 checkpoint 的挑选依据：best_hit = A 口径的最优候选命中率（历史口径）；
+    # q_best_hit = r+A 口径（与引擎的选择值同口径，见 ADR 0034）。只影响"留哪个 epoch 的
+    # 权重"，不影响损失——因为价值头原理上只能学 A（r 不是 afterstate 的函数）。
+    value_selection: str = "best_hit"
     split_seed: int = 0
     # 每轮采样多少条（0 = 各来源训练池之和）。只在多来源或显式想缩短轮长时才有意义。
     samples_per_epoch: int = 0
@@ -139,11 +171,22 @@ class EpochMetrics:
     val_candidate_regret: float
     samples: int
     seconds: float
+    # 同一套指标在 r+A 口径下的值（搜索的选择值就是 r + A，见 ADR 0034）。
+    # 为什么两个口径都要报：A 口径量"价值头预测得准不准"，r+A 口径量"引擎会不会选对"，
+    # 而加 r 不改变预测误差、只改变排序——两者差多少必须能从产物里读出来。
+    val_candidate_q_pair_agreement: float = float("nan")
+    val_candidate_q_best_hit: float = float("nan")
+    val_candidate_q_regret: float = float("nan")
+    # 排序项的加权均值（分数单位）：只在 value_ranking_weight > 0 时有值。
+    ranking_loss: float = float("nan")
     # 这一轮价值头实际回归的是哪个量（"candidate" / "trajectory"；未训价值头时为空）。
     # 为什么必须显式记录：同一个 mode + 同一批数据在两种价值目标下会训出**不同**的权重，
     # 而 model_id 只由 (mode, 数据标签) 组成——实测两个不同的模型因为沿用旧写法而同名，
     # 评分池按 model_id 去重时会把它们当成同一个。标识与元数据都必须能区分。
     value_target: str = ""
+    # 这一轮策略头学的是哪个目标（"visits" / "improved"；未训策略头时为空）。
+    # 与 value_target 同一条纪律：不同目标训出的是**不同权重**，必须能从产物本身读出来。
+    policy_target: str = ""
 
     @property
     def samples_per_second(self) -> float:
@@ -189,10 +232,20 @@ def model_id_for(config: TrainConfig, value_target: str) -> str:
     价值目标不是默认值时进名字：`value-<数据标签>` 这个旧写法让"候选目标"和"主轨迹回报"
     训出的两份**不同权重**同名，而评分池按 model_id 去重、按 model_id 分组——同名就会被
     当成同一个模型（实测已发生，见 ADR 0030）。名字只给人看，但它必须是**可区分**的。
+    策略目标同理：`improved` 与 `visits` 是同一条线上两份不同权重，名字里必须看得出 β。
     """
-    base = f"{config.mode}-{data_label(config)}"
     if value_target == "trajectory" and config.mode in ("value", "joint", "dual"):
-        return f"{config.mode}-trajectory-{data_label(config)}"
+        base = f"{config.mode}-trajectory-{data_label(config)}"
+    else:
+        base = f"{config.mode}-{data_label(config)}"
+    if config.policy_target != "visits":
+        # β 进名字：它能改变 6%~9% 的决策，是一个会被反复扫的旋钮，不能只靠 metadata 区分。
+        base = f"{base}+{config.policy_target}-b{config.improve_beta:g}"
+    if config.value_selection != "best_hit":
+        # 同一批数据、同一个种子、只换挑选口径 ⇒ 两份不同权重。名字不分就无法事后区分。
+        base = f"{base}+{config.value_selection}"
+    if config.value_ranking_weight > 0:
+        base = f"{base}+rank{config.value_ranking_weight:g}"
     return base
 
 
@@ -288,8 +341,53 @@ class _PolicyStats:
     agreement: float
 
 
-def policy_loss(logits: torch.Tensor, batch: Batch) -> _PolicyStats | None:
-    """软标签交叉熵（只统计有搜索记录的样本）+ 与搜索实际选招的一致率。"""
+def improved_policy_target(batch: Batch, beta: float, floor: float) -> torch.Tensor:
+    """一步策略改进的目标：π̃_a ∝ π̂_a · exp(Â_a / (β · scale))。
+
+    * Â_a = Q_a − V，V = Σ_a π̂_a Q_a（on-policy 基线）；Q_a = r_a + A(u_a) 由候选块重建。
+    * `scale` 是**同根** Â 的无权重标准差。用无权重而不是 π̂ 加权：加权 std 会把"访问数怎么
+      分配"混进尺度，而尺度只该描述这个根的候选之间差多少；且无权重 std 与 ADR 0030 的
+      "同根标签 std"同定义，离线审计的数字可以直接对上。
+    * **β 无量纲是硬约束**：Â 的绝对量级由标签来源决定（ADR 0030 §4.1 实测同一族价值头在
+      不同教师下量级差 10 倍）。固定 β 等于让"这一轮的标签量级"顺带决定"目标有多尖"，
+      两个本该独立的旋钮被焊在一起——ADR 0013 与 §4.1 的两次退化都是这个形态。
+    * `floor` 是 π̂ 上的均匀伪访问数：纯乘法重加权只能把质量在**搜索访问过的**边之间重分配，
+      未访问边永远拿不到质量（ADR 0030 §6.6 实测 NN 自举批有 0.8%~7.7% 的合法边访问数为 0）。
+    * β→∞ 时逐样本等于 π̂（回归测试钉住这条）；没有候选监督的记录原样返回 π̂，因此
+      混入随机策略批次时不会把垃圾写进目标。
+
+    这一步改进的保证（E_{π̃}[Q] ≥ E_{π̂}[Q]）是在**同一个 Q 下**成立的，用生成 Â 的那个 Q
+    度量它没有信息量——算子的有效性只能由训练轮 + 评测臂回答（ADR 0032）。
+    """
+    has_candidates = batch.candidate_weight.sum(dim=-1) > 0
+    if not bool(has_candidates.any()):
+        return batch.policy_target
+    legal = batch.legal_mask.bool()
+    visits = batch.visits + floor
+    pi = visits / visits.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    q = batch.candidate_q()
+    value = (pi * q * legal).sum(dim=-1, keepdim=True)
+    advantage = (q - value) * legal
+    count = legal.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    mean = advantage.sum(dim=-1, keepdim=True) / count
+    var = ((advantage - mean) ** 2 * legal).sum(dim=-1, keepdim=True) / count
+    scale = var.clamp_min(0.0).sqrt().clamp_min(1e-9)
+    # 减去同根最大权重再取指数：溢出防护，且不影响归一化后的分布（同根之差被抵消）。
+    exponent = advantage / (beta * scale)
+    neg_inf = torch.full_like(exponent, float("-inf"))
+    exponent = exponent - torch.where(legal, exponent, neg_inf).max(dim=-1, keepdim=True).values
+    weights = torch.where(legal, exponent, neg_inf).exp()
+    improved = pi * weights
+    improved = improved / improved.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    return torch.where(has_candidates[:, None], improved, batch.policy_target)
+
+
+def policy_loss(logits: torch.Tensor, batch: Batch, target: torch.Tensor) -> _PolicyStats | None:
+    """软标签交叉熵（只统计有搜索记录的样本）+ 与搜索实际选招的一致率。
+
+    `target` 由调用方给出（`visits` 或改进后的 π̃），不再从 batch 里现取：改进目标必须在
+    D4 增强**之前**算好，否则候选块的方向下标与增强后的棋盘就不再对齐（ADR 0010 决策 4）。
+    """
     has_search = batch.visits.sum(dim=-1) > 0
     if not bool(has_search.any()):
         return None
@@ -297,7 +395,7 @@ def policy_loss(logits: torch.Tensor, batch: Batch) -> _PolicyStats | None:
     kept = logits[has_search]
     legal_kept = legal[has_search]
     masked = kept.masked_fill(~legal_kept, float("-inf"))
-    target = batch.policy_target[has_search]
+    target = target[has_search]
     log_probs = F.log_softmax(masked, dim=-1)
     # 非法方向上的 log 概率是 -inf，而目标在那些位置是 0：0 × (-inf) 直接得到 nan。
     # 先把非法项替换成 0，非法项对加权和就没有贡献了，合法项不受影响。
@@ -305,6 +403,52 @@ def policy_loss(logits: torch.Tensor, batch: Batch) -> _PolicyStats | None:
     loss = (-(target * log_probs).sum(dim=-1)).mean()
     agreement = (target.argmax(dim=-1) == masked.argmax(dim=-1)).float().mean()
     return _PolicyStats(loss=loss, records=int(kept.shape[0]), agreement=float(agreement))
+
+
+def _ratio(numerator: torch.Tensor, denominator: torch.Tensor) -> float:
+    total = float(denominator)
+    return float(numerator) / total if total > 0 else float("nan")
+
+
+def _mean_score(total: torch.Tensor, count: torch.Tensor, score_scale: float) -> float:
+    value = float(count)
+    return float(total) / value * score_scale if value > 0 else float("nan")
+
+
+def _ranking_totals(
+    prediction: torch.Tensor, target: torch.Tensor, valid: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, ...]:
+    """一次排序统计：(成对一致、成对不一致、最优命中、参与命中统计的根数、后悔值之和)。
+
+    抽成函数是因为它要跑两遍（A 口径与 r+A 口径）——两遍的差别只是整体平移了 r，
+    所以只有"谁排第一"会变，代码必须完全相同，否则两个口径就不是同一个度量了。
+    """
+    concordant = torch.zeros((), dtype=torch.float64, device=device)
+    discordant = torch.zeros((), dtype=torch.float64, device=device)
+    best_hit = torch.zeros((), dtype=torch.float64, device=device)
+    best_total = torch.zeros((), dtype=torch.float64, device=device)
+    regret = torch.zeros((), dtype=torch.float64, device=device)
+    for first, second in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
+        pair_valid = valid[:, first] & valid[:, second] & (target[:, first] != target[:, second])
+        if not bool(pair_valid.any()):
+            continue
+        agree = (prediction[:, first] - prediction[:, second]).sign() == (
+            target[:, first] - target[:, second]
+        ).sign()
+        concordant += (agree & pair_valid).double().sum()
+        discordant += (~agree & pair_valid).double().sum()
+
+    has_two = valid.sum(dim=1) >= 2
+    if bool(has_two.any()):
+        masked_prediction = prediction.masked_fill(~valid, float("-inf"))
+        masked_target = target.masked_fill(~valid, float("-inf"))
+        picked = masked_prediction.argmax(dim=1)
+        best = masked_target.argmax(dim=1)
+        best_hit += (picked[has_two] == best[has_two]).double().sum()
+        best_total += has_two.double().sum()
+        picked_value = target.gather(1, picked[:, None]).squeeze(1)
+        regret += (masked_target.max(dim=1).values[has_two] - picked_value[has_two]).double().sum()
+    return concordant, discordant, best_hit, best_total, regret
 
 
 class _Metrics:
@@ -326,10 +470,32 @@ class _Metrics:
         self.best_hit = torch.zeros((), dtype=torch.float64, device=device)
         self.best_total = torch.zeros((), dtype=torch.float64, device=device)
         self.regret = torch.zeros((), dtype=torch.float64, device=device)
+        # 同一套排序指标的 r+A 口径（q_ 前缀）：搜索的选择值是 r + A，所以"引擎会不会选对"
+        # 只能在这一套上量。两套口径共用 valid 掩码，因此根集合与权重完全相同、可直接对比。
+        self.q_concordant = torch.zeros((), dtype=torch.float64, device=device)
+        self.q_discordant = torch.zeros((), dtype=torch.float64, device=device)
+        self.q_best_hit = torch.zeros((), dtype=torch.float64, device=device)
+        self.q_best_total = torch.zeros((), dtype=torch.float64, device=device)
+        self.q_regret = torch.zeros((), dtype=torch.float64, device=device)
+        # 排序项自己的量级（加权均值，分数单位）：权重取值合理不合理只能从这里看出来。
+        self._ranking_sum = 0.0
+        self._ranking_weight = 0.0
         # 价值头这一轮回归的量（空集 = 没训价值头）。由真正做决策的那一行写入，
         # 不在别处重新推导一遍；用集合是因为多来源混训时不同批可能落到不同的量上，
         # 那种情况必须在记录里看得见，而不是被最后一个批覆盖掉。
         self.value_targets_used: set[str] = set()
+
+    def add_ranking(self, ranking: torch.Tensor, batch: Batch) -> None:
+        """累计排序项（按这一批的候选质量加权，与损失里的口径一致）。"""
+        weight = float(batch.candidate_weight.sum())
+        self._ranking_sum += float(ranking) * weight
+        self._ranking_weight += weight
+
+    def ranking_loss(self) -> float:
+        """排序项的加权均值（**分数单位**，与候选 MAE 同一量纲，便于比较两者量级）。"""
+        if self._ranking_weight <= 0:
+            return float("nan")
+        return self._ranking_sum / self._ranking_weight * self.score_scale
 
     def add_value(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
         self.value_abs += (prediction.double() - target.double()).abs().sum()
@@ -340,36 +506,49 @@ class _Metrics:
         self._policy_agreement_sum += stats.agreement * stats.records
         self.policy_count += stats.records
 
-    def add_candidates(self, prediction: torch.Tensor, target: torch.Tensor, weight: torch.Tensor) -> None:
+    def add_candidates(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        weight: torch.Tensor,
+        reward: torch.Tensor | None = None,
+    ) -> None:
         """候选预测与搜索给出的候选目标对比。
 
         排序指标用“同根成对一致率”而不是 Spearman：每个根只有 2~4 个候选，
         成对一致率等价于 Kendall tau 的分子，且在候选数少时更稳定、更容易解释。
+
+        `reward` 是每个候选的立即合并得分 r(s,a)：给了它，就**同时**累计一套 r+A 口径的
+        排序指标（成对一致率 / 最优命中 / 后悔值）。两套口径回答两个不同的问题：
+
+        * **A 口径**（不加 r）＝"价值头把 afterstate 价值预测得准不准"。这是价值头该学的量
+          ——它的输入是 afterstate `u = T(s,a)`，而 `r(s,a)` **不是 u 的函数**（同一个
+          afterstate 既能由"合并出 4"产生、也能由"本来就有 4 只是平移"产生），所以网络
+          原理上无法预测 r+A，r 必须在查询时由规则加上。
+        * **r+A 口径**＝"引擎会不会选对"。引擎的选择值是 `one_ply = r + A`
+          （`cpp/search/batched_engine.cpp`），所以只有加上 r 之后排序才与搜索同一口径。
+
+        两个口径在真数据上的差别不小（r 能改写 3%~13% 的 argmax，全是价值几乎并列的根），
+        而**加 r 不改变预测误差**——`(pred+r) − (target+r) = pred − target`，所以 MAE/后悔值
+        的量级不变，变的只有"谁排第一"。见 ADR 0034。
         """
         valid = weight > 0
         self.candidate_weight += weight.double().sum()
         self.candidate_abs_error += ((prediction - target).double().abs() * weight.double()).sum()
 
-        for first, second in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
-            pair_valid = valid[:, first] & valid[:, second] & (target[:, first] != target[:, second])
-            if not bool(pair_valid.any()):
-                continue
-            agree = (prediction[:, first] - prediction[:, second]).sign() == (
-                target[:, first] - target[:, second]
-            ).sign()
-            self.concordant += (agree & pair_valid).double().sum()
-            self.discordant += (~agree & pair_valid).double().sum()
-
-        has_two = valid.sum(dim=1) >= 2
-        if bool(has_two.any()):
-            masked_prediction = prediction.masked_fill(~valid, float("-inf"))
-            masked_target = target.masked_fill(~valid, float("-inf"))
-            picked = masked_prediction.argmax(dim=1)
-            best = masked_target.argmax(dim=1)
-            self.best_hit += (picked[has_two] == best[has_two]).double().sum()
-            self.best_total += has_two.double().sum()
-            picked_value = target.gather(1, picked[:, None]).squeeze(1)
-            self.regret += (masked_target.max(dim=1).values[has_two] - picked_value[has_two]).double().sum()
+        ranking = _ranking_totals(prediction, target, valid, self.device)
+        self.concordant += ranking[0]
+        self.discordant += ranking[1]
+        self.best_hit += ranking[2]
+        self.best_total += ranking[3]
+        self.regret += ranking[4]
+        if reward is not None:
+            q_ranking = _ranking_totals(prediction + reward, target + reward, valid, self.device)
+            self.q_concordant += q_ranking[0]
+            self.q_discordant += q_ranking[1]
+            self.q_best_hit += q_ranking[2]
+            self.q_best_total += q_ranking[3]
+            self.q_regret += q_ranking[4]
 
     def candidate_mae(self) -> float:
         if float(self.candidate_weight) <= 0:
@@ -377,18 +556,25 @@ class _Metrics:
         return float((self.candidate_abs_error / self.candidate_weight).item() * self.score_scale)
 
     def pair_agreement(self) -> float:
-        total = float(self.concordant + self.discordant)
-        return float(self.concordant) / total if total > 0 else float("nan")
+        return _ratio(self.concordant, self.concordant + self.discordant)
 
     def best_candidate_hit(self) -> float:
-        return float(self.best_hit / self.best_total) if float(self.best_total) > 0 else float("nan")
+        return _ratio(self.best_hit, self.best_total)
 
     def candidate_regret(self) -> float:
-        return (
-            float(self.regret / self.best_total * self.score_scale)
-            if float(self.best_total) > 0
-            else float("nan")
-        )
+        return _mean_score(self.regret, self.best_total, self.score_scale)
+
+    def q_pair_agreement(self) -> float:
+        """r+A 口径的同根成对一致率（与搜索实际排序同一口径）。"""
+        return _ratio(self.q_concordant, self.q_concordant + self.q_discordant)
+
+    def q_best_candidate_hit(self) -> float:
+        """r+A 口径的最优候选命中率：预测的 argmax(r+A) 是否等于目标的 argmax(r+A)。"""
+        return _ratio(self.q_best_hit, self.q_best_total)
+
+    def q_candidate_regret(self) -> float:
+        """r+A 口径的后悔值：按预测的 argmax(r+A) 走，比最优候选少拿多少 Q（分数单位）。"""
+        return _mean_score(self.q_regret, self.q_best_total, self.score_scale)
 
     def value_mae(self) -> float:
         return (
@@ -456,6 +642,75 @@ def _value_loss(
     return (per_candidate * weight).sum() / total_weight, prediction.detach()
 
 
+# 排序项的"让步界限"（分数单位）：预测的 Q 间隔只要超过它，这一对就算学对了。
+# 取 20 分 ≈ 这条线上候选 MAE 的一半（r6 的验证候选 MAE 约 40 分）——比它更小的间隔本来就
+# 埋在价值头自己的误差里，不值得去追。它只影响近并列的那些对，不影响"符号错"的惩罚。
+_RANKING_MARGIN_POINTS = 20.0
+
+
+def _ranking_loss(prediction: torch.Tensor, batch: Batch, score_scale: float) -> torch.Tensor:
+    """Q 空间的同根成对排序项：按 Q 间隔加权的**软成对后悔**。
+
+    为什么在 Q = r + A 空间做：引擎的选择值就是 `one_ply = r + A`（ADR 0034）。把 r 加在
+    预测与目标两边**不改变预测误差**——`(pred+r) − (target+r) = pred − target`，所以 Huber
+    在两种口径下逐值相同，这也是"价值头只能训 A"的由来（r 不是 afterstate 的函数，网络学
+    不到它）。**但成对的标签会变**：A 口径比 `target_a vs target_b`，Q 口径比
+    `target_a + r_a vs target_b + r_b`，在 r6 的批上 12.9% 的根给出不同的 argmax。所以这一项
+    不是"换个度量再训一遍"，它喂给网络的监督本身不同。
+
+    形状：对每根的每对合法候选，令 g = 目标 Q 间隔、h = 预测 Q 间隔，取
+
+        |g| · τ · softplus(−h · sign(g) / τ)
+
+    * `τ·softplus(x/τ)` 是 `relu(x)` 的平滑版（τ→0 就是它），所以这一项**在极限上等于成对
+      后悔**：符号错就罚 |g|·|h|，符号对（且间隔超过 τ）就趋 0。用 |g| 当权重 = "按这一对值
+      多少分罚"，于是它的量纲与 Huber 的 MAE 可比，`value_ranking_weight` 有直接含义
+      （1.0 = 一分软后悔与一分 MAE 同权）。
+    * 只看**符号**而不要求间隔匹配：决策只取决于 argmax，间隔差多少不影响走哪一步。
+    * 目标间隔为 0 的对不计入（没有可学的排序）。
+    """
+    margin = _RANKING_MARGIN_POINTS / score_scale
+    count = batch.decision.shape[0]
+    predicted = prediction.reshape(count, int(r2048_core.NUM_ACTIONS))
+    valid = batch.candidate_weight > 0
+    q_predicted = predicted + batch.candidate_reward
+    q_target = batch.candidate_value + batch.candidate_reward
+    total = torch.zeros((), dtype=torch.float32, device=prediction.device)
+    used = torch.zeros(count, dtype=torch.bool, device=prediction.device)
+    for first, second in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
+        pair_valid = valid[:, first] & valid[:, second]
+        if not bool(pair_valid.any()):
+            continue
+        gap_target = (q_target[:, first] - q_target[:, second]) * pair_valid
+        pair_weight = gap_target.abs()
+        usable = pair_valid & (pair_weight > 0)
+        if not bool(usable.any()):
+            continue
+        gap_predicted = (q_predicted[:, first] - q_predicted[:, second]) * pair_valid
+        pair_loss = margin * F.softplus(-gap_predicted * gap_target.sign() / margin)
+        total = total + (pair_loss * pair_weight)[usable].sum()
+        used = used | usable
+    # 按**根**归一化：这一项于是是"每一步决策的软后悔（分数）"，与候选 MAE（每个候选的误差，
+    # 分数）同一量纲、同一量级，`value_ranking_weight` 才有可比的含义。按间隔和归一化会被
+    # "间隔大、本来就容易对"的那些对稀释，同一个错误报出来的数会小一个量级。
+    return total / used.double().sum().clamp_min(1.0)
+
+
+def _add_ranking(
+    metrics: _Metrics, config: TrainConfig, prediction: torch.Tensor, batch: Batch
+) -> torch.Tensor:
+    """算排序项并把它加进损失；顺带把"排序项自己有多大"记进指标。
+
+    为什么必须单独记账：这一项与 Huber 的量纲都是"分数"，但两者的实际量级差几倍到几十倍，
+    权重取值是否合理只能从这两个数上读出来——否则"加了排序项"会变成一个看不见的配方改动。
+    """
+    if config.value_ranking_weight <= 0:
+        return torch.zeros((), dtype=torch.float32, device=prediction.device)
+    ranking = _ranking_loss(prediction, batch, metrics.score_scale)
+    metrics.add_ranking(ranking.detach(), batch)
+    return config.value_ranking_weight * ranking
+
+
 def _run_epoch(
     model: torch.nn.Module,
     stream: BatchStream,
@@ -498,16 +753,24 @@ def _run_epoch(
         if step < skip:
             continue
         batch = batch.to(device)
+        # 改进目标必须在增强**之前**从原始候选块算出来：增强会按方向重排棋盘、合法掩码与
+        # 目标，而候选块（candidate_value/reward/visits）是"按方向下标对齐"的，先增强棋盘
+        # 再从候选块算目标，方向就对不上了。算好之后把目标交给增强函数一起变换即可。
+        target = (
+            improved_policy_target(batch, config.improve_beta, config.improve_floor)
+            if config.policy_target == "improved"
+            else batch.policy_target
+        )
         if augment:
             if config.mode == "value":
                 batch.afterstate = augment_value(batch.afterstate, rng)
             elif config.mode == "policy":
-                batch.decision, batch.legal_mask, batch.policy_target = augment_policy(
-                    batch.decision, batch.legal_mask, batch.policy_target, rng
+                batch.decision, batch.legal_mask, target = augment_policy(
+                    batch.decision, batch.legal_mask, target, rng
                 )
             else:
-                (batch.decision, batch.afterstate, batch.legal_mask, batch.policy_target) = augment_joint(
-                    batch.decision, batch.afterstate, batch.legal_mask, batch.policy_target, rng
+                (batch.decision, batch.afterstate, batch.legal_mask, target) = augment_joint(
+                    batch.decision, batch.afterstate, batch.legal_mask, target, rng
                 )
 
         with torch.set_grad_enabled(training):
@@ -518,6 +781,10 @@ def _run_epoch(
             use_candidates = want_value and config.value_target != "trajectory" and batch.has_candidates
             if config.value_target == "candidate" and want_value and not batch.has_candidates:
                 raise ValueError("要求候选目标，但这一批数据没有候选监督（检查数据是否由搜索产出）")
+            if config.policy_target == "improved" and want_policy and not batch.has_candidates:
+                # 没有候选块就无法重建 Q，"改进"会安静地退化成原访问分布——那等于
+                # "改了参数却没生效"，必须变成显式失败（同 value_target=candidate 的口径）。
+                raise ValueError("要求改进的策略目标，但这一批数据没有候选监督（检查数据是否由搜索产出）")
             if want_value:
                 metrics.value_targets_used.add("candidate" if use_candidates else "trajectory")
             count = batch.decision.shape[0]
@@ -536,11 +803,14 @@ def _run_epoch(
                     value_loss, value_pred = _value_loss(values[count:], batch, use_candidates, config)
                     loss = loss + config.value_weight * value_loss
                     if use_candidates:
-                        metrics.add_candidates(value_pred, batch.candidate_value, batch.candidate_weight)
+                        metrics.add_candidates(
+                            value_pred, batch.candidate_value, batch.candidate_weight, batch.candidate_reward
+                        )
+                        loss = loss + _add_ranking(metrics, config, values[count:], batch)
                     else:
                         metrics.add_value(value_pred, batch.value_target)
                 if want_policy:
-                    stats = policy_loss(logits[:count], batch)
+                    stats = policy_loss(logits[:count], batch, target)
                     if stats is not None:
                         loss = loss + config.policy_weight * stats.loss
                         metrics.add_policy(stats)
@@ -556,11 +826,14 @@ def _run_epoch(
                     value_loss, value_pred = _value_loss(values, batch, use_candidates, config)
                     loss = loss + config.value_weight * value_loss
                     if use_candidates:
-                        metrics.add_candidates(value_pred, batch.candidate_value, batch.candidate_weight)
+                        metrics.add_candidates(
+                            value_pred, batch.candidate_value, batch.candidate_weight, batch.candidate_reward
+                        )
+                        loss = loss + _add_ranking(metrics, config, values, batch)
                     else:
                         metrics.add_value(value_pred, batch.value_target)
                 if want_policy:
-                    stats = policy_loss(logits, batch)
+                    stats = policy_loss(logits, batch, target)
                     if stats is not None:
                         loss = loss + config.policy_weight * stats.loss
                         metrics.add_policy(stats)
@@ -618,6 +891,16 @@ def _run_epoch(
 def run_training(config: TrainConfig) -> TrainResult:
     if config.mode not in ALL_MODES:
         raise ValueError(f"未知训练模式: {config.mode}")
+    if config.policy_target not in POLICY_TARGETS:
+        raise ValueError(f"未知策略目标口径: {config.policy_target}，可选 {list(POLICY_TARGETS)}")
+    if config.value_ranking_weight < 0:
+        raise ValueError(f"value_ranking_weight 必须 ≥ 0（0 = 关），收到 {config.value_ranking_weight}")
+    if config.value_selection not in VALUE_SELECTIONS:
+        raise ValueError(f"未知 checkpoint 挑选口径: {config.value_selection}，可选 {list(VALUE_SELECTIONS)}")
+    if config.policy_target == "improved" and config.improve_beta <= 0:
+        # β 是"用多少倍同根 std 当温度"，0 或负数会把目标直接退化成 argmax（且负 β 会
+        # 反过来奖励差的候选），这是配置错误而不是一种配方。
+        raise ValueError(f"improve_beta 必须 > 0，收到 {config.improve_beta}")
     if config.mode == "policy" and config.freeze_value and not config.init_checkpoint:
         raise ValueError(
             "冻结价值路径时必须给出 --init-checkpoint：在一个随机初始化的价值头上只训策略头没有意义"
@@ -825,6 +1108,13 @@ def run_training(config: TrainConfig) -> TrainResult:
         f"模式 {config.mode}，结构 {architecture}，可训练参数 {sum(p.numel() for p in trainable):,}，"
         f"冻结张量 {len(frozen)}，批 {config.batch_size}，设备 {device}{' bf16' if amp_dtype else ''}"
     )
+    if config.policy_target != "visits":
+        # 目标口径必须在启动时打印出来：它与默认口径训出的权重不同，日志里看不见就等于
+        # 事后无法判断"这一份是怎么训出来的"。
+        print(
+            f"策略目标 {config.policy_target}：π̃ ∝ π̂·exp(Â/(β·同根 std))，"
+            f"β={config.improve_beta:g}，floor={config.improve_floor:g}"
+        )
 
     # 主指标的方向取决于“这一轮用没用候选监督”，只有进入循环才知道（`best_metric` 与
     # `best_metric_kind` 已在续跑块里恢复，不能在这里清零——那等于每次续跑都重启最佳的选择）。
@@ -885,6 +1175,8 @@ def run_training(config: TrainConfig) -> TrainResult:
         nan = float("nan")
         val_loss, val_mae, val_ce, val_agreement, val_records = nan, nan, nan, nan, 0
         candidate_mae, pair_agreement, best_hit, regret = nan, nan, nan, nan
+        q_pair_agreement, q_best_hit, q_regret = nan, nan, nan
+        ranking = nan
         if val_stream is not None:
             val_loss, val_metrics, _ = _run_epoch(
                 model,
@@ -909,6 +1201,11 @@ def run_training(config: TrainConfig) -> TrainResult:
             pair_agreement = val_metrics.pair_agreement()
             best_hit = val_metrics.best_candidate_hit()
             regret = val_metrics.candidate_regret()
+            # r+A 口径：与引擎的选择值同口径（ADR 0034）。只在数据带候选时才有值。
+            q_pair_agreement = val_metrics.q_pair_agreement()
+            q_best_hit = val_metrics.q_best_candidate_hit()
+            q_regret = val_metrics.q_candidate_regret()
+            ranking = val_metrics.ranking_loss()
 
         entry = EpochMetrics(
             epoch=epoch,
@@ -924,9 +1221,14 @@ def run_training(config: TrainConfig) -> TrainResult:
             val_candidate_pair_agreement=pair_agreement,
             val_candidate_best_hit=best_hit,
             val_candidate_regret=regret,
+            val_candidate_q_pair_agreement=q_pair_agreement,
+            val_candidate_q_best_hit=q_best_hit,
+            val_candidate_q_regret=q_regret,
+            ranking_loss=ranking,
             samples=int(train_indices.size),
             seconds=train_seconds,
             value_target="+".join(sorted(train_metrics.value_targets_used)),
+            policy_target=config.policy_target if trains_policy(config.mode) else "",
         )
         history.append(entry)
         # 主指标：**供应给搜索的价值头必须用同根候选排序来挑，而不是全局 MAE**
@@ -934,6 +1236,15 @@ def run_training(config: TrainConfig) -> TrainResult:
         # 有候选监督时用“最优候选命中率”，否则退回价值 MAE；策略模式看交叉熵。
         if config.mode == "policy":
             primary, maximize, kind = val_ce, False, "val_policy_ce"
+        elif config.value_selection == "q_best_hit":
+            if math.isnan(q_best_hit):
+                # 要求按 r+A 口径挑、却没有候选监督 ⇒ 无从计算。静默退回 A 口径（或 MAE）
+                # 等于"改了参数却没生效"，必须显式失败。
+                raise ValueError(
+                    f"要求按 {config.value_selection} 口径挑 checkpoint，但这一轮没有候选监督"
+                    "（需要搜索产出的数据批）"
+                )
+            primary, maximize, kind = q_best_hit, True, "val_candidate_q_best_hit"
         elif not math.isnan(best_hit):  # 非 NaN 说明这一轮确实用了候选监督
             primary, maximize, kind = best_hit, True, "val_candidate_best_hit"
         else:
@@ -944,10 +1255,12 @@ def run_training(config: TrainConfig) -> TrainResult:
             print(f"上一段的最佳值来自 {best_metric_kind}，本段是 {kind}：不沿用旧的最佳值")
             best_metric, best_metric_kind = None, kind
         best_metric_kind = kind
+        ranking_note = f"，排序项 {ranking:.1f} 分/根" if not math.isnan(ranking) else ""
         print(
             f"第 {epoch + 1}/{config.epochs} 轮：训练损失 {train_loss:.4f}，验证损失 {val_loss:.4f} | "
-            f"候选 MAE {candidate_mae:.1f} 分，成对排序一致率 {pair_agreement * 100:.1f}%，"
-            f"最优候选命中 {best_hit * 100:.1f}%，后悔 {regret:.1f} 分 | "
+            f"候选 MAE {candidate_mae:.1f} 分，A 口径 一致率 {pair_agreement * 100:.1f}%/命中 {best_hit * 100:.1f}%"
+            f"/后悔 {regret:.1f} 分，r+A 口径 一致率 {q_pair_agreement * 100:.1f}%/命中 {q_best_hit * 100:.1f}%"
+            f"/后悔 {q_regret:.1f} 分{ranking_note} | "
             f"策略 CE {val_ce:.4f}（一致率 {val_agreement * 100:.1f}%） | "
             f"{train_seconds:.1f}s（{entry.samples_per_second:.0f} 样本/秒）"
         )
@@ -978,6 +1291,14 @@ def run_training(config: TrainConfig) -> TrainResult:
                     "data_build_id": single_build_id,
                     "config_digest": config_digest(config),
                     "value_target": entry.value_target or "none",
+                    # 价值头是按哪个口径挑出来的（两份权重只差这个旋钮）。
+                    "value_selection": config.value_selection,
+                    "value_ranking_weight": float(config.value_ranking_weight),
+                    # 策略目标的口径与它的两个旋钮必须落在产物里：它是"这一份策略头是纯蒸馏
+                    # 还是被一步改进过"的唯一凭据，而两者训出的是不同权重（同 model_id 陷阱）。
+                    "policy_target": entry.policy_target or "none",
+                    "improve_beta": float(config.improve_beta),
+                    "improve_floor": float(config.improve_floor),
                     "candidate_target_definition": CANDIDATE_TARGET_DEFINITION,
                     "metrics": {
                         "value_mae": entry.val_value_mae,
@@ -985,6 +1306,11 @@ def run_training(config: TrainConfig) -> TrainResult:
                         "candidate_pair_agreement": entry.val_candidate_pair_agreement,
                         "candidate_best_hit": entry.val_candidate_best_hit,
                         "candidate_regret": entry.val_candidate_regret,
+                        # 引擎的选择值是 r + A，所以"会不会选对"看这一组（ADR 0034）。
+                        "candidate_q_pair_agreement": entry.val_candidate_q_pair_agreement,
+                        "candidate_q_best_hit": entry.val_candidate_q_best_hit,
+                        "candidate_q_regret": entry.val_candidate_q_regret,
+                        "ranking_loss": entry.ranking_loss,
                         "policy_ce": entry.val_policy_ce,
                         "policy_agreement": entry.val_policy_agreement,
                     },

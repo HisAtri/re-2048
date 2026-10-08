@@ -182,7 +182,9 @@ def test_batch_stream_normalises_targets(batch_dir: Path) -> None:
     assert float(batch.policy_target.abs().max()) == 0.0
     # 归一化后的价值目标应当量纲合理（分数 / 1024）。
     assert float(batch.value_target.abs().max()) < 100.0
-    assert policy_loss(torch.zeros(128, 4), batch) is None, "无搜索记录时不应产生策略损失"
+    assert policy_loss(torch.zeros(128, 4), batch, batch.policy_target) is None, (
+        "无搜索记录时不应产生策略损失"
+    )
 
 
 def test_policy_target_is_a_distribution(search_batch_dir: Path) -> None:
@@ -203,7 +205,7 @@ def test_policy_target_is_a_distribution(search_batch_dir: Path) -> None:
         assert bool(batch.policy_target[~has_search].abs().max() == 0), "无搜索记录的目标必须为 0"
     # 访问数之和不可能超过模拟次数（根求值那次不落在边上）。
     assert bool((batch.visits.sum(dim=-1) <= batch.visits.new_tensor(8.0) + 1e-6).all())
-    assert policy_loss(torch.randn(int(has_search.sum()), 4), batch) is not None
+    assert policy_loss(torch.randn(int(has_search.sum()), 4), batch, batch.policy_target) is not None
 
 
 def test_candidate_block_matches_rules_and_main_fields(search_batch_dir: Path) -> None:
@@ -269,6 +271,7 @@ def test_candidate_value_loss_and_metrics() -> None:
         episode=torch.zeros(count, dtype=torch.int64),
         candidate_afterstate=torch.zeros(count, 4, 16, dtype=torch.uint8),
         candidate_value=target,
+        candidate_reward=torch.zeros(count, 4),
         candidate_visits=weight,
         candidate_weight=weight,
     )
@@ -291,6 +294,202 @@ def test_candidate_value_loss_and_metrics() -> None:
     noisy_metrics = _Metrics(torch.device("cpu"), 1024.0)
     noisy_metrics.add_candidates(noisy_prediction, target, weight)
     assert noisy_metrics.best_candidate_hit() < 1.0, "带噪声时不可能命中所有最优候选"
+
+
+def test_candidate_ranking_with_and_without_immediate_reward() -> None:
+    """候选排序的两套口径：引擎的选择值是 r + A，而价值头学的只是 A（ADR 0034）。
+
+    两个根各是一侧的典型，方向相反——说明"用哪套口径度量"不是细节，它能直接改变判决：
+
+    * **根 0（用户举的例子）**：up 立即合 512 分、未来价值 1000；left 不合并、未来价值 1200。
+      按 A 排选 left，按 r+A 排选 up（1512 > 1200）。这里让预测的 A 排序与目标 A 相反：
+      **A 口径记为未命中（白丢 200 分），r+A 口径记为命中**（引擎会下对）；
+    * **根 1（反向）**：目标 A 里 up 更高（1200 > 1000），但 left 那一手合 512 分，
+      所以目标的 argmax(r+A) 是 left。预测的 A 排序正确、却把 up 高估到 1600：
+      **A 口径记为命中，r+A 口径记为未命中（按它走丢 312 分 Q）**。
+
+    同时钉住一条不变量：加 r 只平移预测与目标，**误差不变**——所以 MAE 与后悔值的量级与
+    口径无关，变的只有"谁排第一"。这也是为什么只需要给排序指标加一套口径。
+    """
+    from r2048.nn.training import _Metrics
+
+    scale = 1024.0
+
+    def one_root(
+        target_a: list[float], reward: list[float], predicted_a: list[float]
+    ) -> tuple[_Metrics, _Metrics]:
+        """一个根，合法方向取前三个（第 4 槽留空）；返回同一份输入在两种口径下的指标。"""
+
+        def as_row(values: list[float]) -> torch.Tensor:
+            """补足第 4 槽（非法方向）并归一化到 score_scale。"""
+            return torch.tensor([list(values) + [0.0]]) / scale
+
+        legal = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+        metrics = _Metrics(torch.device("cpu"), scale)
+        metrics.add_candidates(as_row(predicted_a), as_row(target_a), legal, as_row(reward))
+        return metrics
+
+    # 根 0：up(r=512, A=1000) / left(r=0, A=1200) / down(0,0)，预测把 up 的 A 高估到 1300。
+    up_merge = one_root([1000.0, 1200.0, 0.0], [512.0, 0.0, 0.0], [1300.0, 1200.0, 0.0])
+    assert up_merge.best_candidate_hit() == pytest.approx(0.0), "A 口径：预测的 argmax(A) 与目标相反"
+    assert up_merge.candidate_regret() == pytest.approx(200.0, abs=1e-3), "A 口径白丢 200 分"
+    assert up_merge.q_best_candidate_hit() == pytest.approx(1.0), "r+A 口径：引擎的判决没被动摇"
+    assert up_merge.q_candidate_regret() == pytest.approx(0.0, abs=1e-3)
+    assert up_merge.pair_agreement() == pytest.approx(2.0 / 3.0), "A 口径：up/left 这一对被判为不一致"
+    assert up_merge.q_pair_agreement() == pytest.approx(1.0), "r+A 口径：三对全一致"
+
+    # 根 1：反向——目标 A 里 up 更高，但 left 那一手合 512 分，所以目标 Q 的最优是 left。
+    left_merge = one_root([1200.0, 1000.0, 0.0], [0.0, 512.0, 0.0], [1600.0, 1000.0, 0.0])
+    assert left_merge.best_candidate_hit() == pytest.approx(1.0), "A 口径：预测的 argmax(A) 正确"
+    assert left_merge.candidate_regret() == pytest.approx(0.0, abs=1e-3)
+    assert left_merge.q_best_candidate_hit() == pytest.approx(0.0), "r+A 口径：把大合并走丢了"
+    assert left_merge.q_candidate_regret() == pytest.approx(312.0, abs=1e-3), "少拿 312 分 Q（1512−1200）"
+    assert left_merge.pair_agreement() == pytest.approx(1.0)
+    assert left_merge.q_pair_agreement() == pytest.approx(2.0 / 3.0)
+
+    # 不给 reward 时 r+A 一整套必须是 NaN（而不是悄悄等于 A 口径）——旧调用点不能因此失真。
+    plain = _Metrics(torch.device("cpu"), scale)
+    plain.add_candidates(
+        torch.tensor([[1.5, 1.0, 0.0, 0.0]]),
+        torch.tensor([[1.0, 1.2, 0.0, 0.0]]),
+        torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+    )
+    assert np.isnan(plain.q_pair_agreement()) and np.isnan(plain.q_best_candidate_hit())
+    assert np.isnan(plain.q_candidate_regret())
+
+    # 误差不变量：加 r 只平移预测与目标 → 加权 MAE 必须完全一致（所以不需要第二套 MAE）。
+    # 这条不是形式主义：它说明"两套口径"只影响判决、不影响误差，指标不会因为换了口径而
+    # 看起来变好或变坏。
+    same_pred = torch.tensor([[1.5, 1.0, 0.0, 0.0]])
+    same_target = torch.tensor([[1.0, 1.2, 0.0, 0.0]])
+    same_reward = torch.tensor([[0.5, 0.0, 0.0, 0.0]])
+    legal = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+    with_reward = _Metrics(torch.device("cpu"), scale)
+    with_reward.add_candidates(same_pred, same_target, legal, same_reward)
+    without = _Metrics(torch.device("cpu"), scale)
+    without.add_candidates(same_pred, same_target, legal)
+    assert with_reward.candidate_mae() == pytest.approx(without.candidate_mae(), abs=1e-9)
+
+
+def test_ranking_loss_only_punishes_decisions() -> None:
+    """Q 空间的同根成对排序项：只罚"改变引擎判决"的误差（ADR 0035）。
+
+    手算表（一个根：up(r=512, A=1000) / left(r=0, A=1200) / down(0,0)，目标 Q = [1512, 1200]）：
+
+    | 预测的 A | A 口径 MAE | 排序项 | 语义 |
+    |---|---|---|---|
+    | [1000, 1200]（与目标一致） | 0 | 0 | 什么都对 |
+    | [1600, 1000]（把 up 高估 600） | 400 | **0** | A 的排序错了，但引擎仍选 up（1512 < 2112） |
+    | [1000, 1600]（把 left 高估 600） | 200 | **>0** | A 的排序"对"，但引擎会改选 left（1600 > 1512） |
+
+    第二行与第三行是这一项存在的全部理由：Huber 罚的是"像不像教师的 A"，而排序项罚的是
+    "引擎会不会走出教师的判决"——两者的差别在 r 能改写 argmax 的那 12.9% 的根上（ADR 0034）。
+    """
+    from r2048.nn.training import _ranking_loss
+
+    scale = 1024.0
+    count = 1
+    target_a = torch.tensor([[1000.0, 1200.0, 0.0, 0.0]]) / scale
+    reward = torch.tensor([[512.0, 0.0, 0.0, 0.0]]) / scale
+    batch = Batch(
+        decision=torch.zeros(count, 16, dtype=torch.uint8),
+        afterstate=torch.zeros(count, 16, dtype=torch.uint8),
+        action=torch.zeros(count, dtype=torch.int64),
+        legal_mask=torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+        visits=torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+        policy_target=torch.zeros(count, 4),
+        value_target=torch.zeros(count),
+        move_score=torch.zeros(count),
+        episode=torch.zeros(count, dtype=torch.int64),
+        candidate_afterstate=torch.zeros(count, 4, 16, dtype=torch.uint8),
+        candidate_value=target_a,
+        candidate_reward=reward,
+        candidate_visits=torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+        candidate_weight=torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+    )
+
+    def loss(predicted_a: list[float]) -> float:
+        prediction = torch.tensor([predicted_a]) / scale
+        return float(_ranking_loss(prediction, batch, scale)) * scale
+
+    assert loss([1000.0, 1200.0, 0.0, 0.0]) == pytest.approx(0.0, abs=1e-3), "完美预测必须为 0"
+    assert loss([1600.0, 1000.0, 0.0, 0.0]) == pytest.approx(0.0, abs=1e-3), (
+        "A 的排序错了但引擎的判决没变（2112 > 1512，仍选 up）⇒ 不该罚"
+    )
+    wrong_decision = loss([1000.0, 1600.0, 0.0, 0.0])
+    assert wrong_decision > 5.0, "把 left 高估到让引擎改选它 ⇒ 必须罚（1512 vs 1600）"
+    assert loss([800.0, 1800.0, 0.0, 0.0]) > wrong_decision, "错得越离谱，罚得越重"
+    # 合法失败的极端情形仍有界：上界是"这一对的 Q 间隔"（成对后悔的定义）。
+    assert wrong_decision < 312.0, "软 hinge 的有界性：不会超过该对的目标 Q 间隔"
+
+
+def test_improved_policy_target_arithmetic_and_limits() -> None:
+    """一步策略改进的目标：手算值、β→∞ 的极限、无候选的回退。
+
+    这里的两个极限是本算子的**唯一**可离线验证的性质（"改进后是不是更好"必须靠对局评测，
+    因为"用同一个 Q 度量改进"是恒真的，见 ADR 0032）：
+    * β→∞ 必须逐样本退化成原访问分布——这条一旦不成立，A/B 的差异就分不清是算子还是别的；
+    * 没有候选监督的记录必须原样保留 π̂，否则混入随机策略批次时会把垃圾写进目标。
+    """
+    from r2048.nn.training import improved_policy_target, model_id_for
+
+    count = 2
+    legal = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 0.0, 1.0, 0.0]])
+    visits = torch.tensor([[8.0, 2.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+    reward = torch.tensor([[10.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+    value = torch.tensor([[100.0, 90.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+    # 第二条记录没有候选监督（权重为 0），它的目标必须保持原样。
+    weight = torch.tensor([[1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+    fallback = torch.tensor([[0.5, 0.5, 0.0, 0.0], [0.25, 0.25, 0.25, 0.25]])
+    batch = Batch(
+        decision=torch.zeros(count, 16, dtype=torch.uint8),
+        afterstate=torch.zeros(count, 16, dtype=torch.uint8),
+        action=torch.zeros(count, dtype=torch.int64),
+        legal_mask=legal,
+        visits=visits,
+        policy_target=fallback,
+        value_target=torch.zeros(count),
+        move_score=torch.zeros(count),
+        episode=torch.zeros(count, dtype=torch.int64),
+        candidate_afterstate=torch.zeros(count, 4, 16, dtype=torch.uint8),
+        candidate_value=value,
+        candidate_reward=reward,
+        candidate_visits=visits,
+        candidate_weight=weight,
+    )
+    # Q = r + A = [110, 90]；π̂ = [0.8, 0.2]；V = 106；Â = [4, −16]；同根 std = 10。
+    # β=1 ⇒ 权重 = [1, e^{−2}] ⇒ π̃ ∝ [0.8, 0.2·e^{−2}, 0, 0]。
+    raw = torch.tensor([0.8, 0.2 * float(torch.exp(torch.tensor(-2.0))), 0.0, 0.0])
+    expected = raw / raw.sum()
+    target = improved_policy_target(batch, beta=1.0, floor=0.0)
+    assert torch.allclose(target[0], expected, atol=1e-5), f"π̃ 与手算不符: {target[0]}"
+    assert torch.allclose(target[1], fallback[1], atol=1e-9), "无候选监督的记录必须保持 π̂"
+
+    # β→∞：指数项恒为 0，权重全 1，π̃ 必须逐样本等于 π̂ = visits/Σvisits（不是"接近"）。
+    limit = improved_policy_target(batch, beta=float("inf"), floor=0.0)
+    assert torch.allclose(limit[0], torch.tensor([0.8, 0.2, 0.0, 0.0]), atol=1e-7), "β→∞ 必须退化回访问分布"
+
+    # 目标必须是概率分布，且带候选的那条记录在非法方向上恒为 0
+    # （第 2 条走的是回退路径、原样保留传入的 π̂，真实数据里它本来就只落在合法方向上）。
+    for candidate in (target, limit):
+        assert torch.allclose(candidate.sum(dim=-1), torch.ones(count), atol=1e-5)
+        assert float(candidate[0][~legal[0].bool()].abs().max()) == 0.0
+
+    # model_id 必须能区分同一个 mode + 同一批数据下的两种策略目标（ADR 0030 的同名事故）。
+    plain = TrainConfig(datasets=[DatasetSpec(path="/data/批")], output="x", mode="policy")
+    improved = TrainConfig(
+        datasets=[DatasetSpec(path="/data/批")], output="x", mode="policy", policy_target="improved"
+    )
+    assert model_id_for(plain, "candidate") != model_id_for(improved, "candidate")
+    assert model_id_for(improved, "candidate") == "policy-批+improved-b1"
+    # 同一批数据、同一个种子、只换 checkpoint 挑选口径 ⇒ 两份不同权重，名字必须分得开。
+    q_selected = TrainConfig(
+        datasets=[DatasetSpec(path="/data/批")], output="x", mode="value", value_selection="q_best_hit"
+    )
+    assert model_id_for(q_selected, "candidate") == "value-批+q_best_hit"
+    assert model_id_for(q_selected, "candidate") != model_id_for(
+        TrainConfig(datasets=[DatasetSpec(path="/data/批")], output="x", mode="value"), "candidate"
+    )
 
 
 @pytest.mark.parametrize("rotation", range(4))
@@ -434,6 +633,46 @@ def test_policy_training_requires_trained_head_source(batch_dir: Path, tmp_path:
     )
     with pytest.raises(ValueError, match="init-checkpoint"):
         run_training(config)
+
+
+def test_improved_target_requires_candidates(batch_dir: Path, tmp_path: Path) -> None:
+    """要求改进目标却没有候选块时必须报错，而不是安静地退化回访问分布。
+
+    `batch_dir` 是随机策略批次（没有候选监督，也就无法重建 Q）。这类批次上"改进"没有
+    任何材料可用，静默退回原口径等于"改了参数却没生效"——那是这个仓库明确拒绝的一类错误。
+    """
+    value_run = run_training(
+        training_config(batch_dir, tmp_path / "value", mode="value", epochs=1, device="cpu", log_every=0)
+    )
+    config = training_config(
+        batch_dir,
+        tmp_path / "policy",
+        mode="policy",
+        freeze_value=True,
+        init_checkpoint=value_run.best_checkpoint,
+        policy_target="improved",
+        epochs=1,
+        device="cpu",
+        log_every=0,
+    )
+    with pytest.raises(ValueError, match="候选监督"):
+        run_training(config)
+    # β ≤ 0 是配置错误（会把目标退化成 argmax 或反过来奖励差的候选），也必须在开跑前失败。
+    with pytest.raises(ValueError, match="improve_beta"):
+        run_training(
+            training_config(
+                batch_dir,
+                tmp_path / "policy-bad-beta",
+                mode="policy",
+                freeze_value=True,
+                init_checkpoint=value_run.best_checkpoint,
+                policy_target="improved",
+                improve_beta=0.0,
+                epochs=1,
+                device="cpu",
+                log_every=0,
+            )
+        )
 
 
 # --- P3a：多来源的身份、划分与采样 -------------------------------------------------

@@ -64,6 +64,9 @@ class IterateConfig:
     lanes: int = 64
     in_flight: int = 8
     search_threads: int = 1
+    # 跑谱的并行度：>1 时起 N 个进程写同一批（每个 worker 单线程，数据可复现，ADR 0031）。
+    # 样本目标是整批的，所以进程数可以按机器随便改，不需要分摊配额（ADR 0029 的订正）。
+    data_workers: int = 4
     # 纯 C++ 教师的 rollout 续弈策略（uniform / greedy）。默认 greedy：它决定候选价值
     # 标签的同根区分度，而模型强度跟着区分度走（ADR 0030 的实测）。它进数据批的来源记录，
     # 所以改了它就是换了教师。
@@ -151,35 +154,56 @@ def _step_selfplay(config: IterateConfig, written: dict, job: JobDir) -> dict:
         device = torch.device(config.device)
         model, metadata = load_checkpoint(config.init_checkpoint, device)
         model_id = str(metadata.get("model_id", "")) or Path(config.init_checkpoint).parent.name
-        result = run_selfplay(
-            SelfplayConfig(
-                data_dir=str(data_dir),
-                batch_id=batch_id,
-                samples=config.samples,
-                seed=config.data_seed,
-                model_id=model_id,
-                simulations=config.simulations,
-                lanes=config.lanes,
-                in_flight_per_lane=config.in_flight,
-                search_threads=config.search_threads,
-                c_puct=config.c_puct,
-                # 接上进度回调：相位汇总（谁在等谁、GPU 忙占比）要落到作业日志里，
-                # 而不是只打在终端上——跑完一轮还想回看时，终端已经滚掉了。
-                on_progress=config.on_progress,
-            ),
-            model,
-            device,
+        selfplay_config = SelfplayConfig(
+            data_dir=str(data_dir),
+            batch_id=batch_id,
+            samples=config.samples,
+            seed=config.data_seed,
+            model_id=model_id,
+            simulations=config.simulations,
+            lanes=config.lanes,
+            in_flight_per_lane=config.in_flight,
+            search_threads=config.search_threads,
+            c_puct=config.c_puct,
+            # 接上进度回调：相位汇总（谁在等谁、GPU 忙占比）要落到作业日志里，
+            # 而不是只打在终端上——跑完一轮还想回看时，终端已经滚掉了。
+            on_progress=config.on_progress,
         )
+        if config.data_workers > 1:
+            # 并行跑谱走**多进程**：每个 worker 单线程，数据因此可复现（ADR 0031），
+            # 而样本目标按整批判定，所以进程数随便改、不用分摊配额（ADR 0029 的订正）。
+            from r2048.runtime.worker_pool import run_selfplay_workers
+
+            workers_result = run_selfplay_workers(
+                selfplay_config,
+                config.init_checkpoint,
+                config.device,
+                config.data_workers,
+                on_progress=config.on_progress,
+            )
+            manifest_path = workers_result.manifest_path
+            samples, episodes, state = (
+                workers_result.samples,
+                workers_result.episodes,
+                workers_result.state,
+            )
+            samples_per_second = workers_result.samples_per_second
+        else:
+            result = run_selfplay(selfplay_config, model, device)
+            manifest_path = result.manifest_path
+            samples, episodes, state = result.samples, result.episodes, result.state
+            samples_per_second = result.samples_per_second
         return {
             "batch_id": batch_id,
             "data_dir": str(data_dir),
-            "manifest": result.manifest_path,
+            "manifest": manifest_path,
             "teacher": f"nn:{model_id}",
-            "samples": result.samples,
-            "episodes": result.episodes,
-            "state": result.state,
+            "samples": samples,
+            "episodes": episodes,
+            "state": state,
             "seed": config.data_seed,
-            "samples_per_second": round(result.samples_per_second, 1),
+            "data_workers": config.data_workers,
+            "samples_per_second": round(samples_per_second, 1),
         }
 
     # 首轮：纯 C++ MCTS 教师。走 `generate` 而不是 Python 自对弈——这一轮没有模型，

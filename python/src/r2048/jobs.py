@@ -73,13 +73,18 @@ def progress_payload(
 
 
 def console_progress(payload: dict) -> None:
-    """默认的进度呈现：覆盖式一行。终端里与改动前完全一样。"""
-    print("\r" + payload["line"], end="", flush=True)
+    """默认的进度呈现：覆盖式一行。
+
+    **打到 stderr**：stdout 是结果通道（ADR 0008：末行是产物路径 / 汇总 JSON），
+    脚本用 `$(r2048 selfplay ... | tail -1)` 取清单路径时不该收到一屏进度。
+    C++ 子命令那边（`core/logging.cpp`）本来就全部走 stderr，两边因此一致。
+    """
+    print("\r" + payload["line"], end="", file=sys.stderr, flush=True)
 
 
 def finish_console() -> None:
-    """覆盖式打印收尾：换行，否则后续输出会接在同一行上。"""
-    print()
+    """覆盖式打印收尾：换行，否则后续输出会接在同一行上。同样走 stderr。"""
+    print(file=sys.stderr, flush=True)
 
 
 @dataclass

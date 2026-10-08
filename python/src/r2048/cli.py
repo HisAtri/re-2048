@@ -201,6 +201,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="加入已有批次并行写（多个进程指向同一个 --out）：局号跨进程统一发放，仍是一个批次",
     )
     selfplay.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "起 N 个进程写同一批数据（默认 1 = 本进程自己跑）。N>1 时本进程只做监督："
+            "起 N 个 --join worker、报批级进度、把 Ctrl-C 变成一次 stop 广播。"
+            "样本目标是整批的，进程数随便改（ADR 0029 的订正）；worker 一律单线程（ADR 0031）"
+        ),
+    )
+    selfplay.add_argument(
         "--control", default="", help="控制文件路径（默认 <数据批目录>/control，内容是 pause/stop）"
     )
 
@@ -247,6 +257,12 @@ def _build_parser() -> argparse.ArgumentParser:
     iterate.add_argument("--lanes", type=int, default=64)
     iterate.add_argument("--in-flight", type=int, default=8)
     iterate.add_argument("--search-threads", type=int, default=1, help="推进 lane 的线程数（协议参数）")
+    iterate.add_argument(
+        "--data-workers",
+        type=int,
+        default=4,
+        help="跑谱并行度：起 N 个进程写同一批（每 worker 单线程，数据可复现；样本目标按整批算）",
+    )
     iterate.add_argument(
         "--rollout-policy",
         default="greedy",
@@ -587,6 +603,33 @@ def _command_selfplay(args: argparse.Namespace) -> int:
     # 两个并列的目录里，事后能一眼对上。**join 时按进程分目录**：多个进程共用一个
     # 作业目录会互相踩 status.json.tmp（实测直接崩掉两个进程）。
     job_id = f"{batch_id}-p{os.getpid()}" if args.join else batch_id
+    if args.workers > 1:
+        # 多进程：本进程只做监督，worker 是各自独立的进程（它们会各自建自己的作业目录）。
+        from r2048.runtime.worker_pool import run_selfplay_workers
+
+        with JobDir(job_id, "selfplay", params={**config.__dict__, "workers": args.workers}) as job:
+            workers_result = run_selfplay_workers(
+                config, args.checkpoint, args.device, args.workers, on_progress=job.callback()
+            )
+            job.finish(
+                manifest=workers_result.manifest_path,
+                state=workers_result.state,
+                samples=workers_result.samples,
+                episodes=workers_result.episodes,
+                seconds=round(workers_result.seconds, 3),
+            )
+        print(
+            f"完成：{args.workers} 个进程写同一批，状态 {workers_result.state}，"
+            f"样本 {workers_result.samples}，局数 {workers_result.episodes}，"
+            f"耗时 {workers_result.seconds:.1f} 秒"
+            f"（{workers_result.samples_per_second:.0f} 样本/秒）",
+            file=sys.stderr,
+        )
+        for index, log in enumerate(workers_result.logs):
+            print(f"  worker-{index} 日志：{log}", file=sys.stderr)
+        print(workers_result.manifest_path)
+        return 0
+
     with JobDir(job_id, "selfplay", params=config.__dict__) as job:
         config.on_progress = job.callback()
         result = run_selfplay(config, model, device)
@@ -655,6 +698,7 @@ def _command_iterate(args: argparse.Namespace) -> int:
         lanes=args.lanes,
         in_flight=args.in_flight,
         search_threads=args.search_threads,
+        data_workers=args.data_workers,
         rollout_policy=args.rollout_policy,
         c_puct=args.c_puct,
         device=args.device,

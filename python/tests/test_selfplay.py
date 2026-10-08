@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -22,6 +21,7 @@ import torch
 
 from r2048.nn.model import create_model
 from r2048.runtime.selfplay import SelfplayConfig, run_selfplay
+from r2048.runtime.worker_pool import run_selfplay_workers
 
 # 小规模：测试只验证链路与不变式，不追求成绩。
 SMALL = {"samples": 1200, "simulations": 8, "lanes": 8, "in_flight_per_lane": 4, "shard_samples": 1200}
@@ -134,63 +134,42 @@ def test_extension_exposes_protocol_versions() -> None:
     )
 
 
-def _python_cli() -> list[str]:
+def test_selfplay_workers_share_one_batch(tmp_path: Path) -> None:
+    """多进程跑谱：N 个 worker 写同一批，且 `--samples` 是**整批**目标。
+
+    这条同时守住两件事：
+    1. `run_selfplay_workers` 起的是 N 个真进程（每个单线程，ADR 0031 的可复现前提），
+       它们通过 `--join` 写进同一个批次目录；
+    2. 目标按整批判定——旧实现是每个进程各跑满一次，2 个 worker 会产出接近 2× 目标。
+       上界 1.4× 正是用来把两种语义分开的：现在的超出量只有"在途的局"（达标后进行中的局
+       必须走完，否则局号会出现空洞）。
+    """
     if not os.environ.get("R2048_TEST_BINARY"):
         pytest.skip("未设置 R2048_TEST_BINARY：通过 make test 运行")
-    return [sys.executable, "-m", "r2048"]
-
-
-def test_join_samples_target_is_batch_level(tmp_path: Path) -> None:
-    """多进程 join 下 `--samples` 是**整批**目标，不是每个进程各跑满一次。
-
-    判据用上界把两种语义分开：旧实现（按本进程算）在 2 个进程下会产出接近 2× 目标；
-    现在的实现只多出"在途的局"——达标后正在进行的局必须走完（否则局号会出现空洞），
-    所以超出量 ≈ 在途局数 × 每局样本数，量级远小于一倍。数据集不需要精确规模，
-    这个粒度换来的是"进程数随便改、不用给每个进程分摊配额"（ADR 0029 的订正）。
-    """
-    data_dir = tmp_path / "joined"
+    data_dir = tmp_path / "workers-batch"
     target = 6000
-    args = [
-        "--out",
-        str(data_dir),
-        "--batch-id",
-        "joined-target-test",
-        "--samples",
-        str(target),
-        "--seed",
-        "777",
-        "--random-init",
-        "--simulations",
-        "4",
-        "--lanes",
-        "4",
-        "--in-flight",
-        "2",
-        "--shard-samples",
-        "1000",
-        "--search-threads",
-        "1",
-        "--join",
-        "--device",
-        _device().type,
-    ]
-    procs = [
-        subprocess.Popen(
-            [*_python_cli(), "selfplay", *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        for _ in range(2)
-    ]
-    for proc in procs:
-        out, err = proc.communicate(timeout=600)
-        assert proc.returncode == 0, f"子进程失败：\n{out}\n{err}"
+    config = SelfplayConfig(
+        data_dir=str(data_dir),
+        batch_id="workers-test",
+        samples=target,
+        seed=4242,
+        model_id="random-init",
+        simulations=4,
+        lanes=4,
+        in_flight_per_lane=2,
+        shard_samples=1000,
+        max_batch=4096,
+        search_threads=1,
+        progress_every=0.0,
+    )
+    result = run_selfplay_workers(config, "", _device().type, 2)
 
     manifest = json.loads((data_dir / "manifest.json").read_text())
+    assert result.worker_exits == [0, 0], f"worker 退出码异常：{result.worker_exits}"
+    assert result.samples == manifest["samples"], "监督进程的汇总必须与清单同源"
     assert manifest["state"] == "complete", "达标停车应当把状态记成 complete"
     assert manifest["samples"] >= target, "应当至少产出到目标"
-    # 2 个进程 × 4 lane 的在途局 + 250ms 刷新滞后，远小于"每个进程各跑满一次"的两倍。
+    # 2 个 worker × 4 lane 的在途局 + 刷新滞后，远小于"每个进程各跑满一次"的两倍。
     assert manifest["samples"] <= target * 1.4, (
         f"批级总量 {manifest['samples']} 超出目标 {target} 太多——"
         "像是又变回了按进程计目标（每个进程各跑满一次）"

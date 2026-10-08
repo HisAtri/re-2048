@@ -313,7 +313,10 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
         # 正常路径已经在上面收尾过；异常路径（含第二次 Ctrl-C）在这里兜底提交。
         if result is None:
             result = finish()
-        if config.progress_every > 0 and config.on_progress is None:
+        # 覆盖式进度收尾：两种路径都要换行——走回调时 JobDir 的 callback 里也会调
+        # console_progress 打印那一行，只按"是不是回调"来决定换行会让日志把进度行和
+        # 后面的汇总粘在一起（实测：…批均值 19 行完成：状态 complete…）。
+        if config.progress_every > 0:
             finish_console()
 
     return result

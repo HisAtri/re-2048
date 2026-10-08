@@ -72,6 +72,22 @@ def test_board_is_a_real_tile_component() -> None:
     assert "grid-template-columns" in html, "布局靠网格，不靠表格列宽"
 
 
+def test_board_scales_to_its_container() -> None:
+    """棋盘宽度必须**跟着容器走**，不能由内容决定。
+
+    上一版是"固定格子尺寸 + width:max-content"：父容器的宽度是 flex 算出来的、猜不准，
+    只要比棋盘窄一点点就直接溢出成一条横向滚动条——用户实测截图里就是那样（棋盘被挤成
+    一条缝，底下一条滚动条）。这条钉住三件事：宽度取 100%、列宽用 1fr、方块用 aspect-ratio
+    保持正方形。只断言"棋盘画出来了"是拦不住这次的回归的。
+    """
+    html = render_board(np.zeros(16, dtype=np.uint8))
+    assert "width: 100%" in html, "棋盘宽度要跟着容器，不能由内容决定"
+    assert "repeat(4, 1fr)" in html, "四列要等分容器宽度"
+    assert "aspect-ratio: 1" in html, "方块要靠 aspect-ratio 保持正方形"
+    # 断言的是**声明**而不是出现过的字符串：注释里正解释着这条规则为什么被换掉。
+    assert "width: max-content" not in html, "width:max-content 正是溢出成滚动条的那条规则"
+
+
 def test_board_marks_the_engine_choice() -> None:
     board = np.zeros(16, dtype=np.uint8)
     board[0] = 1

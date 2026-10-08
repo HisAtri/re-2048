@@ -56,12 +56,16 @@ _FONT = 'system-ui, "Segoe UI", "Helvetica Neue", Arial, "PingFang SC", sans-ser
 
 # 页面样式自带一份（带 r2048- 前缀），免得跟 Gradio 自己的 CSS 打架。
 _STYLE = f"""<style>
-.r2048-board {{ --u: 78px; display: grid; grid-template-columns: 20px repeat(4, var(--u));
-  grid-template-rows: 16px repeat(4, var(--u)); gap: 8px; width: max-content;
-  background: #bbada0; padding: 10px; border-radius: 10px; }}
+/* 宽度**跟着容器走**（width:100% + 四列 1fr），而不是由内容决定。
+   上一版是"固定格子尺寸 + width:max-content"：父容器的宽度是 flex 算出来的、猜不准，
+   只要比棋盘窄一点点，棋盘就直接溢出成一条横向滚动条（实测就是那样）。
+   方块用 aspect-ratio 保持正方形，于是格子随容器缩放而不变形，也不会溢出。 */
+.r2048-board {{ display: grid; grid-template-columns: 16px repeat(4, 1fr); gap: 6px;
+  width: 100%; min-width: 0; max-width: 380px; box-sizing: border-box;
+  background: #bbada0; padding: 9px; border-radius: 10px; }}
 .r2048-label {{ display: flex; align-items: center; justify-content: center;
   color: #efe6dd; font-size: 12px; font-weight: 600; }}
-.r2048-tile {{ display: flex; align-items: center; justify-content: center;
+.r2048-tile {{ aspect-ratio: 1; display: flex; align-items: center; justify-content: center;
   border-radius: 6px; font-weight: 800; font-variant-numeric: tabular-nums;
   font-family: {_FONT}; }}
 .r2048-d1, .r2048-d2 {{ font-size: 32px; }} .r2048-d3 {{ font-size: 26px; }}
@@ -79,6 +83,10 @@ _STYLE = f"""<style>
 .r2048-chip.warn {{ background: #fff4e0; color: #a56a12; }}
 .r2048-chip.bad {{ background: #fde8e6; color: #c0392b; }}
 .r2048-chip.muted {{ background: #f5f5f5; color: #9a9a9a; }}
+/* 方向键：Gradio 的按钮默认会 flex-grow 把整列撑满，四个键就变成四条横杠。
+   这里钉住宽度并居中，让它读起来是一个十字键。 */
+#r2048-dpad {{ align-items: center; }}
+#r2048-dpad button {{ width: 46px; max-width: 46px; flex-grow: 0; min-width: 0; }}
 .r2048-panel {{ border-collapse: collapse; font-variant-numeric: tabular-nums;
   font-family: {_FONT}; }}
 .r2048-panel th {{ color: #999; font-size: 12px; font-weight: 600; padding: 3px 10px; }}
@@ -300,7 +308,7 @@ def build_app(state: AppState | None = None):
         }
 
     with gr.Blocks(title="re-2048") as demo:
-        gr.Markdown(f"### re-2048 · 交互分析\n输出根 `{paths.output_root()}`")
+        gr.Markdown(f"**re-2048** · 输出根 `{paths.output_root()}`")
 
         models = inventory.list_models()
         with gr.Row():
@@ -324,26 +332,35 @@ def build_app(state: AppState | None = None):
 
         with gr.Tabs():
             with gr.Tab("计算 / 分析"), gr.Row():
-                with gr.Column(scale=3, min_width=430):
+                # 左：棋盘 + 方向键 + 动作。方向键与棋盘是**同一件事**，摆在一起——上一版把方向键
+                # 单独放一行，结果整块被挤到折线以下，一进页面根本看不到它。
+                with gr.Column(scale=0, min_width=470):
                     status_html = gr.HTML(render_status(None))
-                    board_html = gr.HTML(render_board(np.zeros(16, dtype=np.uint8)))
+                    with gr.Row(equal_height=False):
+                        board_html = gr.HTML(render_board(np.zeros(16, dtype=np.uint8)))
+                        with gr.Column(scale=0, min_width=130, elem_id="r2048-dpad"):
+                            dpad_up = gr.Button(DIRECTION_LABELS["up"], min_width=44)
+                            with gr.Row():
+                                dpad_left = gr.Button(DIRECTION_LABELS["left"], min_width=44)
+                                dpad_right = gr.Button(DIRECTION_LABELS["right"], min_width=44)
+                            dpad_down = gr.Button(DIRECTION_LABELS["down"], min_width=44)
+                    direction_buttons = [dpad_up, dpad_right, dpad_down, dpad_left]
                     with gr.Row():
-                        newgame_btn = gr.Button("新开一局", variant="primary")
-                        analyze_btn = gr.Button("分析当前局面")
-                        undo_btn = gr.Button("撤销一步")
-                        clear_btn = gr.Button("清空")
-                    with gr.Row():
-                        direction_buttons = [gr.Button(DIRECTION_LABELS[name]) for name in records.DIRECTIONS]
+                        newgame_btn = gr.Button("新开一局", variant="primary", min_width=96)
+                        analyze_btn = gr.Button("分析当前局面", min_width=96)
+                        undo_btn = gr.Button("撤销一步", min_width=84)
+                        clear_btn = gr.Button("清空", min_width=64)
                     with gr.Row():
                         # 运行与停止**同一个位置**：点自动执行之后它变成停止，停下来再变回来。
                         auto_start = gr.Button("▶ 自动执行", variant="primary")
                         auto_stop = gr.Button("■ 停止", variant="stop", visible=False)
-                with gr.Column(scale=2, min_width=380):
+                # 右：分析结果。这是"看着数字决定下一步"的地方，给足宽度。
+                with gr.Column(scale=1, min_width=430):
                     analysis_html = gr.HTML(render_analysis(None))
-                    note_html = gr.HTML()
                     with gr.Row():
-                        record_name = gr.Textbox(value="game", label="棋谱名", scale=2)
-                        save_btn = gr.Button("保存棋谱", scale=1)
+                        record_name = gr.Textbox(value="game", label="棋谱名", scale=3)
+                        save_btn = gr.Button("保存棋谱", scale=1, min_width=90)
+                    note_html = gr.HTML()
 
             with gr.Tab("棋盘编辑器"):
                 gr.Markdown(

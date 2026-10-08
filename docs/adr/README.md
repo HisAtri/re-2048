@@ -43,6 +43,7 @@ ADR 解释为什么整体是这个形状。
 | [0035](0035-q-space-pairwise-ranking-loss.md) | Q 空间的同根成对排序项：贪心判决 +19%（显著），256 模拟的搜索不动 | 已采纳（机制在瞄准的口径上生效；默认关闭） |
 | [0036](0036-record-text-format.md) | 棋谱文本格式：一行一命令、生成块显式化、值域键表、解析与应用分两层 | 已采纳 |
 | [0037](0037-engine-arbitrary-root-and-step-drive.md) | 引擎的任意局面与逐步驱动（会话模式）：在批引擎上加 set_root / begin_analysis / report_root / commit_step | 已采纳 |
+| [0038](0038-session-process-and-text-protocol.md) | 会话进程与文本协议（三层结构）：一行一命令、空行结束应答、棋谱是唯一事实源 | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

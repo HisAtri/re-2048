@@ -313,6 +313,25 @@ def _build_parser() -> argparse.ArgumentParser:
     iterate.add_argument(
         "--anchor", action="append", default=[], help="刷新锚点，形如 track=model_id（可重复）"
     )
+
+    session = sub.add_parser(
+        "session",
+        help="启动会话进程（文本协议，供界面与脚本驱动；见 ADR 0038）",
+        description=(
+            "一个盘面 + 一条棋谱 + 一个引擎。命令走 stdin/stdout 的文本协议，一行一条："
+            "clear / set <值> <坐标> / move <方向> / genmove / analyze / undo / state / "
+            "load <路径> / save <路径> / list_commands / quit。"
+            "编辑与复盘不需要 --checkpoint；分析与落子需要。"
+        ),
+    )
+    session.add_argument("--checkpoint", default="", help="模型 checkpoint；不给则这个会话只能编辑与复盘")
+    session.add_argument("--device", default="cpu", help="cpu / cuda（交互分析默认 cpu）")
+    session.add_argument("--strategy", default="search", choices=["search", "policy", "value"])
+    session.add_argument("--simulations", type=int, default=256, help="每次分析的模拟数")
+    session.add_argument("--time-ms", type=int, default=0, help="每次分析的时间上限（毫秒，0 = 不限时）")
+    session.add_argument("--in-flight", type=int, default=4, help="每 lane 在途模拟数（批大小旋钮）")
+    session.add_argument("--cache-entries", type=int, default=1 << 16)
+    session.add_argument("--seed", type=int, default=0)
     return parser
 
 
@@ -747,6 +766,35 @@ def _command_iterate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_session(args: argparse.Namespace) -> int:
+    """会话进程：把 stdin/stdout 交给文本协议。
+
+    **stdout 是协议通道**，所以这里一句都不往上写（就像 ADR 0008 里 stdout 是结果通道那样）；
+    给人看的就绪信息走 stderr。
+    """
+    from r2048.session import Session, SessionConfig
+    from r2048.session_io import NAME, serve
+
+    config = SessionConfig(
+        checkpoint=args.checkpoint,
+        device=args.device,
+        strategy=args.strategy,
+        simulations=args.simulations,
+        time_ms=args.time_ms,
+        in_flight=args.in_flight,
+        cache_entries=args.cache_entries,
+        seed=args.seed,
+    )
+    session = Session(config)
+    print(
+        f"{NAME} 就绪：策略 {config.strategy}，设备 {config.device}，"
+        + (f"模型 {session.state()['model_id']}" if args.checkpoint else "无模型（只能编辑与复盘）"),
+        file=sys.stderr,
+        flush=True,
+    )
+    return serve(session, sys.stdin, sys.stdout)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "version":
@@ -769,6 +817,8 @@ def main(argv: list[str] | None = None) -> int:
         return _command_merge_halves(args)
     if args.command == "iterate":
         return _command_iterate(args)
+    if args.command == "session":
+        return _command_session(args)
     raise SystemExit(f"未知子命令: {args.command}")
 
 

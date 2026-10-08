@@ -113,7 +113,7 @@ struct RootReport {
     float prior[kNumActions] = {0, 0, 0, 0};
     float root_value = 0.0f;
     uint32_t simulations = 0;  // 根实际完成的模拟数（时间上限下可能小于预算）
-    int best_action = -1;      // 访问数最大；并列取编号更小者
+    int best_action = -1;      // 引擎此刻会走的那一步（与 commit_step 同一个选招）
 };
 
 // 一步提交的结果。**生成块由引擎自己生成并在这里回报**，所以"方块生成规则"仍然只有

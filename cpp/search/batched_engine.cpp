@@ -988,13 +988,11 @@ struct BatchedEngine::Impl {
                     : root.one_ply[action];
         }
         report.root_value = root.visits > 0 ? root.value_sum / static_cast<float>(root.visits) : 0.0f;
-        uint16_t best_visits = 0;
-        for (int action = 0; action < kNumActions; action++) {
-            if (report.visits[action] > best_visits) {
-                best_visits = report.visits[action];
-                report.best_action = action;
-            }
-        }
+        // best_action 走**引擎自己的选招**，不另算一遍"访问数最大"：面板要显示的是"引擎会走
+        // 哪一步"，而贪心档根本没有访问数（它的选择来自 r+A 或先验）。用同一个 select_action，
+        // 面板与引擎就不可能有两套口径——这正是本函数与选招共用一批数的意义。
+        // （温度采样开启时它是一次抽样：那本来也就是"引擎此刻会怎么走"的答案。）
+        if (lane.legal_mask != 0) report.best_action = select_action(lane);
         return report;
     }
 

@@ -53,9 +53,14 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
     if (manifest.shards.empty()) {
         if (complete) report.problems.push_back("已完成的批次里没有任何分片");
     }
-    if (complete && manifest.meta.samples_target > 0 && manifest.samples != manifest.meta.samples_target) {
+    // 目标是"**至少**这么多"而不是"恰好这么多"：多进程 join 下达标后**在途的局必须走完**
+    // （否则局号会出现空洞），所以总量会多出"在途局数 × 每局样本数"；数据集不需要精确规模
+    // （ADR 0029 的订正）。单写者路径仍然会截断末局命中恰好等于目标，但那是**做到**的性质，
+    // 不是这里要验的不变式——这里要验的是"自称完成就必须真的到过目标"。
+    if (complete && manifest.meta.samples_target > 0 &&
+        manifest.samples < manifest.meta.samples_target) {
         report.problems.push_back("清单自称已完成，但样本数 " + std::to_string(manifest.samples) +
-                                  " 不等于目标 " + std::to_string(manifest.meta.samples_target));
+                                  " 还没到目标 " + std::to_string(manifest.meta.samples_target));
     }
     if (!complete && manifest.episodes == 0 && manifest.samples > 0) {
         report.problems.push_back("清单没有提交任何局，却有样本条数");

@@ -358,6 +358,8 @@ ShardWriter ShardWriter::resume(const std::string& data_dir, uint64_t shard_samp
     ShardWriter writer(data_dir, shard_samples, meta);
     writer.flushed_samples_ = existing.samples;
     writer.shards_ = existing.shards;
+    // 顺序续跑同样按批级统计判目标：续跑时批里已有 existing.samples 条。
+    writer.batch_committed_samples_ = existing.samples;
     // 续跑的记号从"已有的最大局号 + 1"接着来（不能再用"已写局数"，局号可能有空洞）。
     // 顺序续跑：把手上的号拉回"已有的最大局号 + 1"，保住 ADR 0020 的逐字节复现。
     writer.counter_ = std::make_unique<EpisodeCounter>(data_dir, max_episode_plus_one(existing.shards),
@@ -430,6 +432,8 @@ ShardWriter ShardWriter::join(const std::string& data_dir, uint64_t shard_sample
 
     // **不读回末片**：它可能正被别的写者填着，读回来重写会把那一段数据写两遍。
     ShardWriter writer(data_dir, shard_samples, meta);
+    // 加入时先把批级总量读进来（目标判定要用），之后按需刷新。
+    writer.batch_committed_samples_ = existing.samples;
     // 并行加入：计数器只读不重置（别的写者可能正握着预留的号）。若这一批还没有计数器
     // （旧批次），就从"已有的最大局号 + 1"建一个。
     writer.counter_ = std::make_unique<EpisodeCounter>(data_dir, max_episode_plus_one(existing.shards),
@@ -497,8 +501,35 @@ void ShardWriter::flush_shard() {
     merge_into_manifest(state_);
 }
 
-BatchManifest ShardWriter::snapshot(BatchState state) const {
-    BatchManifest manifest;
+// 整批（含别的写者）已提交的条数 + 本写者缓冲。
+//
+// 刷新是**节流**的：清单在文件锁下读-改-写，读取端每次都要拿锁，按每一局去读会把
+// 写者的提交路径拖慢。250ms 的粒度意味着"达到目标"的滞后只有一局的量级，
+// 而数据集不需要精确规模——换来的是"进程数随便改、不需要给每个进程分摊配额"。
+uint64_t ShardWriter::batch_samples_written() const {
+    refresh_batch_samples();
+    return batch_committed_samples_ + buffered_samples();
+}
+
+void ShardWriter::refresh_batch_samples() const {
+    const auto now = std::chrono::steady_clock::now();
+    if (last_batch_refresh_.time_since_epoch().count() != 0 &&
+        now - last_batch_refresh_ < std::chrono::milliseconds(250)) {
+        return;
+    }
+    last_batch_refresh_ = now;
+    const std::string manifest_path = data_dir_ + "/manifest.json";
+    if (!path_exists(manifest_path)) return;
+    try {
+        ManifestLock lock(data_dir_);
+        batch_committed_samples_ = read_manifest(data_dir_).samples;
+    } catch (const std::exception&) {
+        // 读不到就沿用上一次的值：这是"目标判定"的读数，不是数据完整性检查，
+        // 让它抛异常会把一次正常的并发读失败升级成整批失败。
+    }
+}
+
+BatchManifest ShardWriter::snapshot(BatchState state) const {    BatchManifest manifest;
     manifest.meta = meta_;
     manifest.meta.shard_samples = shard_samples_;
     manifest.state = state;
@@ -541,6 +572,9 @@ BatchManifest ShardWriter::merge_into_manifest(BatchState state) {
     batch_max_episode_plus_one_ = max_episode_plus_one(current.shards);
     current.samples = 0;
     for (const ShardInfo& shard : current.shards) current.samples += shard.samples;
+    // 刚合并出来的就是最新的批级总量：顺手更新，省掉一次清单读。
+    batch_committed_samples_ = current.samples;
+    last_batch_refresh_ = std::chrono::steady_clock::now();
     write_manifest(data_dir_, current);
     return current;
 }

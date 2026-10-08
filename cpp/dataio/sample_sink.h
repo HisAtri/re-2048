@@ -53,6 +53,8 @@ public:
     bool stop_requested() const;
     const std::string& requested_stop() const;
     // 样本目标达成（目标为 0 = 不限量，此时永远不会因为样本数停下）。
+    // **按整批判定**：join 模式下这才是 CLI 承诺的语义（"整个批次的累计目标"），
+    // 进程数因此可以任意改，不需要给每个进程分摊配额（见 ADR 0029 的订正）。
     bool target_reached() const;
 
     const std::string& manifest_path() const { return manifest_path_; }
@@ -65,13 +67,22 @@ private:
     // 两个 *locked 版本的存在理由：`finish()` 已经在锁里了，再去调加锁的公开版本
     // 就是自死锁（std::mutex 不可重入）——实测把 C++ 测试挂死过一次。
     void flush_locked();
+    // 目标判定用的读数：join 模式（同一批有别的写者）按**整批**算，其余模式按本写者算
+    // （单写者时两者相等，所以只有 join 模式的语义变了）。
+    uint64_t target_progress_locked() const {
+        return join_mode_ ? writer_->batch_samples_written() : writer_->samples_written();
+    }
     bool target_reached_locked() const {
-        return samples_target_ > 0 && writer_->samples_written() >= samples_target_;
+        return samples_target_ > 0 && target_progress_locked() >= samples_target_;
     }
 
     std::string data_dir_;
     BatchMeta meta_;
     uint64_t samples_target_;
+    // 是否是"加入别人的批次"（多进程跑谱）。它决定样本目标按整批还是按本进程算，
+    // 也决定达标时**不**截断末局——多进程下"哪一局被截断"没有唯一答案，
+    // 而数据集不需要精确规模（少截一条尾巴、多出一局的量级都可以接受）。
+    bool join_mode_ = false;
     std::unique_ptr<ShardWriter> writer_;
 
     mutable std::mutex mutex_;

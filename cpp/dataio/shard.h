@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <unordered_set>
 #include <string>
@@ -144,6 +145,14 @@ public:
     BatchState state() const { return state_; }
 
     uint64_t samples_written() const { return flushed_samples_ + buffered_samples(); }
+    // **整批**（含别的写者）已提交的条数 + 本写者缓冲。
+    //
+    // 为什么样本目标必须按整批判定：跨进程 join 时每个写者各有缓冲与分片，按本进程算的话
+    // k 个进程会各跑满一次目标（实测 4 进程 × 目标 100 万 = 产出 400 万条），而 CLI 承诺的是
+    // "整个批次的累计目标"。批级总量就是清单里各分片之和（本写者的那部分已在里面），
+    // 加上本写者还没落盘的缓冲。按需刷新（节流 250ms），所以误差只有一个 episode 的量级——
+    // 数据集不需要精确规模，这个粒度足够，且换来"进程数随便改、不用分摊配额"。
+    uint64_t batch_samples_written() const;
     // 整批（含别的写者）已提交的局数：局号有空洞，所以按各分片的区间求和，不能用计数。
     uint32_t episodes_written() const;
     // 下一次会被发出去的局号（发号器的高水位）。
@@ -164,6 +173,8 @@ private:
     // 实测 finish 报的条数比清单少一个末片（snapshot 只算本写者的分片）。
     BatchManifest merge_into_manifest(BatchState state);
     BatchManifest snapshot(BatchState state) const;
+    // 重新读一次清单，把别的写者提交的分片算进来（节流：最多每 250ms 一次）。
+    void refresh_batch_samples() const;
     uint64_t buffered_samples() const { return buffer_.size() / kSampleBytes; }
     uint64_t capacity_bytes() const { return shard_samples_ * kSampleBytes; }
 
@@ -180,6 +191,11 @@ private:
     uint32_t my_shard_count_ = 0;  // 本写者落了多少片（只用于分片命名）
     uint32_t batch_episodes_ = 0;  // 整批已提交的局数（各分片区间之和，来自清单合并）
     uint32_t batch_max_episode_plus_one_ = 0;  // 整批已有的最大局号 + 1
+    // 整批已提交的条数（清单里各分片之和，含本写者已落盘的部分）。每次合并清单时更新，
+    // 之后按需刷新——见 batch_samples_written()。两个成员是 mutable 的：刷新要在 const
+    // 语境里发生（引擎的 stopping()/target_reached() 都是 const）。
+    mutable uint64_t batch_committed_samples_ = 0;
+    mutable std::chrono::steady_clock::time_point last_batch_refresh_{};
     // 续跑时读回来的那个末片：下一次落盘要**覆盖同一个文件**（换名字会让同一段样本
     // 在盘上出现两份，读取端与校验都会看到重复）。
     std::string reuse_shard_path_;

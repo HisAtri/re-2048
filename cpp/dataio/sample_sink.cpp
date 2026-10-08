@@ -10,6 +10,7 @@ namespace r2048 {
 SampleSink::SampleSink(std::string data_dir, BatchMeta meta, uint64_t samples_target,
                        uint64_t shard_samples, Mode mode)
     : data_dir_(std::move(data_dir)), meta_(std::move(meta)), samples_target_(samples_target) {
+    join_mode_ = mode == Mode::kJoin;
     if (mode == Mode::kResume) {
         // 顺序续跑：编号接着清单里的最大局号，所以写入器必须先建好，lane 才能拿到起始编号。
         writer_ = std::make_unique<ShardWriter>(ShardWriter::resume(data_dir_, shard_samples, meta_));
@@ -36,7 +37,7 @@ void SampleSink::submit_episode(uint32_t episode, std::vector<Sample> samples) {
         std::lock_guard<std::mutex> lock(mutex_);
         samples_produced_ += samples.size();
         completed_[episode] = std::move(samples);
-        if (samples_target_ > 0 && samples_produced_ >= samples_target_) stop_.store(true);
+        if (target_reached_locked()) stop_.store(true);
         flush_locked();
     }
 }
@@ -54,24 +55,30 @@ void SampleSink::flush_locked() {
         std::vector<Sample> samples = std::move(it->second);
         completed_.erase(it);
 
-        if (samples_target_ > 0 && writer_->samples_written() >= samples_target_) {
+        if (samples_target_ > 0 && target_progress_locked() >= samples_target_) {
             stop_.store(true);
-            break;
+            // join 模式下**不丢**已完成的局：多进程的每一方都会各自达到目标，丢弃它们
+            // 只会白扔已经算完的对局；overshoot 的量级只是一局/进程，而数据集不需要精确规模。
+            if (!join_mode_) break;
+            continue;
         }
-        if (samples_target_ > 0 && writer_->samples_written() + samples.size() > samples_target_) {
+        if (!join_mode_ && samples_target_ > 0 &&
+            writer_->samples_written() + samples.size() > samples_target_) {
             // 目标边界上那一局被截断：总数恰好等于目标。多写者下"哪一局被截断"取决于落盘
             // 顺序（不再唯一），但**条数只由目标决定**——训练看到的总量是确定的。
             samples.resize(static_cast<size_t>(samples_target_ - writer_->samples_written()));
             stop_.store(true);
         }
         writer_->add_episode(episode, samples);
-        if (samples_target_ > 0 && writer_->samples_written() >= samples_target_) stop_.store(true);
+        if (target_reached_locked()) stop_.store(true);
     }
 }
 
 uint64_t SampleSink::written_samples() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return writer_->samples_written();
+    // join 模式下报**整批**的进度：多进程各报各的会让"这批跑到哪了"完全看不出来
+    // （实测 4 个进程各报 33%、91% 而批级已经 360 万条）。
+    return join_mode_ ? writer_->batch_samples_written() : writer_->samples_written();
 }
 
 uint32_t SampleSink::written_episodes() const {

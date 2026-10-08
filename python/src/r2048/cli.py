@@ -160,7 +160,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--samples",
         type=int,
         default=0,
-        help="目标样本条数（0 = 不限量，跑到被叫停为止）；续跑时是整个批次的累计目标",
+        help=(
+            "目标样本条数（0 = 不限量，跑到被叫停为止）。多进程 --join 下按**整批**判定："
+            "进程数随便改，不需要分摊配额；实际总量会多出在途的几局（达标后进行中的局必须走完）"
+        ),
     )
     selfplay.add_argument("--seed", type=int, default=0, help="随机种子（0 表示按时间生成）")
     selfplay.add_argument("--checkpoint", default="", help="模型 checkpoint；不给则用随机初始化模型")

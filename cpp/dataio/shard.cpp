@@ -60,6 +60,10 @@ const char* const kProtocolParams[] = {
     // 搜索线程数会改变 lane 的调度顺序 → 改变每批请求的组成 → 改变逐局结果（ADR 0017），
     // 所以和 lanes / in_flight 一样属于协议参数，进清单、也进数据来源身份（ADR 0021）。
     "search_threads",
+    // rollout 的续弈策略（uniform / greedy）改变每一步搜索的估值 → 改变逐局结果，
+    // 而且它是候选价值标签的信息量的直接决定因素（ADR 0030）。续跑时它不一致就必须拒绝：
+    // 同一个批里混两种续弈策略，会让"第 N 局是哪一局"这件事失去意义。
+    "rollout_policy",
 };
 
 void compare_protocol_params(const BatchMeta& existing, const BatchMeta& requested) {

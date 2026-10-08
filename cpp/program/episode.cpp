@@ -127,11 +127,13 @@ EpisodeOutcome play_episode(uint64_t base_seed, uint32_t episode, MoveSelector& 
 }
 
 std::unique_ptr<MoveSelector> make_selector(const std::string& policy, uint64_t base_seed,
-                                            uint32_t simulations, uint32_t temperature_moves) {
+                                            uint32_t simulations, uint32_t temperature_moves,
+                                            bool greedy_rollout) {
     if (policy == "random") return std::make_unique<RandomSelector>(base_seed);
     if (policy == "mcts") {
         RolloutMctsConfig config;
         config.simulations = simulations;
+        config.greedy_rollout = greedy_rollout;
         return std::make_unique<MctsSelector>(base_seed, config, temperature_moves);
     }
     throw std::runtime_error("未知策略: " + policy + "（可选 random / mcts）");

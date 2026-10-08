@@ -69,7 +69,10 @@ EpisodeOutcome play_episode(uint64_t base_seed, uint32_t episode, MoveSelector& 
                             EpisodeRecorder* recorder);
 
 // 按策略名构造决策器。未知策略名直接报错，不做静默回退。
+// `greedy_rollout` 只对 mcts 有效：把 rollout 的续弈策略从均匀随机换成一步启发式
+// （理由见 RolloutMctsConfig）。random 策略忽略它。
 std::unique_ptr<MoveSelector> make_selector(const std::string& policy, uint64_t base_seed,
-                                            uint32_t simulations, uint32_t temperature_moves);
+                                            uint32_t simulations, uint32_t temperature_moves,
+                                            bool greedy_rollout = false);
 
 }  // namespace r2048

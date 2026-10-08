@@ -27,6 +27,9 @@ void print_usage() {
         "  --seed               随机种子；不给则按当前时间生成并打印（同一组参数与种子\n"
         "                       必须产出逐字节相同的数据，verify 会重放校验这一点）\n"
         "  --simulations        mcts 每次决策的模拟次数（默认 64）\n"
+        "  --rollout-policy     uniform | greedy：rollout 的续弈策略（默认 uniform）。\n"
+        "                       greedy = 一步启发式（走完空位最多的方向）走到终局；\n"
+        "                       它决定候选价值标签的信息量（ADR 0030），属协议参数\n"
         "  --temperature-moves  开局多少步按根访问分布采样（默认 30；仅 mcts 有效）\n"
         "  --shard-samples      每个分片的样本数（默认 100000）\n"
         "  --workers            并行 worker 数（默认取硬件并发数）\n"
@@ -54,9 +57,9 @@ int run_generate(int argc, const char* const* argv) {
         print_usage();
         return 0;
     }
-    args.expect_only({"policy", "samples", "seed", "simulations", "temperature-moves", "shard-samples",
-                      "workers", "out", "batch-id", "model-id", "continue", "control", "progress-json",
-                      "quiet", "help"});
+    args.expect_only({"policy", "samples", "seed", "simulations", "temperature-moves", "rollout-policy",
+                      "shard-samples", "workers", "out", "batch-id", "model-id", "continue", "control",
+                      "progress-json", "quiet", "help"});
 
     GenerateConfig config;
     config.policy = args.str("policy", "");
@@ -68,6 +71,13 @@ int run_generate(int argc, const char* const* argv) {
     config.simulations = static_cast<uint32_t>(args.i32("simulations", 64));
     config.temperature_moves = static_cast<uint32_t>(args.i32("temperature-moves", 30));
     config.seed = args.has("seed") ? args.u64("seed", 0) : default_seed();
+    // 续弈策略：只认 uniform / greedy，未知值直接报错（不做静默回退——一个拼错的策略名
+    // 会让整批数据来自另一个教师，而它看起来是"跑完了"）。
+    const std::string rollout_policy = args.str("rollout-policy", "uniform");
+    if (rollout_policy != "uniform" && rollout_policy != "greedy") {
+        throw std::runtime_error("未知 --rollout-policy: " + rollout_policy + "（可选 uniform / greedy）");
+    }
+    config.greedy_rollout = rollout_policy == "greedy";
     config.shard_samples = args.u64("shard-samples", 100000);
     config.workers = static_cast<uint32_t>(args.i32("workers", 0));
     config.batch_id = args.str("batch-id", make_batch_id(config.policy, config.simulations));
@@ -80,9 +90,17 @@ int run_generate(int argc, const char* const* argv) {
     // 原样记录命令行参数（输出目录除外，它由 manifest 的地点本身表达）：
     // 数据来源必须能从数据自身读出来，而不是靠翻命令行历史。
     // 续跑时这些参数会与清单里的记录逐项比对（只比对协议项，见 dataio/shard.cpp）。
+    //
+    // 键名统一成下划线：参数**名**是清单这份数据格式的词汇表（kProtocolParams 与
+    // Python 的 SOURCE_KEY_PARAMS 都按下划线拼写），而命令行用连字符只是 CLI 的写法。
+    // 两者混在一起会让同一个参数在 C++ 路径与 NN 路径里叫两个名字，来源身份也对不上。
     for (const auto& item : args.items()) {
         if (item.first == "out" || item.first == "quiet" || item.first == "help") continue;
-        config.params.push_back(item);
+        std::string key = item.first;
+        for (char& c : key) {
+            if (c == '-') c = '_';
+        }
+        config.params.emplace_back(key, item.second);
     }
 
     if (!args.flag("quiet")) {

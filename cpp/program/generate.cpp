@@ -98,7 +98,8 @@ GenerateResult run_generate(const GenerateConfig& config) {
     auto worker_body = [&]() {
         // 每个 worker 持有独立决策器：搜索器内部有可复用的节点池，不能跨线程共享。
         std::unique_ptr<MoveSelector> selector =
-            make_selector(config.policy, config.seed, config.simulations, config.temperature_moves);
+            make_selector(config.policy, config.seed, config.simulations, config.temperature_moves,
+                          config.greedy_rollout);
         while (true) {
             slots.acquire();
             if (stop.load()) {

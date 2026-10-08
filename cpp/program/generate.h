@@ -20,6 +20,9 @@ struct GenerateConfig {
     uint64_t shard_samples = 100000;
     uint32_t workers = 0;  // 0 = 自动取硬件并发数
     uint32_t temperature_moves = 0;
+    // rollout 的续弈策略（仅 policy=mcts 有效）：false = 均匀随机（历史行为），
+    // true = 一步启发式。它改变候选价值标签的信息量，属协议参数（见 RolloutMctsConfig）。
+    bool greedy_rollout = false;
     std::string model_id;  // 非 NN 策略留空
     std::vector<std::pair<std::string, std::string>> params;
     // 控制文件路径。为空时用 <数据批目录>/control：控制通道与批次放在一起，

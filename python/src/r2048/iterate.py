@@ -64,6 +64,10 @@ class IterateConfig:
     lanes: int = 64
     in_flight: int = 8
     search_threads: int = 1
+    # 纯 C++ 教师的 rollout 续弈策略（uniform / greedy）。默认 greedy：它决定候选价值
+    # 标签的同根区分度，而模型强度跟着区分度走（ADR 0030 的实测）。它进数据批的来源记录，
+    # 所以改了它就是换了教师。
+    rollout_policy: str = "greedy"
     c_puct: float = 1.5
     device: str = "cuda"
     eval_games: int = 400
@@ -180,11 +184,17 @@ def _step_selfplay(config: IterateConfig, written: dict, job: JobDir) -> dict:
 
     # 首轮：纯 C++ MCTS 教师。走 `generate` 而不是 Python 自对弈——这一轮没有模型，
     # 而纯 C++ 线是整数运算、几秒钟就能跑完的（ADR 0020 的停止语义对它同样成立）。
+    #
+    # 续弈策略默认 greedy：实测它决定候选价值标签的同根区分度（同种子同模拟数下
+    # 同根标签 std 55.5 → 186.2），而模型强度跟着这个区分度走（NN-MCTS-64 8,306 → 13,156），
+    # 教师棋力本身不解释差异（greedy-64 的棋力 22,357 与 uniform-256 的 22,863 相当，
+    # 但后者训出的模型只有 6,388）。见 ADR 0030。
     command = run_cpp(
         "generate",
         {
             "policy": "mcts",
             "simulations": config.simulations,
+            "rollout_policy": config.rollout_policy,
             "samples": config.samples,
             "seed": config.data_seed,
             "out": str(data_dir),

@@ -168,6 +168,18 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
     }
     if config.search_threads > 1:
         # K 个搜索引擎 + 合并推理线程（ADR 0028）。单线程路径保持原样：默认行为不变。
+        #
+        # 但这条路产出的数据**不可复现**：一条模拟挂起时不回填，而"是否挂起"取决于缓存命中，
+        # 于是每个决策步的（选择→展开→回填）序列依赖于交付时序。实测同模型同种子两次运行，
+        # 同一局号会下出完全不同的棋（共同局 11 个里只有 2 个长度相同；见 ADR 0031）。
+        # 这种数据既不能被重放校验，也不能当"第 N 局是哪一局"的证据，因此不许入训练线。
+        print(
+            "警告：search_threads>1 产出的数据不可复现（ADR 0031）：同一 (种子, 局号) 两次运行会下出"
+            "不同的棋，这批数据无法被重放校验，不要拿它训练。并行跑谱请改用多进程 --join"
+            "（每进程搜索线程数为 1，实测两次运行 52/52 局逐条相同）。",
+            file=sys.stderr,
+            flush=True,
+        )
         from r2048.runtime.parallel_search import run_parallel_selfplay
 
         return run_parallel_selfplay(config, model, device)

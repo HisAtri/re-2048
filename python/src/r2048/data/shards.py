@@ -160,6 +160,10 @@ SOURCE_KEY_PARAMS = (
     "max_batch",
     "device",
     "search_threads",
+    # rollout 的续弈策略（uniform / greedy）：它决定候选价值标签的信息量（ADR 0030），
+    # 也改变逐局结果，所以必须进来源身份——否则"64 模拟 + 均匀续弈"与"64 模拟 + 启发式续弈"
+    # 两份数据会被当成同一个来源，同一个局号会指向两盘不同的棋。
+    "rollout_policy",
 )
 
 

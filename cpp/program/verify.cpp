@@ -192,6 +192,15 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
         config.shard_samples = manifest.meta.shard_samples;
         config.workers = options.replay_workers;
         config.model_id = manifest.meta.model_id;
+        // 清单里的参数原样带回（重放出来的清单才是原批的孪生，而不是"少记了几项"的一份）。
+        config.params = manifest.meta.params;
+        // **凡是有对应 GenerateConfig 字段的协议参数，都必须在这里恢复。**
+        // 漏一个的后果不是"报错说参数没恢复"，而是拿另一个教师去重放，
+        // 然后报出"分片哈希不一致"——看起来像数据损坏（实测：rollout_policy 忘在这里，
+        // 均匀续弈重放启发式续弈的批，5 个问题里有 4 个是哈希/条数不一致）。
+        for (const auto& param : manifest.meta.params) {
+            if (param.first == "rollout_policy") config.greedy_rollout = param.second == "greedy";
+        }
 
         BatchManifest replayed;
         try {

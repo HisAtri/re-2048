@@ -176,7 +176,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--search-threads",
         type=int,
         default=1,
-        help="推进 lane 的线程数（1 = 单线程；>1 会改变调度，属协议参数）",
+        help=(
+            "推进 lane 的线程数（1 = 单线程；>1 会改变调度，属协议参数）。"
+            "注意：>1 产出的数据不可复现（ADR 0031），只能用于吞吐实验；"
+            "要并行跑谱请用 --join 多进程（每进程 1 线程）"
+        ),
     )
     selfplay.add_argument("--shard-samples", type=int, default=100000)
     selfplay.add_argument("--max-batch", type=int, default=16384)
@@ -240,6 +244,12 @@ def _build_parser() -> argparse.ArgumentParser:
     iterate.add_argument("--lanes", type=int, default=64)
     iterate.add_argument("--in-flight", type=int, default=8)
     iterate.add_argument("--search-threads", type=int, default=1, help="推进 lane 的线程数（协议参数）")
+    iterate.add_argument(
+        "--rollout-policy",
+        default="greedy",
+        choices=["uniform", "greedy"],
+        help="首轮纯 C++ 教师的 rollout 续弈策略（默认 greedy，见 ADR 0030）",
+    )
     iterate.add_argument("--c-puct", type=float, default=1.5)
     iterate.add_argument("--device", default="cuda")
     iterate.add_argument("--eval-games", type=int, default=400)
@@ -642,6 +652,7 @@ def _command_iterate(args: argparse.Namespace) -> int:
         lanes=args.lanes,
         in_flight=args.in_flight,
         search_threads=args.search_threads,
+        rollout_policy=args.rollout_policy,
         c_puct=args.c_puct,
         device=args.device,
         eval_games=args.eval_games,

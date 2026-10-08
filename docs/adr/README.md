@@ -33,8 +33,10 @@ ADR 解释为什么整体是这个形状。
 | [0025](0025-inference-precision.md) | 推理精度的现状与暂不引入降精度开关 | 已采纳 |
 | [0026](0026-model-naming-and-tiers.md) | 模型命名分层与版本层级（测试版 / 正式版） | 已采纳 |
 | [0027](0027-inference-pipeline-utilisation.md) | 推理管线的性能诊断与引擎优化方向 | 已采纳 |
-| [0028](0028-multi-threaded-search.md) | 多线程搜索（K 个引擎共享写入侧 + 合并推理线程） | 已采纳 |
+| [0028](0028-multi-threaded-search.md) | 多线程搜索（K 个引擎共享写入侧 + 合并推理线程） | 已采纳（决策 2 的前提已被 0031 的实测否掉：K>1 时内容不可复现） |
 | [0029](0029-one-batch-many-writers.md) | 一个数据批、多个写者（跨进程并发跑谱） | 已采纳 |
+| [0030](0030-value-label-ordering-collapse.md) | MCTS 退化：价值标签的同根排序塌缩；改续弈策略被证实（退化不复现，深度不是杠杆） | 已采纳（三版处方被实测否掉，第四版被证实） |
+| [0031](0031-why-parallel-selfplay-is-not-reproducible.md) | 并行跑谱不可复现的原因：挂起不回填（不是缓存） | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

@@ -14,6 +14,17 @@ struct RolloutMctsConfig {
     // UCT 探索系数，作用于**节点内归一化**后的 Q。归一化是必要的：2048 的分数
     // 量级随局面演进从几十涨到几万，直接用原始 Q 会让探索项完全失去作用。
     float exploration = 1.0f;
+    // rollout 的续弈策略：
+    //   false（默认，历史行为）在合法方向里**均匀抽样**走到终局；
+    //   true 用一步启发式（走完空位最多的方向）走到终局。
+    //
+    // 为什么需要这个开关：价值标签 `candidate_value = Q̄ − r` 就是在 rollout 里估出来的，
+    // 而均匀随机的续弈会把局面质量差异洗掉——实测同根（同一局面的几个候选）标签的信号
+    // std 只有约 36 分，与"这一手立刻合多少分"的 std（59~70 分）同量级，且它与真实回报的
+    // 分层秩相关只有 0.05（ADR 0030）。把教师的搜索加深 4 倍（64→256 模拟）**没有**改善
+    // 这些数字，所以限制在**续弈策略**上，不在搜索深度上。换一个"先把局面保住"的续弈策略
+    // 是唯一非循环的改法（不引入任何网络）。
+    bool greedy_rollout = false;
 };
 
 struct RolloutMctsResult {
@@ -76,6 +87,11 @@ private:
     uint32_t add_node(const Board& board, NodeKind kind, uint32_t parent, uint8_t parent_action);
     int select_action(const Node& node) const;
     float rollout(const Board& board, Rng& rng) const;
+    // 一步启发式续弈：在合法方向里挑"走完之后空位最多"的，平局取立即得分高的。
+    // 为什么是空位而不是立即得分：贪图立刻合并会把局面挤死（纯贪心实测只有约 2200 分），
+    // 而空位数直接读作"还能活多久"——标签要的是"这个 afterstate 之后还能拿多少分"，
+    // 续弈策略必须先把局面保住才谈得上分数。
+    int greedy_action(const Board& board, uint8_t mask) const;
 
     RolloutMctsConfig config_;
     uint64_t base_seed_;

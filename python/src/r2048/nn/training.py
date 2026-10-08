@@ -139,6 +139,11 @@ class EpochMetrics:
     val_candidate_regret: float
     samples: int
     seconds: float
+    # 这一轮价值头实际回归的是哪个量（"candidate" / "trajectory"；未训价值头时为空）。
+    # 为什么必须显式记录：同一个 mode + 同一批数据在两种价值目标下会训出**不同**的权重，
+    # 而 model_id 只由 (mode, 数据标签) 组成——实测两个不同的模型因为沿用旧写法而同名，
+    # 评分池按 model_id 去重时会把它们当成同一个。标识与元数据都必须能区分。
+    value_target: str = ""
 
     @property
     def samples_per_second(self) -> float:
@@ -176,6 +181,19 @@ def data_label(config: TrainConfig) -> str:
     if len(config.datasets) == 1:
         return Path(config.datasets[0].path).name
     return f"{len(config.datasets)}src"
+
+
+def model_id_for(config: TrainConfig, value_target: str) -> str:
+    """写进 checkpoint 的 model_id。
+
+    价值目标不是默认值时进名字：`value-<数据标签>` 这个旧写法让"候选目标"和"主轨迹回报"
+    训出的两份**不同权重**同名，而评分池按 model_id 去重、按 model_id 分组——同名就会被
+    当成同一个模型（实测已发生，见 ADR 0030）。名字只给人看，但它必须是**可区分**的。
+    """
+    base = f"{config.mode}-{data_label(config)}"
+    if value_target == "trajectory" and config.mode in ("value", "joint", "dual"):
+        return f"{config.mode}-trajectory-{data_label(config)}"
+    return base
 
 
 def file_digest(path: str | Path) -> str:
@@ -308,6 +326,10 @@ class _Metrics:
         self.best_hit = torch.zeros((), dtype=torch.float64, device=device)
         self.best_total = torch.zeros((), dtype=torch.float64, device=device)
         self.regret = torch.zeros((), dtype=torch.float64, device=device)
+        # 价值头这一轮回归的量（空集 = 没训价值头）。由真正做决策的那一行写入，
+        # 不在别处重新推导一遍；用集合是因为多来源混训时不同批可能落到不同的量上，
+        # 那种情况必须在记录里看得见，而不是被最后一个批覆盖掉。
+        self.value_targets_used: set[str] = set()
 
     def add_value(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
         self.value_abs += (prediction.double() - target.double()).abs().sum()
@@ -496,6 +518,8 @@ def _run_epoch(
             use_candidates = want_value and config.value_target != "trajectory" and batch.has_candidates
             if config.value_target == "candidate" and want_value and not batch.has_candidates:
                 raise ValueError("要求候选目标，但这一批数据没有候选监督（检查数据是否由搜索产出）")
+            if want_value:
+                metrics.value_targets_used.add("candidate" if use_candidates else "trajectory")
             count = batch.decision.shape[0]
 
             if config.mode in JOINT_MODES:
@@ -902,6 +926,7 @@ def run_training(config: TrainConfig) -> TrainResult:
             val_candidate_regret=regret,
             samples=int(train_indices.size),
             seconds=train_seconds,
+            value_target="+".join(sorted(train_metrics.value_targets_used)),
         )
         history.append(entry)
         # 主指标：**供应给搜索的价值头必须用同根候选排序来挑，而不是全局 MAE**
@@ -937,7 +962,7 @@ def run_training(config: TrainConfig) -> TrainResult:
             best_metric = primary
             best_checkpoint = str(run_dir / "model.pt")
             meta = _unwrap(model).metadata(
-                model_id=f"{config.mode}-{data_label(config)}",
+                model_id=model_id_for(config, entry.value_target),
                 parent=str(source_metadata.get("model_id", "")),
             )
             meta.update(
@@ -952,11 +977,7 @@ def run_training(config: TrainConfig) -> TrainResult:
                     "batch_id": single_batch_id,
                     "data_build_id": single_build_id,
                     "config_digest": config_digest(config),
-                    "value_target": (
-                        "candidate"
-                        if entry.val_candidate_best_hit == entry.val_candidate_best_hit
-                        else "trajectory"
-                    ),
+                    "value_target": entry.value_target or "none",
                     "candidate_target_definition": CANDIDATE_TARGET_DEFINITION,
                     "metrics": {
                         "value_mae": entry.val_value_mae,

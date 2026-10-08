@@ -6,7 +6,8 @@
 #include "core/version.h"
 #include "game/board.h"
 #include "game/rules.h"
-#include "r2048_build_id.h"  // 由 CMake 生成，见 cmake/R2048BuildId.cmake
+#include "program/episode.h"  // opening_board：开局口径与跑谱共用同一个函数
+#include "r2048_build_id.h"   // 由 CMake 生成，见 cmake/R2048BuildId.cmake
 #include "search/batched_engine.h"
 
 namespace py = pybind11;
@@ -111,6 +112,17 @@ PYBIND11_MODULE(r2048_core, m) {
         py::arg("board"), py::arg("action"));
 
     m.def("legal_mask", [](const U8Array& board) { return r2048::legal_mask(board_from_array(board)); });
+
+    // 标准开局（两枚随机块，90% 出 2 / 10% 出 4）。**绑的就是跑谱用的那一个函数**，
+    // 而不是在 Python 里再实现一遍生成规则：界面上"开一局"与训练数据里的开局因此是同一
+    // 分布、同一条随机流推导（batched_engine.cpp 的注释同样强调开局口径必须与跑谱一致）。
+    m.def(
+        "opening_board",
+        [](uint64_t seed, uint64_t episode) {
+            return board_to_array(r2048::opening_board(seed, episode));
+        },
+        py::arg("seed"), py::arg("episode") = 0,
+        "标准开局：给定 (种子, 局号) 时确定性，返回 16 个指数。");
 
     py::class_<r2048::BatchedEngine> engine(m, "BatchedEngine");
     engine.doc() = R"(

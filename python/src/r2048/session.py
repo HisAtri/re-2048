@@ -115,6 +115,8 @@ class Session:
         self.moves = 0
         self.max_exponent = 0
         self.legal_mask = 0
+        # 这一局的开局种子（`new_game` 记下来）；0 表示不是用 new_game 起的局。
+        self.seed = 0
 
         self._model: torch.nn.Module | None = None
         self._metadata: dict = {}
@@ -218,7 +220,25 @@ class Session:
     def reset(self) -> None:
         """清空盘面与棋谱（`clear`）。"""
         self.record = [records.Clear()]
+        self.seed = 0
         self._recompute()
+
+    def new_game(self, seed: int | None = None) -> int:
+        """开一局标准 2048：两枚随机块（90% 出 2、10% 出 4）。
+
+        开局走 C++ 的 `opening_board(seed, episode)` —— **与跑谱用的是同一个函数**，所以界面
+        上开的局与训练数据里的开局是同一分布、同一条随机流推导，而不是 Python 另写一遍生成规则
+        （规则只实现一次，ADR 0004/0005）。
+
+        棋谱写下来的仍然是显式的 `set`，于是这一步又把随机性固定进了文件（ADR 0036 决策 3）：
+        同一个 seed 开的局能被逐字节重放，换个 seed 就是另一局。
+        """
+        value = int(seed) if seed else int(time.time() * 1000) & 0x7FFFFFFF
+        board = np.asarray(r2048_core.opening_board(value, 0), dtype=np.uint8)
+        self.record = records.commands_for_board(board)
+        self.seed = value
+        self._recompute()
+        return value
 
     def set_tile(self, index: int, exponent: int | None) -> None:
         """摆一块或清一块（棋谱里的 `set`）。合法性由 records.apply 判定。"""
@@ -380,6 +400,7 @@ class Session:
             "board": [int(cell) for cell in self.board],
             "score": self.score,
             "moves": self.moves,
+            "seed": self.seed,
             "max_exponent": self.max_exponent,
             "max_face": (1 << self.max_exponent) if self.max_exponent else 0,
             "legal_mask": self.legal_mask,

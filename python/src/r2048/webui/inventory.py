@@ -26,15 +26,13 @@ class ModelEntry:
     training_target: str = ""
 
     def label(self) -> str:
-        """下拉里显示的名字：路径要跟着，因为不同 run 下的 checkpoint 经常同名。"""
-        parts = [self.path.parent.name + "/" + self.path.name]
-        if self.model_id:
-            parts.append(self.model_id)
-        if self.architecture:
-            parts.append(self.architecture)
-        if self.training_target:
-            parts.append(f"target={self.training_target}")
-        return "  ·  ".join(parts)
+        """下拉里显示的一行：路径 + 训练目标。
+
+        模型标识（`model_id`）刻意不放在这里——它常常是"数据批 + 配方"拼出来的长串，塞进下拉
+        会把每行都撑爆、反而谁也认不出来。它会在连接之后的状态行里显示。
+        """
+        suffix = f"  [{self.training_target}]" if self.training_target else ""
+        return f"{self.path.parent.name}/{self.path.name}{suffix}"
 
 
 @dataclass(frozen=True)

@@ -80,6 +80,7 @@ class SessionServer:
             "list_commands": self._list_commands,
             "state": self._state,
             "clear": self._clear,
+            "newgame": self._newgame,
             "set": self._set,
             "move": self._move,
             "genmove": self._genmove,
@@ -159,6 +160,17 @@ class SessionServer:
         self._expect(request_id, args, 0, "clear")
         self.session.reset()
         return {"state": self.session.state()}
+
+    def _newgame(self, request_id: str, args: list[str]) -> dict:
+        """开一局标准 2048。`newgame` 或 `newgame seed=123`（同一个 seed 必然同一局）。"""
+        seed = 0
+        for token in args:
+            key, separator, value = token.partition("=")
+            if not separator or key != "seed" or not value.isdigit():
+                raise ValueError(f"newgame 只接受 `seed=<非负整数>`，收到 {token!r}")
+            seed = int(value)
+        chosen = self.session.new_game(seed or None)
+        return {"seed": chosen, "state": self.session.state()}
 
     def _set(self, request_id: str, args: list[str]) -> dict:
         if len(args) != 2:

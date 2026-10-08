@@ -319,8 +319,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="启动会话进程（文本协议，供界面与脚本驱动；见 ADR 0038）",
         description=(
             "一个盘面 + 一条棋谱 + 一个引擎。命令走 stdin/stdout 的文本协议，一行一条："
-            "clear / set <值> <坐标> / move <方向> / genmove / analyze / undo / state / "
-            "load <路径> / save <路径> / list_commands / quit。"
+            "clear / newgame [seed=N]（标准开局）/ set <值> <坐标> / move <方向> / genmove / "
+            "analyze / undo / state / load <路径> / save <路径> / list_commands / quit。"
             "编辑与复盘不需要 --checkpoint；分析与落子需要。"
         ),
     )

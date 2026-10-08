@@ -206,6 +206,53 @@ def test_analysis_needs_a_model_but_editing_does_not() -> None:
         session.analyze()
 
 
+# ---- 2b. 开局 -------------------------------------------------------------------
+
+
+def test_new_game_starts_a_standard_opening() -> None:
+    """`new_game` 走 C++ 的 opening_board——与跑谱同一个函数，不是 Python 另写一遍。
+
+    棋谱写下来的仍然是显式的 `set`，于是"哪两枚块、在哪"被固定进文件：同 seed 必然同盘。
+    """
+    session = _session()
+    assert session.new_game(20261009) == 20261009
+    tiles = [int(cell) for cell in session.board if cell]
+    assert len(tiles) == 2, "标准开局是两枚块"
+    assert all(tile in (1, 2) for tile in tiles), "只会出 2（指数 1）或 4（指数 2）"
+    assert session.state()["moves"] == 0 and session.score == 0
+    assert session.state()["seed"] == 20261009
+    assert session.legal_mask != 0, "开局必然有合法方向，否则没法玩"
+
+    assert isinstance(session.record[0], records.Clear)
+    spawns = [c for c in session.record if isinstance(c, records.SetTile)]
+    assert len(spawns) == 2, "开局的每一枚块都是棋谱里的一条 set"
+    assert records.apply(session.record).move_count == 0, "开局不是一步棋"
+
+    same = _session()
+    same.new_game(20261009)
+    assert np.array_equal(same.board, session.board), "同 seed 必须同盘"
+
+
+def test_new_game_is_playable_and_undoable(checkpoint: str) -> None:
+    """开一局之后整条链路要能跑：分析 → 落子 → 撤销回开局。"""
+    session = _session(checkpoint)
+    session.new_game(7)
+    assert session.analyze().best_action >= 0
+    assert session.play(None)["action"] >= 0
+    assert session.state()["moves"] == 1
+    assert session.undo() is True
+    assert session.state()["moves"] == 0
+    assert np.array_equal(session.board, records.apply(session.record).board)
+
+
+def test_new_game_without_a_seed_picks_one_and_records_it() -> None:
+    session = _session()
+    seed = session.new_game()
+    assert seed > 0 and session.state()["seed"] == seed
+    # 不给种子也必须能被重放：棋谱里是显式的 set，盘面由重放算出。
+    assert np.array_equal(session.board, records.apply(session.record).board)
+
+
 # ---- 3. 协议 ---------------------------------------------------------------------
 
 
@@ -248,6 +295,21 @@ def test_protocol_commands_change_state_and_report_it() -> None:
     _run(server, "set 2 a1")
     mark, payload = _run(server, "undo")
     assert mark == "=" and payload["undone"] is False, "没有走过步，undo 应当如实说没有"
+
+
+def test_protocol_newgame_starts_an_opening() -> None:
+    """`newgame` 让界面不用先手摆棋就能直接玩：开一局 → 分析 → 落子。"""
+    server = SessionServer(_session())
+    mark, payload = _run(server, "newgame seed=123")
+    assert mark == "=" and payload["seed"] == 123
+    board = payload["state"]["board"]
+    assert len([cell for cell in board if cell]) == 2
+    mark, again = _run(server, "newgame seed=123")
+    assert again["state"]["board"] == board, "同一个 seed 必然同一局（棋谱里是显式的 set）"
+    mark, _ = _run(server, "newgame seed=abc")
+    assert mark == "?"
+    mark, payload = _run(server, "newgame")  # 不给种子也要能用
+    assert mark == "=" and payload["seed"] > 0
 
 
 def test_analyze_streams_frames_and_ends_with_a_final_one(checkpoint: str) -> None:

@@ -44,7 +44,7 @@ def test_board_shows_coordinates_and_face_values() -> None:
     board = np.zeros(16, dtype=np.uint8)
     board[0] = 1  # a1 = 2
     board[15] = 11  # d4 = 2048
-    html = render_board(board, legal_mask=0, spawn_index=5)
+    html = render_board(board, spawn_index=5)
     for label in ("a", "b", "c", "d", "1", "2", "3", "4"):
         assert f">{label}<" in html, f"棋盘必须显示坐标 {label}"
     # 显示的是**面值**（2048），不是内部指数（11）——棋谱与界面都用人能读的那种写法。
@@ -52,10 +52,29 @@ def test_board_shows_coordinates_and_face_values() -> None:
     assert ">11<" not in html
 
 
+def test_board_is_a_real_tile_component() -> None:
+    """棋盘是**组件**，不是"能看就行"的表格：方块有自己的类与标准配色，布局靠网格。
+
+    这条挡的是样式回退——上一版用裸 `<table>` 加内联宽度，格子会被容器拉变形，
+    而变形了也没人会发现。
+    """
+    board = np.zeros(16, dtype=np.uint8)
+    board[0] = 1  # 2  → 米色
+    board[5] = 6  # 64 → 橙红
+    html = render_board(board, spawn_index=5)
+    assert "r2048-board" in html and "r2048-tile" in html and "r2048-label" in html
+    # 底色与字色**必须成对**地断言：只查"颜色出现过"是不够的——把两者对调照样能通过，
+    # 而那正是"配色写反了"的形态（2 会变成深底浅字，看起来只是丑，不会报错）。
+    assert "background:#eee4da;color:#776e65" in html, "2 的方块：米色底 + 深色字"
+    assert "background:#f65e3b;color:#f9f6f2" in html, "64 的方块：橙红底 + 白字"
+    assert "r2048-spawn" in html, "生成块要能被标出来"
+    assert "grid-template-columns" in html, "布局靠网格，不靠表格列宽"
+
+
 def test_board_marks_the_engine_choice() -> None:
     board = np.zeros(16, dtype=np.uint8)
     board[0] = 1
-    html = render_board(board, legal_mask=6, best_action=records.ACTION_OF_DIRECTION["right"])
+    html = render_board(board, best_action=records.ACTION_OF_DIRECTION["right"])
     assert "引擎选招" in html and "右" in html
 
 
@@ -162,20 +181,19 @@ def test_inventory_on_a_missing_root_is_empty_not_an_error(tmp_path: Path) -> No
 # ---- 界面实际发出的命令流（无浏览器）--------------------------------------------
 
 
-def test_ui_command_flow_editor_analyze_move_save_replay(checkpoint: str, tmp_path: Path) -> None:
+def test_ui_command_flow_newgame_analyze_move_save_replay(checkpoint: str, tmp_path: Path) -> None:
     """把三个标签页会发的命令在真会话上跑一遍。
 
-    编辑器 = `clear` + `set ...`；分析 = `analyze`；落子 = `move <方向>`；
-    存档 = `save`；复盘 = 读回棋谱并逐前缀重放。这条路径不依赖任何浏览器组件。
+    新开一局 = `newgame`；分析 = `analyze`；落子 = `genmove`/`move <方向>`；存档 = `save`；
+    复盘 = 读回棋谱并逐前缀重放。这条路径不依赖任何浏览器组件，所以没有浏览器也能验。
     """
     client = SessionClient(session_argv(checkpoint=checkpoint, device="cpu", simulations=8))
     try:
         client.request("set_simulations 8")
-        # 编辑器：摆一个能走几步的局面
-        client.request("clear")
-        for face, coordinate in (("2", "a1"), ("4", "c3"), ("8", "b2")):
-            payload = client.request(f"set {face} {coordinate}")[0]["state"]
-        assert payload["board"][records.coordinate_to_index("c3")] == 2  # 4 → 指数 2
+        # 「新开一局」：这是界面上从零开始的那一步，不再需要先手工摆棋
+        opened = client.request("newgame seed=4242")[0]
+        assert opened["seed"] == 4242
+        assert len([cell for cell in opened["state"]["board"] if cell]) == 2
 
         # 分析：必须回报四个方向与一个引擎选招
         report = client.request("analyze")[-1]
@@ -189,17 +207,28 @@ def test_ui_command_flow_editor_analyze_move_save_replay(checkpoint: str, tmp_pa
         assert step["action"] == report["best_action"], "引擎走的那一步必须与分析面板一致"
         assert step["spawn_index"] >= 0
 
+        # 玩家模式：按指定方向走一步（这条路径不经过搜索）
+        frames = client.request("move down")
+        assert frames[0]["step"]["action"] == records.ACTION_OF_DIRECTION["down"]
+
         # 存档，然后读回来逐前缀重放
         path = tmp_path / "ui.txt"
         client.request(f"save {path}")
         commands = records.load(path)
+        assert isinstance(commands[0], records.Clear)
         assert isinstance(commands[-1], records.SetTile), "生成块必须是棋谱里的显式 set"
         final = records.apply(commands)
-        assert final.move_count == 1
+        assert final.move_count == 2, "genmove 与 move 各算一步"
+        assert np.array_equal(final.board, records.apply(commands).board)
 
         # 复盘滑块：从空到终局的每一个前缀都必须能重放（这正是不需要随机数状态的理由）
         for upto in range(len(commands) + 1):
             records.apply(commands[:upto])
+
+        # 编辑器：`clear` + `set ...` 也照样能用（手摆局面）
+        assert client.request("clear")[0]["state"]["moves"] == 0
+        payload = client.request("set 4 c3")[0]["state"]
+        assert payload["board"][records.coordinate_to_index("c3")] == 2  # 4 → 指数 2
     finally:
         client.close()
     assert client.returncode == 0

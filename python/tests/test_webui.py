@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -139,7 +140,10 @@ def _fake_root(tmp_path: Path) -> Path:
     run = root / "runs" / "some-run"
     run.mkdir(parents=True)
     model = build("sh-s6c64", {"channels": 8, "blocks": 1, "head_width": 16, "groups": 2})
-    save_checkpoint(str(run / "model.pt"), model, model.metadata("m1"))
+    metadata = model.metadata("m1")
+    # 模型定义本身不带 training_target（那是训练阶段写进去的），但清单层要靠它判断"完整模型"。
+    metadata["training_target"] = "dual"
+    save_checkpoint(str(run / "model.pt"), model, metadata)
 
     records_dir = root / "records"
     records_dir.mkdir()
@@ -159,6 +163,51 @@ def test_inventory_finds_models_by_metadata(tmp_path: Path) -> None:
     assert "model.pt" in models[0].label()
     found = inventory.find_model(models[0].label(), root)
     assert found is not None and found.path == models[0].path
+
+
+def test_inventory_labels_carry_the_run_and_hide_resume_points(tmp_path: Path) -> None:
+    """下拉里的每一行必须**认得出来**，而且不能一半是续跑点。
+
+    输出根里同名 checkpoint 到处都是（每个 run 下都有 `value/model.pt`、`policy-head/model.pt`），
+    只写"父目录/文件名"会得到一列谁也分不清的 `value/model.pt`——这正是这一页最初的形态。
+    相对输出根的路径把 run 身份带回来，于是相邻行共享前缀、读起来成组。
+    """
+    root = _fake_root(tmp_path)
+    inner = root / "runs" / "some-run" / "value"
+    inner.mkdir()
+    shutil.copy(root / "runs" / "some-run" / "model.pt", inner / "model.pt")
+    shutil.copy(root / "runs" / "some-run" / "model.pt", inner / "last.pt")
+
+    labels = [entry.label() for entry in inventory.list_models(root)]
+    assert labels == sorted(labels)
+    assert any(label.startswith("runs/some-run/model.pt") for label in labels)
+    # 同名文件必须靠相对路径区分（这正是"读不出来"的那个 bug）。
+    assert any(label.startswith("runs/some-run/value/model.pt") for label in labels)
+    assert len(set(labels)) == len(labels), "标签不能撞车（撞车就等于选不中）"
+    assert not any("last.pt" in label for label in labels), "续跑点默认不列出来"
+
+    with_resume = [entry.label() for entry in inventory.list_models(root, include_resume=True)]
+    assert any(label.startswith("runs/some-run/value/last.pt") for label in with_resume), (
+        "要的时候必须能列出来"
+    )
+
+
+def test_default_model_prefers_a_complete_one(tmp_path: Path) -> None:
+    """默认值往往就是用户直接点的那一个，所以它得是**完整模型**而不是恰好排在前面的半模型。"""
+    from r2048.nn.model import build, save_checkpoint
+
+    root = _fake_root(tmp_path)
+    half = root / "runs" / "aaa-first" / "value"
+    half.mkdir(parents=True)
+    model = build("sh-s6c64", {"channels": 8, "blocks": 1, "head_width": 16, "groups": 2})
+    metadata = model.metadata("half")
+    metadata["training_target"] = "value"  # 只训了价值的半模型
+    save_checkpoint(str(half / "model.pt"), model, metadata)
+
+    entries = inventory.list_models(root)
+    assert entries[0].label().startswith("runs/aaa-first"), "列表按路径排，半模型确实排在最前"
+    assert entries[0].training_target == "value"
+    assert inventory.default_model(entries).endswith("[dual]"), "默认选中要挑完整模型"
 
 
 def test_inventory_reads_batches_and_records(tmp_path: Path) -> None:

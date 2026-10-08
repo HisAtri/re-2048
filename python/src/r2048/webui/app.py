@@ -294,10 +294,11 @@ def build_app(state: AppState | None = None):
         with gr.Row():
             model_box = gr.Dropdown(
                 choices=[entry.label() for entry in models],
-                value=models[0].label() if models else None,
-                label="模型（扫输出根下的 *.pt）",
+                value=inventory.default_model(models),
+                label="模型（按相对输出根的路径列出；输入可过滤）",
                 scale=4,
             )
+            include_resume = gr.Checkbox(value=False, label="含续跑点 last.pt", scale=1)
             refresh_models = gr.Button("重新扫描", scale=1)
             device_box = gr.Dropdown(choices=["cpu", "cuda"], value="cpu", label="设备", scale=1)
 
@@ -374,12 +375,13 @@ def build_app(state: AppState | None = None):
 
         # ---- 回调 -----------------------------------------------------------
 
-        def on_refresh_models():
-            labels = [entry.label() for entry in inventory.list_models()]
-            return gr.update(choices=labels, value=labels[0] if labels else None)
+        def on_refresh_models(include_resume: bool):
+            found = inventory.list_models(include_resume=include_resume)
+            labels = [entry.label() for entry in found]
+            return gr.update(choices=labels, value=inventory.default_model(found))
 
-        def on_connect(model_label, device, strategy_label, simulations, time_ms):
-            entry = inventory.find_model(model_label) if model_label else None
+        def on_connect(model_label, include_resume, device, strategy_label, simulations, time_ms):
+            entry = inventory.find_model(model_label, include_resume=include_resume) if model_label else None
             checkpoint = str(entry.path) if entry else ""
             try:
                 with state.lock:
@@ -589,10 +591,11 @@ def build_app(state: AppState | None = None):
         # ---- 绑定 -----------------------------------------------------------
 
         outputs = [board_html, status_html, analysis_html, note_html]
-        refresh_models.click(on_refresh_models, outputs=[model_box])
+        refresh_models.click(on_refresh_models, inputs=[include_resume], outputs=[model_box])
+        include_resume.change(on_refresh_models, inputs=[include_resume], outputs=[model_box])
         connect.click(
             on_connect,
-            inputs=[model_box, device_box, strategy_box, sims_box, time_box],
+            inputs=[model_box, include_resume, device_box, strategy_box, sims_box, time_box],
             outputs=outputs,
         )
         newgame_btn.click(on_newgame, inputs=[strategy_box, sims_box, time_box], outputs=outputs)

@@ -21,18 +21,29 @@ from r2048 import paths
 @dataclass(frozen=True)
 class ModelEntry:
     path: Path
+    root: Path | None = None
     model_id: str = ""
     architecture: str = ""
     training_target: str = ""
 
     def label(self) -> str:
-        """下拉里显示的一行：路径 + 训练目标。
+        """下拉里显示的一行：**相对输出根的路径** + 训练目标。
 
-        模型标识（`model_id`）刻意不放在这里——它常常是"数据批 + 配方"拼出来的长串，塞进下拉
-        会把每行都撑爆、反而谁也认不出来。它会在连接之后的状态行里显示。
+        必须是相对路径而不是文件名。输出根里同名 checkpoint 到处都是（每个 run 下都有
+        `value/model.pt`、`policy-head/model.pt`），只写 `父目录/文件名` 会得到一列谁也认不出
+        的 `value/model.pt`；相对路径把 run 身份带回来了，而且相邻行共享前缀，读起来成组。
+
+        `model_id` 不进来：它常是"数据批 + 配方"拼出来的长串，塞进去每行都撑爆——它在连接
+        之后的状态行里显示。
         """
+        shown: object = self.path
+        if self.root is not None:
+            try:
+                shown = self.path.relative_to(self.root)
+            except ValueError:  # 不在输出根下（不该发生）：退回绝对路径，但不要抛
+                shown = self.path
         suffix = f"  [{self.training_target}]" if self.training_target else ""
-        return f"{self.path.parent.name}/{self.path.name}{suffix}"
+        return f"{shown}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -75,23 +86,29 @@ def _read_checkpoint_metadata(path: Path) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
-def list_models(root: Path | None = None) -> list[ModelEntry]:
+def list_models(root: Path | None = None, include_resume: bool = False) -> list[ModelEntry]:
     """扫输出根下所有 `*.pt`。
 
-    不按固定子目录扫（`runs/`、`models/`）而是整个根递归：模型的实际落点一直在长
-    （训练 run 下、`models/` 的发布位、以及实验目录），写死子目录会让"新放出来的模型
-    在下拉里看不见"，而看不见的原因又完全不可见。代价可以忽略——元数据读取用 meta 张量，
-    实测 20 个文件 0.05s（权重留在磁盘上）。
+    整个根递归而不是写死 `runs/`、`models/`：模型的实际落点一直在长（训练 run 下、`models/`
+    的发布位、实验目录），写死子目录会让"新放出来的模型在下拉里看不见"，而看不见的原因完全
+    不可见。代价可以忽略——元数据只读 pickle（`map_location="meta"`，权重留在磁盘上），
+    实测 20 个 checkpoint 0.05s。
+
+    `last.pt` 默认不列：它是**断点续跑的落点**，不是"训好的模型"，而每个 run 里都有一份，
+    混进来会让列表翻倍、却几乎没人要选它。要的时候由调用方显式打开。
     """
     base = root or paths.output_root()
     if not base.is_dir():
         return []
     entries: list[ModelEntry] = []
     for path in sorted(base.rglob("*.pt")):
+        if not include_resume and path.name == "last.pt":
+            continue
         metadata = _read_checkpoint_metadata(path)
         entries.append(
             ModelEntry(
                 path=path,
+                root=base,
                 model_id=str(metadata.get("model_id", "")),
                 architecture=str(metadata.get("architecture", "")),
                 training_target=str(metadata.get("training_target", "")),
@@ -100,12 +117,29 @@ def list_models(root: Path | None = None) -> list[ModelEntry]:
     return entries
 
 
-def find_model(label: str, root: Path | None = None) -> ModelEntry | None:
+def find_model(label: str, root: Path | None = None, include_resume: bool = False) -> ModelEntry | None:
     """按下拉里显示的那一行找回条目（界面拿到的只有 label）。"""
-    for entry in list_models(root):
+    for entry in list_models(root, include_resume=include_resume):
         if entry.label() == label:
             return entry
     return None
+
+
+# 完整的模型：两个头都是这一轮训出来的。迭代目录里另有只训了价值或只训了策略的**半模型**，
+# 它们不是"拿来对局的模型"。
+COMPLETE_TARGETS = ("dual", "joint")
+
+
+def default_model(entries: list[ModelEntry]) -> str:
+    """默认选中哪个：优先完整模型，而不是"列表里的第一个"。
+
+    列表按路径排（那样才读得出来），于是第一个很可能是 `.../runs/value/model.pt`——半个模型。
+    默认值往往就是用户会直接点的那一个，所以它得是有意义的那个。
+    """
+    for entry in entries:
+        if entry.training_target in COMPLETE_TARGETS:
+            return entry.label()
+    return entries[0].label() if entries else ""
 
 
 def list_batches(root: Path | None = None) -> list[BatchEntry]:

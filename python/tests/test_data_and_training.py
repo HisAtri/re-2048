@@ -482,14 +482,20 @@ def test_improved_policy_target_arithmetic_and_limits() -> None:
     )
     assert model_id_for(plain, "candidate") != model_id_for(improved, "candidate")
     assert model_id_for(improved, "candidate") == "policy-批+improved-b1"
-    # 同一批数据、同一个种子、只换 checkpoint 挑选口径 ⇒ 两份不同权重，名字必须分得开。
-    q_selected = TrainConfig(
-        datasets=[DatasetSpec(path="/data/批")], output="x", mode="value", value_selection="q_best_hit"
+    # 挑选口径**总是**进名字：默认值换过（best_hit → q_best_hit），只给非默认值加后缀会让
+    # 新默认训出的 `value-<数据>` 与历史上按 A 口径挑出的同名（ADR 0030 §5.7 的同名事故）。
+    default_value = TrainConfig(datasets=[DatasetSpec(path="/data/批")], output="x", mode="value")
+    legacy = TrainConfig(
+        datasets=[DatasetSpec(path="/data/批")], output="x", mode="value", value_selection="best_hit"
     )
-    assert model_id_for(q_selected, "candidate") == "value-批+q_best_hit"
-    assert model_id_for(q_selected, "candidate") != model_id_for(
-        TrainConfig(datasets=[DatasetSpec(path="/data/批")], output="x", mode="value"), "candidate"
+    assert model_id_for(default_value, "candidate") == "value-批+q_best_hit"
+    assert model_id_for(legacy, "candidate") == "value-批+best_hit"
+    assert model_id_for(default_value, "candidate") != model_id_for(legacy, "candidate")
+    # 策略模式不训价值头，挑选口径与它无关，不该进名字。
+    policy_only = TrainConfig(
+        datasets=[DatasetSpec(path="/data/批")], output="x", mode="policy", value_selection="best_hit"
     )
+    assert model_id_for(policy_only, "candidate") == "policy-批"
 
 
 @pytest.mark.parametrize("rotation", range(4))

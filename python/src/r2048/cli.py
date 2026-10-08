@@ -67,7 +67,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--value-selection",
         default=argparse.SUPPRESS,
         choices=["best_hit", "q_best_hit"],
-        help="价值头 checkpoint 的挑选口径：best_hit = A 口径命中率（默认）；q_best_hit = r+A 口径",
+        help="价值头 checkpoint 的挑选口径：q_best_hit = r+A 口径（默认，与引擎的选择值同口径）；"
+        "best_hit = A 口径（旧口径，仅用于复现历史产物）",
     )
     train.add_argument("--policy-weight", type=float, default=argparse.SUPPRESS)
     train.add_argument(

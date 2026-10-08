@@ -36,6 +36,9 @@
 6. **价值头的主指标改为同根候选排序**：成对排序一致率（Kendall tau 的分子，候选只有 2~4 个时
    比 Spearman 更稳）、最优候选命中率、后悔值（分数单位）。checkpoint 也按最优候选命中率挑，
    而不是全局 MAE——旧版的结论是“只报告全局 Value MAE 不能替代同根候选排序”。
+   **口径已由 [ADR 0034](0034-a-versus-r-plus-a-ranking.md) 订正**：这些指标当时算在 `A(u_a)`
+   上（不含立即合并得分），而引擎的判决取决于 `r + A` 的排序。现在两套口径都报，且
+   **checkpoint 默认按 r+A 口径挑**；回归目标仍是 A（r 不是 afterstate 的函数，网络学不到它）。
 7. **每个 checkpoint 记录 `value_target` 与 `candidate_target_definition`**，
    让“这个价值头是在什么目标上训的”可从产物本身回答。
 

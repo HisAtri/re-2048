@@ -76,6 +76,11 @@ def trains_policy(mode: str) -> bool:
     return mode in POLICY_MODES or mode in JOINT_MODES
 
 
+def trains_value(mode: str) -> bool:
+    """这个配方训不训价值头（决定 checkpoint 里该不该记挑选口径、名字里该不该带它）。"""
+    return mode in VALUE_MODES or mode in JOINT_MODES
+
+
 @dataclass(frozen=True)
 class DatasetSpec:
     """一个训练数据来源：路径 + 采样权重 + 可选条数上限。
@@ -129,10 +134,17 @@ class TrainConfig:
     # "在 Q 空间做排序监督"与"在 A 空间做"不是同一件事，而 Q 空间的排序目标恰好是
     # 教师自己的边均值 Q：对搜索输出最忠实的蒸馏。见 ADR 0035。
     value_ranking_weight: float = 0.0
-    # 价值头 checkpoint 的挑选依据：best_hit = A 口径的最优候选命中率（历史口径）；
-    # q_best_hit = r+A 口径（与引擎的选择值同口径，见 ADR 0034）。只影响"留哪个 epoch 的
-    # 权重"，不影响损失——因为价值头原理上只能学 A（r 不是 afterstate 的函数）。
-    value_selection: str = "best_hit"
+    # 价值头 checkpoint 的挑选依据：q_best_hit = r+A 口径（**默认**，与引擎的选择值
+    # `one_ply = r + A` 同口径）；best_hit = A 口径（旧口径，保留用于复现历史产物）。
+    # 只影响"留哪个 epoch 的权重"，不影响损失——价值头原理上只能学 A（r 不是 afterstate
+    # 的函数），所以目标不动、动的是**量它的尺子**。
+    #
+    # 为什么默认就是 r+A（ADR 0034 决策 3 的修正）：旧口径量的是"像不像教师的 A"，而引擎的
+    # 判决取决于 r+A 的排序，两者在 3.1%~12.9% 的根上给出不同的 argmax。**这是一个度量错误，
+    # 不是参数取舍**，所以修它不取决于"换了之后成绩有没有变"——实测在 r6 的数据上两个口径
+    # 挑到同一个 epoch（空实验），那说明的是这个错误在该配置下的影响面还没显现，而不是它
+    # 没有影响。尺子先修对，再谈影响面。
+    value_selection: str = "q_best_hit"
     split_seed: int = 0
     # 每轮采样多少条（0 = 各来源训练池之和）。只在多来源或显式想缩短轮长时才有意义。
     samples_per_epoch: int = 0
@@ -241,8 +253,10 @@ def model_id_for(config: TrainConfig, value_target: str) -> str:
     if config.policy_target != "visits":
         # β 进名字：它能改变 6%~9% 的决策，是一个会被反复扫的旋钮，不能只靠 metadata 区分。
         base = f"{base}+{config.policy_target}-b{config.improve_beta:g}"
-    if config.value_selection != "best_hit":
-        # 同一批数据、同一个种子、只换挑选口径 ⇒ 两份不同权重。名字不分就无法事后区分。
+    if trains_value(config.mode):
+        # 挑选口径**总是**进名字：它换过默认值（best_hit → q_best_hit），如果只给非默认值加
+        # 后缀，新默认训出的 `value-<数据>` 会与历史上按 A 口径挑出的同名——正是 ADR 0030
+        # §5.7 那次事故的形状（两份不同权重、一个名字，评分池按 model_id 去重会合并它们）。
         base = f"{base}+{config.value_selection}"
     if config.value_ranking_weight > 0:
         base = f"{base}+rank{config.value_ranking_weight:g}"
@@ -1025,6 +1039,7 @@ def run_training(config: TrainConfig) -> TrainResult:
     best_metric: float | None = None
     best_metric_kind = ""
     best_checkpoint = ""
+    warned_ranking_selection = False
     identity = data_identity(reader, config)
     if config.resume and not (run_dir / "last.pt").exists():
         # 说了要接着跑、却什么也没接着，是必须说出来的一件事：安静地重头开始，
@@ -1236,18 +1251,20 @@ def run_training(config: TrainConfig) -> TrainResult:
         # 有候选监督时用“最优候选命中率”，否则退回价值 MAE；策略模式看交叉熵。
         if config.mode == "policy":
             primary, maximize, kind = val_ce, False, "val_policy_ce"
-        elif config.value_selection == "q_best_hit":
-            if math.isnan(q_best_hit):
-                # 要求按 r+A 口径挑、却没有候选监督 ⇒ 无从计算。静默退回 A 口径（或 MAE）
-                # 等于"改了参数却没生效"，必须显式失败。
-                raise ValueError(
-                    f"要求按 {config.value_selection} 口径挑 checkpoint，但这一轮没有候选监督"
-                    "（需要搜索产出的数据批）"
-                )
+        elif config.value_selection == "q_best_hit" and not math.isnan(q_best_hit):
             primary, maximize, kind = q_best_hit, True, "val_candidate_q_best_hit"
         elif not math.isnan(best_hit):  # 非 NaN 说明这一轮确实用了候选监督
             primary, maximize, kind = best_hit, True, "val_candidate_best_hit"
         else:
+            # 没有候选监督（随机策略批次）：r+A 与 A 两个排序口径都算不出来，退回价值 MAE。
+            # **必须出声**：这是"改了参数却没生效"的形态，而冷启动（在随机策略数据上训价值头，
+            # ADR 0013/0015）是正常用法，不能因此硬失败——缺席要说出来，而不是拦下来。
+            if config.value_selection == "q_best_hit" and not warned_ranking_selection:
+                print(
+                    "这一轮没有候选监督：无法按 r+A 口径挑 checkpoint（随机策略批次没有候选块），"
+                    "退回价值 MAE；要按 r+A 口径挑就用搜索产出的数据批"
+                )
+                warned_ranking_selection = True
             primary, maximize, kind = val_mae, False, "val_value_mae"
         if best_metric_kind and best_metric_kind != kind:
             # 主指标换了口径（换了配方，或换了一批没有候选监督的数据）：旧的"最佳"不可比。

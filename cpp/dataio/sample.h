@@ -66,7 +66,14 @@ namespace r2048 {
 //    20    16   reward[4]     uint32：r(s,a)
 //    36     8   visits[4]     u16 × 4：该节点上这条边的访问数
 //    44    64   afterstate[4] 每个合法动作的 afterstate（16 × 4）
+//   108    16   rollout_value[4] int32：**独立** playout 对 A(u_a) 的估计（原始分数单位）
 //  节点块不需要存节点自己的 decision 盘面：价值头的输入是 afterstate，而 afterstate 就在块里。
+//
+// 为什么**同时**存 `value` 与 `rollout_value`（v4，ADR 0043）：`value` 是搜索自己的 Q̄ − r，
+// 在访问数少的节点上它约等于 `one_ply = r + A_θ`，也就是**头自己的输出**——拿它当监督等于让
+// 学生复制自己（ADR 0030 §3 的循环下沉一层）。`rollout_value` 由规则驱动的续弈策略独立估计，
+// 与头无关。两种标签同批并存，于是"标签来源"的 A/B 只需要训练侧开关，可比性由构造保证；
+// 而且两者的相关本身就是"这个闭环有多紧"的读数。
 //
 // 为什么要有这一块（ADR 0041）：价值头在搜索里被**直接使用**的位置是叶节点与未被访问的边
 // （那里的 Q 就是 `r + A_θ`，没有模拟平均来纠错），而根候选块只覆盖"轨迹根"——搜索在根上有
@@ -75,13 +82,13 @@ namespace r2048 {
 // 是"价值头真正说了算"的地方。
 constexpr size_t kSampleBaseBytes = 192;
 // 一个树内节点块的字节数（见上面的偏移表）。
-constexpr size_t kTreeNodeBytes = 108;
+constexpr size_t kTreeNodeBytes = 124;
 // 单条记录里最多放几个树内节点。K 由清单声明、可以更小；这是编译期上界（定长数组）。
 constexpr uint8_t kTreeNodesMax = 4;
 constexpr size_t sample_bytes(uint8_t tree_nodes) {
     return kSampleBaseBytes + static_cast<size_t>(tree_nodes) * kTreeNodeBytes;
 }
-constexpr uint32_t kSampleSchemaVersion = 3;
+constexpr uint32_t kSampleSchemaVersion = 4;
 
 // 一个决策局面的候选目标集合。搜索负责给出每条边的平均 Q 与访问数，
 // afterstate 与立即得分由样本构造方用规则算（只有一个规则实现，避免两条路径分叉）。
@@ -104,6 +111,8 @@ struct TreeNodeTarget {
     std::array<int32_t, kNumActions> value{0, 0, 0, 0};
     std::array<uint32_t, kNumActions> reward{0, 0, 0, 0};
     std::array<uint16_t, kNumActions> visits{0, 0, 0, 0};
+    // 独立 playout 估计（ADR 0043）；0 表示没标注（例如未开启标注）。
+    std::array<int32_t, kNumActions> rollout{0, 0, 0, 0};
 };
 
 struct Sample {

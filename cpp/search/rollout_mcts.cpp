@@ -4,6 +4,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "game/continuation.h"
 #include "game/rules.h"
 #include "game/seeds.h"
 
@@ -63,53 +64,15 @@ int RolloutMcts::select_action(const Node& node) const {
 }
 
 int RolloutMcts::greedy_action(const Board& board, uint8_t mask) const {
-    int best = -1;
-    int best_empty = -1;
-    uint32_t best_score = 0;
-    for (int action = 0; action < kNumActions; action++) {
-        if ((mask & (1u << action)) == 0) continue;
-        const MoveOutcome outcome = apply_move(board, action);
-        if (!outcome.valid) continue;
-        const int empties = outcome.board.empty_count();
-        if (best < 0 || empties > best_empty || (empties == best_empty && outcome.score > best_score)) {
-            best = action;
-            best_empty = empties;
-            best_score = outcome.score;
-        }
-    }
-    if (best < 0) throw std::runtime_error("rollout 里没有合法方向：入口应先用 legal_mask 过滤");
-    return best;
+    // 续弈策略只有一份实现（game/continuation.h）：rollout 引擎与树内节点的独立标注共用它。
+    // 分成两份的话它们会漂，而续弈策略正是标签信息量的决定因素（ADR 0030 §6.1、ADR 0043）。
+    return greedy_continuation(board, mask);
 }
 
 float RolloutMcts::rollout(const Board& board, Rng& rng) const {
-    Board current = board;
-    uint64_t total = 0;
-    for (;;) {
-        const uint8_t mask = legal_mask(current);
-        if (mask == 0) break;
-        int action;
-        if (config_.greedy_rollout) {
-            action = greedy_action(current, mask);
-        } else {
-            // 在合法方向中均匀抽样：先数出掩码里的位置数，再取第 k 个。
-            int picks = 0;
-            for (int a = 0; a < kNumActions; a++) picks += (mask >> a) & 1;
-            int chosen = static_cast<int>(rng.below(static_cast<uint32_t>(picks)));
-            action = 0;
-            for (; action < kNumActions; action++) {
-                if ((mask & (1u << action)) == 0) continue;
-                if (chosen == 0) break;
-                chosen--;
-            }
-        }
-        const MoveOutcome outcome = apply_move(current, action);
-        total += outcome.score;
-        current = outcome.board;
-        // rollout 内的随机块用 rollout 自己的随机流：它与真实环境流分开，
-        // 这样调整 rollout 策略不会连带改变对局的随机序列。
-        spawn_tile(current, rng);
-    }
-    return static_cast<float>(total);
+    const ContinuationPolicy policy =
+        config_.greedy_rollout ? ContinuationPolicy::kGreedy : ContinuationPolicy::kUniform;
+    return playout(board, rng, policy);
 }
 
 RolloutMctsResult RolloutMcts::search(const Board& root, uint64_t episode, uint64_t step) {

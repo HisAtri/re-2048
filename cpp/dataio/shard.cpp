@@ -89,6 +89,10 @@ void compare_resume_meta(const BatchMeta& existing, const BatchMeta& requested, 
     require_equal_u64("shard_samples", existing.shard_samples, shard_samples);
     // 记录长度由它决定：不一致就必须拒绝，否则接着写下去的记录会错位（ADR 0041）。
     require_equal_u64("tree_nodes", existing.tree_nodes, requested.tree_nodes);
+    // 标注参数决定"这些字节里装的是什么标签"：不一致就必须拒绝（同 tree_nodes 的理由）。
+    require_equal_u64("tree_label_policy", existing.tree_label_policy, requested.tree_label_policy);
+    require_equal_u64("tree_label_plays", existing.tree_label_plays, requested.tree_label_plays);
+    require_equal_u64("tree_label_rollout", existing.tree_label_rollout, requested.tree_label_rollout);
     compare_protocol_params(existing, requested);
 }
 
@@ -146,6 +150,9 @@ Json manifest_to_json(const BatchManifest& manifest) {
     root.set("model_id", Json::str(manifest.meta.model_id));
     // 记录长度由 tree_nodes 决定（v3 的树内节点块），清单声明它，读侧照着解码。
     root.set("tree_nodes", Json::integer(static_cast<int64_t>(manifest.meta.tree_nodes)));
+    root.set("tree_label_policy", Json::integer(static_cast<int64_t>(manifest.meta.tree_label_policy)));
+    root.set("tree_label_plays", Json::integer(static_cast<int64_t>(manifest.meta.tree_label_plays)));
+    root.set("tree_label_rollout", Json::integer(static_cast<int64_t>(manifest.meta.tree_label_rollout)));
     root.set("record_bytes", Json::integer(static_cast<int64_t>(manifest.meta.record_bytes())));
     root.set("shard_samples", Json::integer(manifest.meta.shard_samples));
     root.set("samples_target", Json::integer(static_cast<int64_t>(manifest.meta.samples_target)));
@@ -203,6 +210,12 @@ BatchManifest manifest_from_json(const Json& json) {
                                  std::to_string(kSampleSchemaVersion) + " 格式的数据批");
     }
     manifest.meta.tree_nodes = static_cast<uint8_t>(json.at("tree_nodes").as_int());
+    manifest.meta.tree_label_policy =
+        static_cast<uint8_t>(json.has("tree_label_policy") ? json.at("tree_label_policy").as_int() : 0);
+    manifest.meta.tree_label_plays =
+        static_cast<uint32_t>(json.has("tree_label_plays") ? json.at("tree_label_plays").as_int() : 0);
+    manifest.meta.tree_label_rollout =
+        static_cast<uint8_t>(json.has("tree_label_rollout") ? json.at("tree_label_rollout").as_int() : 0);
     if (manifest.meta.tree_nodes > kTreeNodesMax) {
         throw std::runtime_error("清单声明的 tree_nodes 超出本构建支持的上界: " +
                                  std::to_string(manifest.meta.tree_nodes));

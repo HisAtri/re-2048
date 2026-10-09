@@ -84,6 +84,7 @@ void encode_sample(const Sample& sample, uint8_t out[], uint8_t tree_nodes) {
             write_u32(block + 4 + 4 * action, static_cast<uint32_t>(target.value[action]));
             write_u32(block + 20 + 4 * action, target.reward[action]);
             write_u16(block + 36 + 2 * action, target.visits[action]);
+            write_u32(block + 108 + 4 * action, static_cast<uint32_t>(target.rollout[action]));
         }
     }
 }
@@ -121,6 +122,7 @@ Sample decode_sample(const uint8_t in[], uint8_t tree_nodes) {
             target.value[action] = static_cast<int32_t>(read_u32(block + 4 + 4 * action));
             target.reward[action] = read_u32(block + 20 + 4 * action);
             target.visits[action] = read_u16(block + 36 + 2 * action);
+            target.rollout[action] = static_cast<int32_t>(read_u32(block + 108 + 4 * action));
         }
     }
     sample.tree_count = in[185];

@@ -57,6 +57,14 @@ class SelfplayConfig:
     # 每步一个根——那是训练分布与部署分布错配，不是「值不值得付 2 倍存储」的取舍。一致性
     # 优先，成本（记录 2.1 倍、价值前向行数 3 倍）接受并记账。
     tree_nodes: int = 2
+    # 树内节点的**独立标注**（ADR 0043）：对抽样到的每个内部决策节点、每条合法边的 afterstate，
+    # 用规则驱动的续弈策略跑 N 次 playout 取均值，作为**非循环**的价值标签（低频/深层节点的树内
+    # Q̄ 约等于头自己的输出，拿它当监督等于让学生复制自己）。0 = 不标注。
+    tree_label_plays: int = 8
+    # 抽样策略：depth_stratified（默认，每深度取访问数最大者）| top_visits（ADR 0042 的那一版）
+    tree_label_policy: str = "depth_stratified"
+    # 标注用的续弈策略：greedy（默认，ADR 0030 §6.1 证实更强）| uniform
+    tree_label_rollout: str = "greedy"
     cache_entries: int = 1 << 17
     shard_samples: int = 100000
     max_batch: int = 16384
@@ -163,6 +171,9 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
         "temperature": config.temperature,
         "temperature_moves": config.temperature_moves,
         "tree_nodes": config.tree_nodes,
+        "tree_label_plays": config.tree_label_plays,
+        "tree_label_policy": 0 if config.tree_label_policy == "depth_stratified" else 1,
+        "tree_label_greedy": 1 if config.tree_label_rollout == "greedy" else 0,
         "cache_entries": config.cache_entries,
         "search_threads": config.search_threads,
         "score_scale": float(r2048_core.SCORE_SCALE),

@@ -16,6 +16,7 @@
 #include "core/logging.h"
 #include "dataio/sample.h"
 #include "dataio/shard.h"
+#include "game/continuation.h"
 #include "game/rules.h"
 #include "game/seeds.h"
 #include "program/episode.h"  // opening_board：开局口径必须与纯 C++ 跑谱完全一致
@@ -140,6 +141,9 @@ struct BatchedEngine::Impl {
         meta.simulations = config.decision_mode == kDecisionSearch ? config.simulations : 0;
         meta.temperature_moves = config.temperature_moves;
         meta.tree_nodes = config.tree_nodes;
+        meta.tree_label_policy = config.tree_label_policy;
+        meta.tree_label_plays = config.tree_label_plays;
+        meta.tree_label_rollout = config.tree_label_greedy ? 1 : 0;
         meta.seed = config.seed;
         // 并发对局数记**整批**的值：多线程搜索时它 = 各引擎 lanes 之和（见 ADR 0003/0028）。
         meta.workers = config.lanes_total > 0 ? config.lanes_total : config.lanes;
@@ -734,27 +738,80 @@ struct BatchedEngine::Impl {
             std::array<TreeNodeTarget, kTreeNodesMax> tree{};
             uint8_t tree_count = 0;
             if (config.tree_nodes > 0) {
-                std::vector<std::pair<uint32_t, uint32_t>> ranked;  // (visits, node index)
+                // 选中的节点：每项 = (节点下标, 到根的步数, 访问数)。用一个固定大小的小数组装，
+                // 不用 std::sort/vector —— 只需要"每深度最大"与"top-K"两种选择，选择循环是 O(n·K)
+                // 且不需要分配；顺带避开 GCC 13 对 std::sort + 小结构体报的
+                // -Wfree-nonheap-object（已知误报类）。
+                struct Pick {
+                    uint32_t index = 0;
+                    uint8_t depth = 0;
+                    uint32_t visits = 0;
+                };
+                std::array<Pick, kTreeNodesMax> chosen{};
+                size_t chosen_count = 0;
+
+                // 各深度的当前最优（按访问数降序、并列取下标小者）。深度上限取一个安全上界：
+                // 树深不会超过模拟次数，也不需要更精细的界。
+                constexpr uint32_t kMaxDepth = 64;
+                std::array<Pick, kMaxDepth + 1> best_at_depth{};
+
+                // top-K 的当前集合（按 (访问数, 下标) 排序，用插入法维护）。
                 for (uint32_t index = 1; index < lane.nodes.size(); index++) {
                     const Node& node = lane.nodes[index];
                     if (node.kind != kDecision || node.state != kEvaluated) continue;
                     if (node.parent == kNoNode) continue;  // 根不算树内节点
                     if (node.visits == 0) continue;
-                    ranked.emplace_back(node.visits, index);
-                }
-                std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
-                    return left.first != right.first ? left.first > right.first
-                                                     : left.second < right.second;
-                });
-                const size_t take = std::min<size_t>(config.tree_nodes, ranked.size());
-                for (size_t slot = 0; slot < take; slot++) {
-                    const uint32_t at = ranked[slot].second;
-                    const Node& node = lane.nodes[at];
                     uint8_t depth = 0;
-                    for (uint32_t walk = at; lane.nodes[walk].parent != kNoNode;
+                    for (uint32_t walk = index; lane.nodes[walk].parent != kNoNode;
                          walk = lane.nodes[walk].parent) {
                         depth++;
                     }
+                    const Pick pick{index, depth, node.visits};
+                    const bool better = [](const Pick& left, const Pick& right) {
+                        return left.visits != right.visits ? left.visits > right.visits
+                                                           : left.index < right.index;
+                    }(pick, best_at_depth[std::min<uint32_t>(depth, kMaxDepth)]);
+                    if (better) best_at_depth[std::min<uint32_t>(depth, kMaxDepth)] = pick;
+
+                    // top-K：插到第一个比自己差的位置，超出的丢掉。
+                    size_t at = 0;
+                    while (at < chosen_count && !better) {
+                        const bool worse = [](const Pick& left, const Pick& right) {
+                            return left.visits != right.visits ? left.visits < right.visits
+                                                               : left.index > right.index;
+                        }(chosen[at], pick);
+                        if (worse) break;
+                        at++;
+                    }
+                    if (at >= kTreeNodesMax) continue;
+                    for (size_t shift = std::min<size_t>(kTreeNodesMax - 1, chosen_count);
+                         shift > at; shift--) {
+                        chosen[shift] = chosen[shift - 1];
+                    }
+                    chosen[at] = pick;
+                    if (chosen_count < kTreeNodesMax) chosen_count++;
+                }
+
+                if (config.tree_label_policy == kTreeLabelDepthStratified) {
+                    // 按深度分层：每个深度取访问数最大的那个节点（K = 覆盖的深度数）。
+                    // 为什么分层：头的查询面**遍布各深度**，而"按访问数取 top-K"会把槽位全堆在浅层
+                    // ——浅层既最像根（信息冗余），也恰好是树内标签最不像头自己回声的地方。分层把
+                    // 监督铺到深层，而那里正是 `one_ply` 直接决定 Q 的区域（ADR 0043）。
+                    chosen_count = 0;
+                    for (uint8_t depth = 1; depth <= config.tree_nodes; depth++) {
+                        const Pick& pick = best_at_depth[std::min<uint32_t>(depth, kMaxDepth)];
+                        if (pick.visits == 0) continue;  // 该深度没有可用的决策节点
+                        chosen[chosen_count++] = pick;
+                    }
+                } else {
+                    // 按访问数取 top-K（ADR 0042 的那一版，保留用于对照）：chosen 已按此序维护。
+                }
+
+                const ContinuationPolicy label_policy = config.tree_label_greedy
+                                                            ? ContinuationPolicy::kGreedy
+                                                            : ContinuationPolicy::kUniform;
+                for (size_t slot = 0; slot < chosen_count; slot++) {
+                    const Node& node = lane.nodes[chosen[slot].index];
                     int32_t node_q_mean[kNumActions] = {0, 0, 0, 0};
                     uint16_t node_visits[kNumActions] = {0, 0, 0, 0};
                     for (int candidate = 0; candidate < kNumActions; candidate++) {
@@ -765,10 +822,34 @@ struct BatchedEngine::Impl {
                         node_q_mean[candidate] = static_cast<int32_t>(std::lround(q));
                         node_visits[candidate] = static_cast<uint16_t>(std::min<uint32_t>(raw, 0xFFFF));
                     }
-                    tree[slot] =
-                        build_tree_node(node.board, node.legal_mask, depth, node_q_mean, node_visits);
-                    tree_count++;
+                    tree[slot] = build_tree_node(node.board, node.legal_mask, chosen[slot].depth,
+                                                 node_q_mean, node_visits);
+                    // 独立标注（ADR 0043）：从候选 afterstate 出发，先补一个随机块（A(u) 的定义里
+                    // 块在决策前生成），再用规则驱动的续弈策略走到终局，取 R 次均值。
+                    if (config.tree_label_plays > 0) {
+                        for (int candidate = 0; candidate < kNumActions; candidate++) {
+                            if ((node.legal_mask & (1u << candidate)) == 0) continue;
+                            double total = 0.0;
+                            for (uint32_t replica = 0; replica < config.tree_label_plays; replica++) {
+                                // 每条 (槽位, 方向, 副本) 一条独立流。index 只由**静态量**构成：
+                                // 不能用访问数或在途数这类取决于交付时序的计数（ADR 0031 记过
+                                // batched_engine 拿 pending.size() 当 index 的后果——数据不可复现）。
+                                const uint64_t index =
+                                    (static_cast<uint64_t>(slot) * kNumActions + candidate) *
+                                        config.tree_label_plays +
+                                    replica;
+                                Rng rng(derive_seed(config.seed, kSaltTreeLabel, lane.episode,
+                                                    lane.step, index));
+                                Board state = node.edge_afterstate[candidate];
+                                spawn_tile(state, rng);
+                                total += playout(state, rng, label_policy);
+                            }
+                            tree[slot].rollout[candidate] =
+                                static_cast<int32_t>(std::lround(total / config.tree_label_plays));
+                        }
+                    }
                 }
+                tree_count = static_cast<uint8_t>(chosen_count);
             }
             lane.recorder.add(lane.board, move.board, action, lane.legal_mask,
                               static_cast<uint32_t>(move.score), visits, &candidates, tree.data(),

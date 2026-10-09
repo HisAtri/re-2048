@@ -391,6 +391,8 @@ class Batch:
     tree_reward: torch.Tensor  # (B, K, 4) float32：r
     tree_visits: torch.Tensor  # (B, K, 4) float32：该节点上这条边的访问数
     tree_depth: torch.Tensor  # (B, K) float32：该节点到根经过的步数（诊断用）
+    tree_rollout_value: torch.Tensor  # (B, K, 4) float32：**独立** playout 对 A(u_a) 的估计（已归一化）
+    tree_legal: torch.Tensor  # (B, K, 4) float32：该槽位是否有效（缺席槽位与非法方向都是 0）
     tree_count: torch.Tensor  # (B,) int64：这条记录实际写了几个节点（0 = 没采到）
 
     def __len__(self) -> int:
@@ -417,6 +419,8 @@ class Batch:
             tree_reward=self.tree_reward.to(device),
             tree_visits=self.tree_visits.to(device),
             tree_depth=self.tree_depth.to(device),
+            tree_rollout_value=self.tree_rollout_value.to(device),
+            tree_legal=self.tree_legal.to(device),
             tree_count=self.tree_count.to(device),
         )
 
@@ -537,6 +541,14 @@ class BatchStream:
             tree_depth = np.stack(
                 [records[f"tree{slot}_depth"].astype(np.float32) for slot in range(tree_nodes)], axis=1
             )
+            tree_legal = tree_legal.astype(np.float32)
+            tree_rollout_value = np.stack(
+                [
+                    records[f"tree{slot}_rollout"].astype(np.float32) / self.score_scale * tree_legal
+                    for slot in range(tree_nodes)
+                ],
+                axis=1,
+            )
             # 非法槽位清零：引擎写的是合法方向的真值，非法方向写 0；这里再乘一次掩码，
             # 让"非法方向的槽位恒为 0"成为下游可以直接依赖的性质（与候选块同一口径）。
             tree_value = tree_value * tree_legal
@@ -548,12 +560,16 @@ class BatchStream:
             tree_reward = np.zeros((len(records), 0, 4), dtype=np.float32)
             tree_visits = np.zeros((len(records), 0, 4), dtype=np.float32)
             tree_depth = np.zeros((len(records), 0), dtype=np.float32)
+            tree_rollout_value = np.zeros((len(records), 0, 4), dtype=np.float32)
+            tree_legal = np.zeros((len(records), 0, 4), dtype=np.float32)
         return Batch(
             tree_afterstate=torch.from_numpy(np.ascontiguousarray(tree_afterstate)),
             tree_value=torch.from_numpy(np.ascontiguousarray(tree_value)),
             tree_reward=torch.from_numpy(np.ascontiguousarray(tree_reward)),
             tree_visits=torch.from_numpy(np.ascontiguousarray(tree_visits)),
             tree_depth=torch.from_numpy(np.ascontiguousarray(tree_depth)),
+            tree_rollout_value=torch.from_numpy(np.ascontiguousarray(tree_rollout_value)),
+            tree_legal=torch.from_numpy(np.ascontiguousarray(tree_legal)),
             tree_count=torch.from_numpy(records["tree_count"].astype(np.int64)),
             decision=torch.from_numpy(np.ascontiguousarray(records["decision"])),
             afterstate=torch.from_numpy(np.ascontiguousarray(records["afterstate"])),

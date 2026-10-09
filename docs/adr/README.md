@@ -48,6 +48,7 @@ ADR 解释为什么整体是这个形状。
 | [0040](0040-session-random-stream-and-terminal-invariants.md) | 会话的两个规则 bug（生成块固定位置/只出 2、终局的棋被丢掉）换来的不变量 | 已采纳 |
 | [0041](0041-record-v3-tree-nodes.md) | 记录格式 v3：树内节点块（K 由清单声明），v2 数据归档、不维护兼容 | 已采纳 |
 | [0042](0042-tree-node-supervision-results.md) | 树内节点监督首轮实测：真实但微弱（+105 且与预算无关），贪心臂反而变差 | 已采纳（默认 K 经订正为 2：一致性优先于成本） |
+| [0043](0043-tree-node-independent-labels.md) | 树内节点的独立标注（记录 v4）：非循环标签 + 按深度分层抽样 + 共享续弈原语 | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

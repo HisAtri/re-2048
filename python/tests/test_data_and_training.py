@@ -32,6 +32,8 @@ def _tree_zeros(count: int, nodes: int = 0) -> dict:
         "tree_reward": torch.zeros(count, nodes, 4),
         "tree_visits": torch.zeros(count, nodes, 4),
         "tree_depth": torch.zeros(count, nodes),
+        "tree_rollout_value": torch.zeros(count, nodes, 4),
+        "tree_legal": torch.zeros(count, nodes, 4),
         "tree_count": torch.zeros(count, dtype=torch.int64),
     }
 
@@ -425,7 +427,7 @@ def test_ranking_loss_only_punishes_decisions() -> None:
 
     def loss(predicted_a: list[float]) -> float:
         prediction = torch.tensor([predicted_a]) / scale
-        return float(_ranking_loss(prediction, None, batch, scale)) * scale
+        return float(_ranking_loss(prediction, None, batch, scale, "qmean")) * scale
 
     assert loss([1000.0, 1200.0, 0.0, 0.0]) == pytest.approx(0.0, abs=1e-3), "完美预测必须为 0"
     assert loss([1600.0, 1000.0, 0.0, 0.0]) == pytest.approx(0.0, abs=1e-3), (
@@ -478,12 +480,19 @@ def test_ranking_loss_covers_tree_nodes() -> None:
         tree_reward=tree_reward,
         tree_visits=tree_visits,
         tree_depth=torch.ones(count, 1),
+        # 独立标签：与 tree_value 同值，好让"换标签来源"这件事不影响这条用例的算术（它测的是
+        # 排序项的形状与语义，不是标签来源）。
+        tree_rollout_value=tree_value,
+        tree_legal=torch.tensor([[[1.0, 1.0, 0.0, 0.0]]]),
         tree_count=torch.ones(count, dtype=torch.int64),
     )
 
     def loss(tree_predicted_a: list[float]) -> float:
         prediction = torch.tensor([tree_predicted_a]) / scale  # (1, 4)？—— 见下
-        return float(_ranking_loss(torch.zeros(count, 4), prediction.reshape(1, 1, 4), batch, scale)) * scale
+        return (
+            float(_ranking_loss(torch.zeros(count, 4), prediction.reshape(1, 1, 4), batch, scale, "rollout"))
+            * scale
+        )
 
     assert loss([1000.0, 1200.0, 0.0, 0.0]) == pytest.approx(0.0, abs=1e-3), "树内节点的完美预测必须为 0"
     assert loss([1600.0, 1000.0, 0.0, 0.0]) == pytest.approx(0.0, abs=1e-3), (
@@ -491,17 +500,24 @@ def test_ranking_loss_covers_tree_nodes() -> None:
     )
     assert loss([1000.0, 1600.0, 0.0, 0.0]) > 5.0, "让引擎在树内节点上改选 left ⇒ 必须罚"
 
-    # 未访问的边不参与：只把"未访问"的那条边搞错，损失必须仍为 0。
+    # 两种标签来源对"未访问的边"的处理必须**不同**——这正是 v4 存在的理由（ADR 0043）：
+    #   qmean：访问数为 0 的边其 `tree_value` 就是 pure one_ply（头自己的输出）⇒ 必须排除；
+    #   rollout：独立标签与访问数无关 ⇒ 未访问的边**参与**（那正是头说了算的区域）。
     batch_extra = Batch(**{**batch.__dict__, "tree_visits": torch.tensor([[[5.0, 0.0, 0.0, 0.0]]])})
     swapped = torch.tensor([[1000.0, 1600.0, 0.0, 0.0]]) / scale
     assert float(
-        _ranking_loss(torch.zeros(count, 4), swapped.reshape(1, 1, 4), batch_extra, scale)
-    ) == pytest.approx(0.0, abs=1e-6), (
-        "left 那条边访问数为 0 ⇒ 它的排序不参与（标签只是教师自己的一次性估计）"
-    )
+        _ranking_loss(torch.zeros(count, 4), swapped.reshape(1, 1, 4), batch_extra, scale, "qmean")
+    ) == pytest.approx(0.0, abs=1e-6), "qmean 口径：left 的访问数为 0 ⇒ 它的排序不参与"
+    assert (
+        float(_ranking_loss(torch.zeros(count, 4), swapped.reshape(1, 1, 4), batch_extra, scale, "rollout"))
+        * scale
+        > 5.0
+    ), "rollout 口径：未访问的边有独立标签 ⇒ 它参与，且把 up 搞错必须被罚"
 
     # 没有树内块时（tree_prediction=None）这一项只看根候选：这里根候选权重全 0 ⇒ 恰好为 0。
-    assert float(_ranking_loss(torch.zeros(count, 4), None, batch, scale)) == pytest.approx(0.0, abs=1e-6)
+    assert float(_ranking_loss(torch.zeros(count, 4), None, batch, scale, "rollout")) == pytest.approx(
+        0.0, abs=1e-6
+    )
 
 
 def test_improved_policy_target_arithmetic_and_limits() -> None:
@@ -575,7 +591,7 @@ def test_improved_policy_target_arithmetic_and_limits() -> None:
         value_ranking_weight=0.0,  # 这一段只测挑选口径，把排序项的默认后缀摘掉
     )
     # 默认还带排序项的权重（ADR 0035 默认 λ=1）：三个旋钮都要能从名字里读出来。
-    assert model_id_for(default_value, "candidate") == "value-批+q_best_hit+rank1"
+    assert model_id_for(default_value, "candidate") == "value-批+q_best_hit+label-rollout+rank1"
     no_rank = TrainConfig(
         datasets=[DatasetSpec(path="/data/批")], output="x", mode="value", value_ranking_weight=0.0
     )

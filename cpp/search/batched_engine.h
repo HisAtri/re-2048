@@ -26,6 +26,14 @@ enum DecisionMode : uint8_t {
     kDecisionPolicyGreedy = 2,  // 不做树搜索：argmax_a π(a|s)（屏蔽非法方向）
 };
 
+// 树内节点的抽样策略（ADR 0043）。两者都确定性；区别在把槽位放在树的哪一段。
+enum TreeLabelPolicy : uint8_t {
+    // 每个深度取访问数最大的那个节点（K = 覆盖的深度数）。默认：头的查询面遍布各深度。
+    kTreeLabelDepthStratified = 0,
+    // 按访问数取 top-K（ADR 0042 的那一版，保留用于对照）：槽位偏浅层。
+    kTreeLabelTopVisits = 1,
+};
+
 struct EngineConfig {
     uint32_t lanes = 8;         // 同时在跑的局数
     uint32_t simulations = 64;  // 每步的模拟次数
@@ -38,7 +46,13 @@ struct EngineConfig {
     float c_puct = 1.5f;              // PUCT 探索系数
     // 记录里放几个树内节点（0 = 不采集，记录 192 字节；见 ADR 0041）。它是**格式参数**：
     // 决定记录字节数，进清单、进续跑闸门。采集本身不改变搜索行为，所以不进逐局协议。
-    uint8_t tree_nodes = 0;
+    uint8_t tree_nodes = 0;    // 树内节点的**独立标注**（ADR 0043）：对抽样到的每个内部决策节点、每条合法边的 afterstate，
+    // 用规则驱动的续弈策略跑 `tree_label_plays` 次 playout，取均值作为**非循环**的价值标签。
+    // 为什么必须独立：低频/深层节点的树内 Q̄ 约等于 `one_ply = r + A_θ`，也就是头自己的输出，
+    // 拿它当监督等于让学生复制自己。标注发生在搜索结束之后，不改变任何一局的走法。
+    uint8_t tree_label_policy = kTreeLabelDepthStratified;
+    uint32_t tree_label_plays = 0;
+    bool tree_label_greedy = true;  // 续弈策略：true = 一步启发式（ADR 0030 §6.1 证实更强）
     uint32_t temperature_moves = 30;  // 开局多少步按访问分布采样
     float temperature = 1.0f;         // 访问数开 1/T 次幂后采样；0 表示直接取最大
     // 搜索线程数（= K 个引擎，各持一份叶子缓存，共用一个写入侧与一个合并推理线程）。

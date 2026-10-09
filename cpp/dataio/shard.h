@@ -40,6 +40,17 @@ struct BatchMeta {
     // 记录里放几个树内节点（0 = 没有树内块，记录就是 192 字节）。它决定**记录字节数**，
     // 因此属于续跑必须比对的字段：一半 K=0、一半 K=2 的批次读出来会错位（ADR 0041）。
     uint8_t tree_nodes = 0;
+    // 树内节点的**标注**参数（ADR 0043）。它们不改变任何一局的走法（标注发生在搜索结束之后），
+    // 所以与 tree_nodes 同属"内容参数"：进清单、进续跑闸门，不进 kProtocolParams。
+    //   tree_label_policy：0 = 按深度分层（每个深度取访问数最大的节点），1 = 按访问数取 top-K
+    //   tree_label_plays：每个候选 afterstate 跑几次独立 playout（0 = 不标注）
+    uint8_t tree_label_policy = 0;
+    uint32_t tree_label_plays = 0;
+    // 标注用的续弈策略（0 = 均匀，1 = 一步启发式）。与 `rollout_policy` 是两个角色：那个驱动
+    // 纯 C++ 教师的**搜索**（因此是协议参数），这个只用于树内节点的**标注**（不改变走法）。
+    // 两份实现共用 `game/continuation.h` 的原语——ADR 0030 §6.1 证明续弈策略是标签信息量的
+    // 决定因素，任何"两套实现"都会漂。
+    uint8_t tree_label_rollout = 0;
     uint32_t workers = 0;
     // 0 表示不限量：跑到被外部叫停为止（见 core/control.h）。
     uint64_t samples_target = 0;

@@ -18,9 +18,9 @@ import numpy as np
 # v3 起记录长度是 **基础块 + K × 树内节点块**，K 由清单的 tree_nodes 声明（0 = 没有这块）。
 # 因此这里没有单一的 RECORD_BYTES，只有一个函数——两份定义迟早会分叉。
 BASE_RECORD_BYTES = 192
-TREE_NODE_BYTES = 108
+TREE_NODE_BYTES = 124
 TREE_NODES_MAX = 4
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def record_dtype(tree_nodes: int) -> np.dtype:
@@ -82,6 +82,10 @@ _TREE_FIELDS = [
     ("reward", "<u4", (4,)),  # +20：r(s,a)
     ("visits", "<u2", (4,)),  # +36：该节点上这条边的访问数
     ("afterstate", "u1", (4, 16)),  # +44
+    # +108：**独立** playout 对 A(u_a) 的估计（原始分数单位）。与 value（搜索自己的 Q̄ − r）并存：
+    # 低频节点的 value 约等于头自己的输出（one_ply），拿它当监督等于让学生复制自己；rollout 由
+    # 规则驱动的续弈策略给出、与头无关（ADR 0043）。
+    ("rollout", "<i4", (4,)),
 ]
 
 if record_dtype(0).itemsize != BASE_RECORD_BYTES:  # pragma: no cover - 契约自检

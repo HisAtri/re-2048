@@ -54,6 +54,10 @@ r2048::EngineConfig engine_config_from_dict(const py::dict& dict) {
     config.c_puct = get_float("c_puct", config.c_puct);
     config.temperature_moves = get_uint("temperature_moves", config.temperature_moves);
     config.tree_nodes = static_cast<uint8_t>(get_uint("tree_nodes", config.tree_nodes));
+    config.tree_label_policy =
+        static_cast<uint8_t>(get_uint("tree_label_policy", config.tree_label_policy));
+    config.tree_label_plays = get_uint("tree_label_plays", config.tree_label_plays);
+    config.tree_label_greedy = get_uint("tree_label_greedy", config.tree_label_greedy ? 1 : 0) != 0;
     config.temperature = get_float("temperature", config.temperature);
     config.cache_entries = get_uint("cache_entries", config.cache_entries);
     config.score_scale = get_float("score_scale", config.score_scale);

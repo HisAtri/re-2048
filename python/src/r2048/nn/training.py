@@ -127,6 +127,11 @@ class TrainConfig:
     improve_beta: float = 1.0
     # π̂ 上的均匀伪访问数：让搜索未访问过的候选也能拿到质量。0 = 严格乘法重加权。
     improve_floor: float = 0.0
+    # 树内节点的排序项用哪种标签（ADR 0043）：
+    #   rollout = **独立** playout 估计（规则驱动的续弈策略，与头无关）——默认，数学上正确的那一个；
+    #   qmean   = 搜索自己的 Q̄ − r（ADR 0042 的那一版）。低频节点的 qmean 约等于 `one_ply = r + A_θ`，
+    #             也就是头自己的输出，拿它当监督等于让学生复制自己。
+    tree_label_source: str = "rollout"
     val_fraction: float = 0.05
     # Q 空间的同根成对排序损失权重（0 = 关；**默认 1.0 = 开**）。Q = r + A 是引擎的选择值：
     # 把 r 加在预测与目标两边**不改变预测误差**（所以 Huber 在两种口径下逐值相同），但会改变
@@ -263,8 +268,11 @@ def model_id_for(config: TrainConfig, value_target: str) -> str:
         # §5.7 那次事故的形状（两份不同权重、一个名字，评分池按 model_id 去重会合并它们）。
         base = f"{base}+{config.value_selection}"
     if trains_value(config.mode) and config.value_ranking_weight > 0:
-        # 排序项只作用在价值头上（它在价值损失里），所以策略模式不带这个后缀——
-        # 那份权重里没有任何与它相关的东西。
+        # 标签来源总是进名字：默认值换过（qmean → rollout），只给非默认值加后缀会让新旧两份
+        # 不同权重同名——ADR 0030 §5.7 与 ADR 0034 都踩过这个形状。
+        base = f"{base}+label-{config.tree_label_source}"
+        # 排序项只作用在价值头上（它在价值损失里），所以策略模式不带这些后缀——
+        # 那份权重里没有任何与它们相关的东西。
         base = f"{base}+rank{config.value_ranking_weight:g}"
     return base
 
@@ -667,6 +675,10 @@ def _value_loss(
 _RANKING_MARGIN_POINTS = 20.0
 
 
+# 树内节点排序项的标签来源。两个值都是真实的标签，区别在"独不独立于头"。
+TREE_LABEL_SOURCES = ("rollout", "qmean")
+
+
 def _pairwise_regret(
     q_predicted: torch.Tensor, q_target: torch.Tensor, valid: torch.Tensor, margin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -700,6 +712,7 @@ def _ranking_loss(
     tree_prediction: torch.Tensor | None,
     batch: Batch,
     score_scale: float,
+    tree_source: str = "rollout",
 ) -> torch.Tensor:
     """Q 空间的同根成对排序项：**轨迹根候选 + 树内节点候选**（ADR 0035/0041）。
 
@@ -729,10 +742,20 @@ def _ranking_loss(
     )
     if tree_prediction is not None and tree_prediction.numel() > 0:
         # (B, K, 4) 摊平成 (B*K, 4)：每个树内节点是一个独立的候选集合。
+        # 标签来源（ADR 0043）：默认用**独立** playout 估计——低频节点的 `tree_value` 约等于头
+        # 自己的输出（`one_ply = r + A_θ`），拿它当监督是自蒸馏；`rollout` 与头无关。
+        # 独立性只在"有标签"的槽位上成立：`qmean` 还需要该边被搜索访问过（访问数为 0 时
+        # `tree_value` 就是 pure one_ply），`rollout` 只要这个槽位有效。
+        if tree_source == "rollout":
+            tree_target = batch.tree_rollout_value
+            tree_valid = batch.tree_legal > 0
+        else:
+            tree_target = batch.tree_value
+            tree_valid = (batch.tree_legal > 0) & (batch.tree_visits > 0)
         tree_total, tree_groups = _pairwise_regret(
             tree_prediction.reshape(-1, int(r2048_core.NUM_ACTIONS)) + batch.tree_reward.reshape(-1, 4),
-            batch.tree_value.reshape(-1, 4) + batch.tree_reward.reshape(-1, 4),
-            (batch.tree_visits > 0).reshape(-1, 4),
+            tree_target.reshape(-1, 4) + batch.tree_reward.reshape(-1, 4),
+            tree_valid.reshape(-1, 4),
             margin,
         )
         total = total + tree_total
@@ -754,7 +777,9 @@ def _add_ranking(
     """
     if config.value_ranking_weight <= 0:
         return torch.zeros((), dtype=torch.float32, device=base_prediction.device)
-    ranking = _ranking_loss(base_prediction, tree_prediction, batch, metrics.score_scale)
+    ranking = _ranking_loss(
+        base_prediction, tree_prediction, batch, metrics.score_scale, config.tree_label_source
+    )
     metrics.add_ranking(ranking.detach(), batch)
     return config.value_ranking_weight * ranking
 
@@ -964,6 +989,8 @@ def run_training(config: TrainConfig) -> TrainResult:
         raise ValueError(f"未知策略目标口径: {config.policy_target}，可选 {list(POLICY_TARGETS)}")
     if config.value_ranking_weight < 0:
         raise ValueError(f"value_ranking_weight 必须 ≥ 0（0 = 关），收到 {config.value_ranking_weight}")
+    if config.tree_label_source not in TREE_LABEL_SOURCES:
+        raise ValueError(f"未知树内标签来源: {config.tree_label_source}，可选 {list(TREE_LABEL_SOURCES)}")
     if config.value_selection not in VALUE_SELECTIONS:
         raise ValueError(f"未知 checkpoint 挑选口径: {config.value_selection}，可选 {list(VALUE_SELECTIONS)}")
     if config.policy_target == "improved" and config.improve_beta <= 0:
@@ -1366,6 +1393,7 @@ def run_training(config: TrainConfig) -> TrainResult:
                     # 价值头是按哪个口径挑出来的（两份权重只差这个旋钮）。
                     "value_selection": config.value_selection,
                     "value_ranking_weight": float(config.value_ranking_weight),
+                    "tree_label_source": config.tree_label_source,
                     # 策略目标的口径与它的两个旋钮必须落在产物里：它是"这一份策略头是纯蒸馏
                     # 还是被一步改进过"的唯一凭据，而两者训出的是不同权重（同 model_id 陷阱）。
                     "policy_target": entry.policy_target or "none",

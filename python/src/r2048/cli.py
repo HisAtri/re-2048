@@ -222,6 +222,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2,
         help="记录里放几个搜索树内部节点（0 = 不采集；默认 2，见 ADR 0041/0042）",
     )
+    selfplay.add_argument(
+        "--tree-label-plays",
+        type=int,
+        default=8,
+        help="树内节点每个候选跑几次独立 playout 作为非循环标签（0 = 不标注，见 ADR 0043）",
+    )
+    selfplay.add_argument(
+        "--tree-label-policy",
+        default="depth_stratified",
+        choices=["depth_stratified", "top_visits"],
+        help="树内节点怎么挑：按深度分层（默认）或按访问数取 top-K",
+    )
+    selfplay.add_argument(
+        "--tree-label-rollout",
+        default="greedy",
+        choices=["greedy", "uniform"],
+        help="树内标注用的续弈策略（默认 greedy，见 ADR 0030 §6.1）",
+    )
     selfplay.add_argument("--shard-samples", type=int, default=100000)
     selfplay.add_argument("--max-batch", type=int, default=16384)
     selfplay.add_argument("--device", default="cuda", help="cuda / cpu（默认 cuda）")
@@ -312,6 +330,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2,
         help="记录里放几个搜索树内部节点（0 = 不采集；默认 2，见 ADR 0041/0042）",
     )
+    iterate.add_argument(
+        "--tree-label-plays", type=int, default=8, help="树内节点每个候选的 playout 次数（ADR 0043）"
+    )
+    iterate.add_argument(
+        "--tree-label-policy",
+        default="depth_stratified",
+        choices=["depth_stratified", "top_visits"],
+    )
+    iterate.add_argument("--tree-label-rollout", default="greedy", choices=["greedy", "uniform"])
     iterate.add_argument("--c-puct", type=float, default=1.5)
     iterate.add_argument("--device", default="cuda")
     iterate.add_argument("--eval-games", type=int, default=400)
@@ -663,6 +690,9 @@ def _command_selfplay(args: argparse.Namespace) -> int:
         shard_samples=args.shard_samples,
         max_batch=args.max_batch,
         tree_nodes=args.tree_nodes,
+        tree_label_plays=args.tree_label_plays,
+        tree_label_policy=args.tree_label_policy,
+        tree_label_rollout=args.tree_label_rollout,
         control_path=args.control or "",
         resume=args.continue_,
         join=args.join,
@@ -776,6 +806,9 @@ def _command_iterate(args: argparse.Namespace) -> int:
         data_workers=args.data_workers,
         rollout_policy=args.rollout_policy,
         tree_nodes=args.tree_nodes,
+        tree_label_plays=args.tree_label_plays,
+        tree_label_policy=args.tree_label_policy,
+        tree_label_rollout=args.tree_label_rollout,
         c_puct=args.c_puct,
         device=args.device,
         eval_games=args.eval_games,

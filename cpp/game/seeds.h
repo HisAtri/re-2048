@@ -13,6 +13,9 @@ enum SeedSalt : uint64_t {
     kSaltAction = 0x2,       // 动作采样：按温度 / 探索分布选方向
     kSaltRollout = 0x3,      // 随机 rollout
     kSaltShuffle = 0x4,      // 数据打乱与采样
+    // 树内节点的独立标注（ADR 0043）：与 kSaltRollout 分开，因为它是**另一条估计量**
+    // （在抽样到的树内节点上从 afterstate 重跑 playout），混用会让"改一处"连带"改另一处"。
+    kSaltTreeLabel = 0x5,
 };
 
 // 种子派生：每个随机流都从 (基础种子, 用途, 局号, 步号, 序号) 直接算出，

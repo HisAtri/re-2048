@@ -74,6 +74,10 @@ class IterateConfig:
     # 记录里放几个树内节点。它是**格式参数**（决定记录字节数），进清单与续跑闸门；采集本身
     # 不改变任何一局的走法（ADR 0041）。默认打开的理由见 SelfplayConfig（ADR 0042 的订正）。
     tree_nodes: int = 2
+    # 树内节点的独立标注（ADR 0043）：见 SelfplayConfig。
+    tree_label_plays: int = 8
+    tree_label_policy: str = "depth_stratified"
+    tree_label_rollout: str = "greedy"
     c_puct: float = 1.5
     device: str = "cuda"
     eval_games: int = 400
@@ -165,6 +169,9 @@ def _step_selfplay(config: IterateConfig, written: dict, job: JobDir) -> dict:
             model_id=model_id,
             simulations=config.simulations,
             tree_nodes=config.tree_nodes,
+            tree_label_plays=config.tree_label_plays,
+            tree_label_policy=config.tree_label_policy,
+            tree_label_rollout=config.tree_label_rollout,
             lanes=config.lanes,
             in_flight_per_lane=config.in_flight,
             search_threads=config.search_threads,

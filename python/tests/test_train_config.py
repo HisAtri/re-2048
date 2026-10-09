@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from r2048.cli import _build_parser
 from r2048.config import build_train_config
 from r2048.nn.training import DatasetSpec, TrainConfig, config_digest
 
@@ -69,6 +70,14 @@ def test_single_batch_without_config(tmp_path: Path) -> None:
     assert config.datasets == [DatasetSpec(path="data/batch")]
     assert config.device == "cpu"
     assert config.augment is False, "取反开关必须落到正向字段上"
+
+
+def test_tree_label_source_can_be_switched_from_cli() -> None:
+    """同批 A/B 必须能从训练入口切换标签，不能只改 Python 内部默认值。"""
+    args = _build_parser().parse_args(
+        ["train", "--data", "data/batch", "--output", "run/out", "--tree-label-source", "qmean"]
+    )
+    assert build_train_config(args).tree_label_source == "qmean"
 
 
 def test_missing_data_is_refused(tmp_path: Path) -> None:

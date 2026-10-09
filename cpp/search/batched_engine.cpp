@@ -105,6 +105,8 @@ struct BatchedEngine::Impl {
         if (config.lanes == 0) throw std::runtime_error("lane 数必须大于 0");
         if (config.simulations == 0) throw std::runtime_error("模拟次数必须大于 0");
         if (config.simulations > 0xFFFF) throw std::runtime_error("模拟次数上限为 65535");
+        // top-K 的定长数组最多容纳 kTreeNodesMax 项；在开始搜索前拒绝越界的 K。
+        if (config.tree_nodes > kTreeNodesMax) throw std::runtime_error("树内节点数超出上限 4");
         control.set_path(config.control_path);
         control.set_sticky(config.join);  // 多写者：一条 stop 要停整批（见 Control::set_sticky）
         if (config.collect_samples) {
@@ -780,13 +782,13 @@ struct BatchedEngine::Impl {
 
                     size_t at = 0;
                     while (at < chosen_count && precedes(chosen[at], pick)) at++;
-                    if (at >= kTreeNodesMax) continue;  // 比已有的 K 个都差（或并列但下标更大）
-                    for (size_t shift = std::min<size_t>(kTreeNodesMax - 1, chosen_count);
+                    if (at >= config.tree_nodes) continue;  // 只保留本批声明的 K 个，额外节点不能进入标注循环。
+                    for (size_t shift = std::min<size_t>(config.tree_nodes - 1, chosen_count);
                          shift > at; shift--) {
                         chosen[shift] = chosen[shift - 1];
                     }
                     chosen[at] = pick;
-                    if (chosen_count < kTreeNodesMax) chosen_count++;
+                    if (chosen_count < config.tree_nodes) chosen_count++;
                 }
 
                 if (config.tree_label_policy == kTreeLabelDepthStratified) {

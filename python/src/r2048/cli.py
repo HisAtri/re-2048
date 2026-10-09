@@ -78,6 +78,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Q 空间的同根成对排序项权重（0 = 关，默认）；与 Huber 同量纲，见 ADR 0035",
     )
     train.add_argument(
+        "--tree-label-source",
+        default=argparse.SUPPRESS,
+        choices=["rollout", "qmean"],
+        help="树内排序项的标签来源：独立 playout 或搜索边均值（ADR 0043）",
+    )
+    train.add_argument(
         "--policy-target",
         default=argparse.SUPPRESS,
         choices=["visits", "improved"],
@@ -230,9 +236,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     selfplay.add_argument(
         "--tree-label-policy",
-        default="depth_stratified",
+        default="top_visits",
         choices=["depth_stratified", "top_visits"],
-        help="树内节点怎么挑：按深度分层（默认）或按访问数取 top-K",
+        help="树内节点怎么挑：按访问数取 top-K（默认）或按深度分层",
     )
     selfplay.add_argument(
         "--tree-label-rollout",
@@ -335,7 +341,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     iterate.add_argument(
         "--tree-label-policy",
-        default="depth_stratified",
+        default="top_visits",
         choices=["depth_stratified", "top_visits"],
     )
     iterate.add_argument("--tree-label-rollout", default="greedy", choices=["greedy", "uniform"])

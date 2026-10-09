@@ -128,7 +128,8 @@ class TrainConfig:
     # π̂ 上的均匀伪访问数：让搜索未访问过的候选也能拿到质量。0 = 严格乘法重加权。
     improve_floor: float = 0.0
     # 树内节点的排序项用哪种标签（ADR 0043）：
-    #   rollout = **独立** playout 估计（规则驱动的续弈策略，与头无关）——默认，数学上正确的那一个；
+    #   rollout = **独立** playout 估计（规则驱动的续弈策略，与头无关）——默认；
+    #             它解除树内排序标签的自我回声，但与搜索策略的排序是否一致仍须对局验证；
     #   qmean   = 搜索自己的 Q̄ − r（ADR 0042 的那一版）。低频节点的 qmean 约等于 `one_ply = r + A_θ`，
     #             也就是头自己的输出，拿它当监督等于让学生复制自己。
     tree_label_source: str = "rollout"
@@ -685,9 +686,8 @@ def _pairwise_regret(
     """一组候选集合的「软成对后悔」之和，以及"有可用对"的集合数（供归一化）。
 
     形状 (N, 4)：N 个候选集合（轨迹根，或一个树内节点），每个最多 4 个候选。
-    每个对的损失 = |目标 Q 间隔| · τ·softplus(−预测间隔·sign(目标间隔)/τ)，
-    `τ·softplus(x/τ)` 是 `relu(x)` 的平滑版，所以极限上它就是**成对后悔**：符号错罚
-    |ΔQ|·|ΔQ̂|，符号对（且间隔超过 τ）趋 0。
+    每个对的损失 = |目标 Q 间隔| · σ(−预测间隔·sign(目标间隔)/τ)。
+    σ 是错误方向的平滑指示子；这个替代损失以目标间隔加权，量纲为分数。
     """
     # 「成对后悔」的**软化指示子**：σ(−x/τ) 在 x ≫ τ 时趋 0、x ≪ −τ 时趋 1，所以
     # `|目标间隔| × σ(…)` 的量纲是**分数**（不是分数平方）——它就是这个对的期望后悔，
@@ -730,8 +730,8 @@ def _ranking_loss(
     转移很小）。树内节点的访问数少、平均弱，价值头在那里直接决定 Q，所以它们是这一项真正的
     作用位置。
 
-    * 树内节点只用**访问数 > 0** 的边：未访问边的"标签"是教师自己的一次性估计（`one_ply`），
-      训它等于让学生复制自己，没有新信息（与根候选用 `candidate_weight > 0` 同一口径）。
+    * `qmean` 树内标签只用**访问数 > 0** 的边：未访问边是教师自己的 `one_ply`。
+      `rollout` 标签独立生成，合法的未访问边也参加排序。
     * 归一化按**候选集合数**（根 + 树内节点）而不是按间隔和：于是这一项就是"每个决策点的软后悔
       （分数）"，与候选 MAE 同一量纲、同一量级，`value_ranking_weight` 才有可比的含义。
       按间隔和归一化会被"间隔大、本来就容易对"的那些对稀释，同一个错误报出来的数会小一个量级。
@@ -986,6 +986,27 @@ def _run_epoch(
     return float(loss_total.item() / max(1, batches)), metrics, seconds
 
 
+def _validate_tree_label_sources(config: TrainConfig, reader: MultiSourceReader) -> None:
+    """开跑前逐来源确认独立标签存在，避免混合数据里无标签批次被静默跳过。"""
+    if not (
+        trains_value(config.mode)
+        and config.tree_label_source == "rollout"
+        and config.value_ranking_weight > 0
+    ):
+        return
+    missing_tree_labels = [
+        source.name
+        for source in reader.sources
+        if source.manifest.tree_nodes > 0 and source.manifest.tree_label_plays == 0
+    ]
+    if missing_tree_labels:
+        raise ValueError(
+            "tree_label_source=rollout 需要每个树内数据来源带独立标注；以下来源声明 "
+            f"tree_label_plays=0：{', '.join(missing_tree_labels)}。"
+            "请改用带标注的批次，或显式改回 --tree-label-source qmean。"
+        )
+
+
 def run_training(config: TrainConfig) -> TrainResult:
     if config.mode not in ALL_MODES:
         raise ValueError(f"未知训练模式: {config.mode}")
@@ -1030,20 +1051,7 @@ def run_training(config: TrainConfig) -> TrainResult:
         val_fraction=config.val_fraction,
         seed=config.split_seed,
     )
-    if (
-        config.tree_label_source == "rollout"
-        and config.value_ranking_weight > 0
-        and reader.tree_nodes > 0
-        and reader.tree_label_plays == 0
-    ):
-        # 数据里有树内节点块、却没有独立标注（生成时 --tree-label-plays 0）⇒ rollout 字段全是 0，
-        # 排序项在每个节点上都拿不到"目标间隔非零"的对，于是**安静地什么都不监督**：训练照跑、
-        # 指标正常、没有任何报错。这类"改了参数却没生效"必须变成开跑前的显式失败。
-        raise ValueError(
-            "tree_label_source=rollout 需要数据带独立标注，但这批数据声明 tree_label_plays=0："
-            "排序项会安静地什么都不监督。用带标注的批次（生成时 --tree-label-plays > 0），"
-            "或显式改回 --tree-label-source qmean。"
-        )
+    _validate_tree_label_sources(config, reader)
     if reader.duplicates:
         repeated = "，".join(f"{name}（{key}）" for key, name in reader.duplicates)
         print(f"警告：以下来源在配置里重复出现，已按来源身份去重：{repeated}")

@@ -225,7 +225,6 @@ class MultiSourceReader:
             )
         self.dtype = self._readers[0].dtype if self._readers else record_dtype(0)
         self.tree_nodes = self._readers[0].manifest.tree_nodes if self._readers else 0
-        self.tree_label_plays = self._readers[0].manifest.tree_label_plays if self._readers else 0
         self.sources: tuple[SourceView, ...] = tuple(sources)
         # 权重与来源一一对应，并且已经按去重结果对齐：调用方拿到的就是"实际会用到的那些来源"。
         self.weights: tuple[float, ...] = tuple(kept_weights)
@@ -545,7 +544,7 @@ class BatchStream:
             tree_legal = tree_legal.astype(np.float32)
             tree_rollout_value = np.stack(
                 [
-                    records[f"tree{slot}_rollout"].astype(np.float32) / self.score_scale * tree_legal
+                    records[f"tree{slot}_rollout"].astype(np.float32) / self.score_scale
                     for slot in range(tree_nodes)
                 ],
                 axis=1,
@@ -555,6 +554,8 @@ class BatchStream:
             tree_value = tree_value * tree_legal
             tree_reward = tree_reward * tree_legal
             tree_visits = tree_visits * tree_legal
+            # 掩码带 K 维；先堆叠全部槽位，再逐槽位清零非法方向。
+            tree_rollout_value = tree_rollout_value * tree_legal
         else:
             tree_afterstate = np.zeros((len(records), 0, 4, 16), dtype=np.uint8)
             tree_value = np.zeros((len(records), 0, 4), dtype=np.float32)

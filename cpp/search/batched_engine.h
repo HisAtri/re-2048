@@ -50,7 +50,7 @@ struct EngineConfig {
     // 用规则驱动的续弈策略跑 `tree_label_plays` 次 playout，取均值作为**非循环**的价值标签。
     // 为什么必须独立：低频/深层节点的树内 Q̄ 约等于 `one_ply = r + A_θ`，也就是头自己的输出，
     // 拿它当监督等于让学生复制自己。标注发生在搜索结束之后，不改变任何一局的走法。
-    uint8_t tree_label_policy = kTreeLabelDepthStratified;
+    uint8_t tree_label_policy = kTreeLabelTopVisits;
     uint32_t tree_label_plays = 0;
     bool tree_label_greedy = true;  // 续弈策略：true = 一步启发式（ADR 0030 §6.1 证实更强）
     uint32_t temperature_moves = 30;  // 开局多少步按访问分布采样

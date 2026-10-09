@@ -490,6 +490,60 @@ TEST(engine_records_candidate_targets) {
     expect_true(checked > 0, "至少要检查到一条候选");
 }
 
+TEST(engine_tree_sampling_preserves_root_and_top_order) {
+    // 两种采样只决定记录中的树内块；同一搜索协议下基础块必须逐字节一致。
+    // top_visits 曾把较低访问数的节点插到高访问数节点前面，这里直接钉住槽位顺序。
+    TempDir dir("tree-sampling");
+    std::vector<std::vector<uint8_t>> batches;
+    for (const uint8_t policy : {kTreeLabelTopVisits, kTreeLabelDepthStratified}) {
+        EngineConfig config;
+        config.lanes = 2;
+        config.simulations = 32;
+        // 单条在途模拟时边访问和与节点访问数只差固定的首次求值，便于从记录检验顺序。
+        config.in_flight_per_lane = 1;
+        config.cache_entries = 1 << 12;
+        config.seed = 20261009;
+        config.tree_nodes = 2;
+        config.tree_label_policy = policy;
+        config.tree_label_plays = 0;
+        const std::string path = dir.sub(policy == kTreeLabelTopVisits ? "top" : "depth");
+        BatchedEngine engine(config, path, "sampling", "synthetic", 400, 10000);
+        SyntheticDriver driver{engine};
+        expect_true(driver.run_until_done(), "树内采样测试应当正常完成");
+        engine.finish();
+        const BatchManifest manifest = read_manifest(path);
+        batches.push_back(read_binary_for_test(path + "/" + manifest.shards.front().path));
+    }
+
+    expect_equal_u64(batches[0].size(), batches[1].size(), "采样策略不应改变记录条数");
+    int checked = 0;
+    for (size_t offset = 0; offset + sample_bytes(2) <= batches[0].size(); offset += sample_bytes(2)) {
+        expect_true(std::memcmp(batches[0].data() + offset, batches[1].data() + offset, 185) == 0,
+                    "采样策略不应改变根部基础记录");
+        const Sample top = decode_sample(batches[0].data() + offset, 2);
+        const Sample depth = decode_sample(batches[1].data() + offset, 2);
+        if (top.tree_count < 2 || depth.tree_count < 2) continue;
+        uint32_t visits[2] = {0, 0};
+        for (int action = 0; action < kNumActions; action++) {
+            visits[0] += top.tree[0].visits[action];
+            visits[1] += top.tree[1].visits[action];
+        }
+        expect_true(visits[0] >= visits[1], "top_visits 的槽位必须按访问数降序");
+        expect_true(depth.tree[0].depth < depth.tree[1].depth, "分层采样必须覆盖递增的两个决策深度");
+        checked++;
+    }
+    expect_true(checked > 0, "至少有一条记录同时包含两个树内节点");
+}
+
+TEST(engine_rejects_tree_nodes_above_record_capacity) {
+    EngineConfig config;
+    config.tree_nodes = kTreeNodesMax + 1;
+    config.collect_samples = false;
+    expect_contains(
+        catch_message([&] { BatchedEngine engine(config, "", "", "synthetic", 0, 0); }),
+        "树内节点数超出上限", "选择数组的 K 必须在引擎启动前校验");
+}
+
 // ---- 会话驱动：任意局面 + 逐步走（ADR 0037）--------------------------------------
 //
 // 这一组测的是"从外部给定的局面起搜、一步一步走"这条路径。它此前完全不存在：整局驱动

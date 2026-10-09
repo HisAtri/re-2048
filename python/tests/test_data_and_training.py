@@ -17,10 +17,16 @@ import pytest
 import r2048_core
 import torch
 
-from r2048.data.dataset import Batch, BatchStream, make_split, open_sources
-from r2048.data.shards import BatchReader
+from r2048.data.dataset import Batch, BatchStream, MultiSourceReader, make_split, open_sources
+from r2048.data.shards import BatchReader, record_dtype
 from r2048.nn.augment import apply_boards, augment_policy, transform_policy_targets
-from r2048.nn.training import DatasetSpec, TrainConfig, policy_loss, run_training
+from r2048.nn.training import (
+    DatasetSpec,
+    TrainConfig,
+    _validate_tree_label_sources,
+    policy_loss,
+    run_training,
+)
 
 
 def _tree_zeros(count: int, nodes: int = 0) -> dict:
@@ -199,6 +205,74 @@ def test_batch_stream_normalises_targets(batch_dir: Path) -> None:
     assert float(batch.value_target.abs().max()) < 100.0
     assert policy_loss(torch.zeros(128, 4), batch, batch.policy_target) is None, (
         "无搜索记录时不应产生策略损失"
+    )
+
+
+def _write_v4_tree_batch(source: Path, target: Path, *, nodes: int, plays: int, seed: int) -> Path:
+    """以 C++ 生成的根记录为底稿，写一个可经真实清单和 mmap 读取的 v4 小批次。"""
+    reader = BatchReader(source)
+    original = reader.gather(np.arange(4))
+    records = np.zeros(4, dtype=record_dtype(nodes))
+    for field in original.dtype.names:
+        records[field] = original[field]
+    if nodes:
+        records["tree_count"] = nodes
+        for slot in range(nodes):
+            records[f"tree{slot}_legal_mask"] = 0b0101
+            records[f"tree{slot}_count"] = 2
+            records[f"tree{slot}_depth"] = 2 * (slot + 1)
+            records[f"tree{slot}_rollout"][:, 0] = 100 + slot
+            records[f"tree{slot}_rollout"][:, 1] = 999  # 非法方向必须在解码后归零。
+            records[f"tree{slot}_rollout"][:, 2] = 200 + slot
+    target.mkdir()
+    records.tofile(target / "shard.bin")
+    manifest = dict(reader.manifest.data)
+    manifest.update(
+        samples=4,
+        episodes=1,
+        seed=seed,
+        tree_nodes=nodes,
+        tree_label_plays=plays,
+        record_bytes=records.dtype.itemsize,
+        shards=[{"path": "shard.bin", "samples": 4}],
+    )
+    (target / "manifest.json").write_text(json.dumps(manifest))
+    return target
+
+
+def test_v4_tree_decode_and_source_labels(search_batch_dir: Path, tmp_path: Path) -> None:
+    """K 维必须在堆叠后掩码；来源校验不能只看排列中的第一批。"""
+    labeled = _write_v4_tree_batch(search_batch_dir, tmp_path / "labeled", nodes=2, plays=8, seed=101)
+    unlabeled = _write_v4_tree_batch(search_batch_dir, tmp_path / "unlabeled", nodes=2, plays=0, seed=102)
+    root_only = _write_v4_tree_batch(search_batch_dir, tmp_path / "root-only", nodes=0, plays=0, seed=103)
+
+    reader = MultiSourceReader([labeled])
+    batch = BatchStream(reader, np.arange(4), batch_size=4, shuffle=False).decode(np.arange(4))
+    assert batch.tree_rollout_value.shape == (4, 2, 4)
+    assert torch.all(batch.tree_rollout_value[:, :, 1] == 0)
+    assert torch.all(batch.tree_rollout_value[:, 0, 0] == 100 / 1024)
+    root_batch = BatchStream(
+        MultiSourceReader([root_only]), np.arange(4), batch_size=4, shuffle=False
+    ).decode(np.arange(4))
+    assert root_batch.tree_rollout_value.shape == (4, 0, 4)
+
+    config = training_config(labeled, tmp_path / "run", mode="value", tree_label_source="rollout")
+    for paths in ([labeled, unlabeled], [unlabeled, labeled]):
+        with pytest.raises(ValueError, match="unlabeled.*tree_label_plays=0|tree_label_plays=0.*unlabeled"):
+            _validate_tree_label_sources(config, MultiSourceReader(paths))
+        mixed_config = training_config(
+            labeled,
+            tmp_path / f"mixed-{paths[0].name}",
+            mode="value",
+            device="cpu",
+            datasets=[DatasetSpec(path=str(path)) for path in paths],
+        )
+        with pytest.raises(ValueError, match="unlabeled"):
+            run_training(mixed_config)
+    _validate_tree_label_sources(config, MultiSourceReader([root_only]))
+    _validate_tree_label_sources(
+        training_config(labeled, tmp_path / "qmean", mode="value", tree_label_source="qmean"),
+        MultiSourceReader([labeled, unlabeled]),
     )
 
 

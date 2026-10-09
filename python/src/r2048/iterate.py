@@ -76,7 +76,7 @@ class IterateConfig:
     tree_nodes: int = 2
     # 树内节点的独立标注（ADR 0043）：见 SelfplayConfig。
     tree_label_plays: int = 8
-    tree_label_policy: str = "depth_stratified"
+    tree_label_policy: str = "top_visits"
     tree_label_rollout: str = "greedy"
     c_puct: float = 1.5
     device: str = "cuda"

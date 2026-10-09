@@ -61,8 +61,8 @@ class SelfplayConfig:
     # 用规则驱动的续弈策略跑 N 次 playout 取均值，作为**非循环**的价值标签（低频/深层节点的树内
     # Q̄ 约等于头自己的输出，拿它当监督等于让学生复制自己）。0 = 不标注。
     tree_label_plays: int = 8
-    # 抽样策略：depth_stratified（默认，每深度取访问数最大者）| top_visits（ADR 0042 的那一版）
-    tree_label_policy: str = "depth_stratified"
+    # 抽样策略：top_visits（默认，ADR 0044 的配对棋力验收）| depth_stratified（每深度取访问数最大者）。
+    tree_label_policy: str = "top_visits"
     # 标注用的续弈策略：greedy（默认，ADR 0030 §6.1 证实更强）| uniform
     tree_label_rollout: str = "greedy"
     cache_entries: int = 1 << 17

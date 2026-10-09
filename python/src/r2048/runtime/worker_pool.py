@@ -79,6 +79,12 @@ def _worker_argv(config: SelfplayConfig, checkpoint: str, device: str) -> list[s
         str(config.temperature_moves),
         "--tree-nodes",
         str(config.tree_nodes),
+        "--tree-label-plays",
+        str(config.tree_label_plays),
+        "--tree-label-policy",
+        config.tree_label_policy,
+        "--tree-label-rollout",
+        config.tree_label_rollout,
         "--cache-entries",
         str(config.cache_entries),
         "--shard-samples",
@@ -126,7 +132,15 @@ def run_selfplay_workers(
     # 这里不预先校验 argv 的每个字段，而是在收尾后核对**产物**的声明：worker 的参数漏传
     # 过一次（--tree-nodes 忘了加，于是整批数据的 tree_nodes=0 而父进程毫不知情），
     # 表现出来只是"记录短了 216 字节"，不报任何错。这类静默失效必须在收尾处变成显式失败。
-    expected_format = {"tree_nodes": int(config.tree_nodes)}
+    # 覆盖**全部**会改变记录内容的字段，而不只是当时想到的那一个：漏传过两次（--tree-nodes、
+    # 以及三个标注参数），每次都是"启用了却没生效"，而产物清单看起来正常。闸门按清单声明逐项
+    # 核对，把这类"参数加了但没接上"变成显式失败。
+    expected_format = {
+        "tree_nodes": int(config.tree_nodes),
+        "tree_label_plays": int(config.tree_label_plays),
+        "tree_label_policy": 0 if config.tree_label_policy == "depth_stratified" else 1,
+        "tree_label_rollout": 1 if config.tree_label_rollout == "greedy" else 0,
+    }
     if config.search_threads != 1:
         raise ValueError("worker 必须是单线程（ADR 0031）：多线程产出的数据不可复现")
     if config.join:

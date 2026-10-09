@@ -77,6 +77,8 @@ def _worker_argv(config: SelfplayConfig, checkpoint: str, device: str) -> list[s
         str(config.temperature),
         "--temperature-moves",
         str(config.temperature_moves),
+        "--tree-nodes",
+        str(config.tree_nodes),
         "--cache-entries",
         str(config.cache_entries),
         "--shard-samples",
@@ -121,6 +123,10 @@ def run_selfplay_workers(
     """
     if workers < 2:
         raise ValueError("run_selfplay_workers 至少需要 2 个 worker（单进程请用 run_selfplay）")
+    # 这里不预先校验 argv 的每个字段，而是在收尾后核对**产物**的声明：worker 的参数漏传
+    # 过一次（--tree-nodes 忘了加，于是整批数据的 tree_nodes=0 而父进程毫不知情），
+    # 表现出来只是"记录短了 216 字节"，不报任何错。这类静默失效必须在收尾处变成显式失败。
+    expected_format = {"tree_nodes": int(config.tree_nodes)}
     if config.search_threads != 1:
         raise ValueError("worker 必须是单线程（ADR 0031）：多线程产出的数据不可复现")
     if config.join:
@@ -160,8 +166,11 @@ def run_selfplay_workers(
         try:
             control_path.parent.mkdir(parents=True, exist_ok=True)
             control_path.write_text("stop")
-            print(f"收到中断：已写 {control_path}，等 {workers} 个 worker 走到局边界停车",
-                  file=sys.stderr, flush=True)
+            print(
+                f"收到中断：已写 {control_path}，等 {workers} 个 worker 走到局边界停车",
+                file=sys.stderr,
+                flush=True,
+            )
         except OSError as error:
             print(f"写控制文件失败（{control_path}）：{error}", file=sys.stderr, flush=True)
 
@@ -217,6 +226,20 @@ def run_selfplay_workers(
     exits = [proc.returncode for proc in procs]
     seconds = time.monotonic() - started
     data = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    # 产物声明的格式参数必须与请求一致：不一致说明 worker 的参数漏传了（实测踩过：漏了
+    # --tree-nodes，整批数据悄悄少一块、训练照跑）。这里失败比事后发现便宜得多。
+    if not data:
+        raise RuntimeError(
+            f"worker 没有产出清单（{manifest_path}）：多半是某个 worker 启动就失败了"
+            f"（参数不认识、模型加载失败等）。逐个看日志：{logs}"
+        )
+    for key, expected in expected_format.items():
+        actual = int(data.get(key, -1))
+        if actual != expected:
+            raise RuntimeError(
+                f"跑谱产物的 {key}={actual} 与请求的 {expected} 不一致：worker 的参数没有传全"
+                f"（见 _worker_argv）。已产出的数据批不可用，请删掉重来。"
+            )
     result = WorkersResult(
         manifest_path=str(manifest_path),
         batch_id=config.batch_id,
@@ -231,7 +254,8 @@ def run_selfplay_workers(
     )
     failed = [index for index, code in enumerate(exits) if code != 0]
     if failed:
-        tails = "\n".join(f"  worker-{index}（日志 {logs[index]}）：\n{_tail(Path(logs[index]))}"
-                          for index in failed)
+        tails = "\n".join(
+            f"  worker-{index}（日志 {logs[index]}）：\n{_tail(Path(logs[index]))}" for index in failed
+        )
         raise RuntimeError(f"{len(failed)}/{workers} 个 worker 退出码非 0：\n{tails}")
     return result

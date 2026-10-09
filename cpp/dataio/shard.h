@@ -37,6 +37,9 @@ struct BatchMeta {
     uint32_t temperature_moves = 0;
     uint64_t seed = 0;
     uint64_t shard_samples = 0;
+    // 记录里放几个树内节点（0 = 没有树内块，记录就是 192 字节）。它决定**记录字节数**，
+    // 因此属于续跑必须比对的字段：一半 K=0、一半 K=2 的批次读出来会错位（ADR 0041）。
+    uint8_t tree_nodes = 0;
     uint32_t workers = 0;
     // 0 表示不限量：跑到被外部叫停为止（见 core/control.h）。
     uint64_t samples_target = 0;
@@ -47,6 +50,10 @@ struct BatchMeta {
     // 命令行与调用方的原样记录（含非协议项，如 --workers、--out）。用于人看，
     // 也用于续跑时的协议项比对（只比对 kProtocolParams 里声明过的名字）。
     std::vector<std::pair<std::string, std::string>> params;
+
+    // 这条批次的记录字节数：由 tree_nodes 决定，写入/读取/校验都从这里取，
+    // 不允许别处再写一遍（两份定义迟早会分叉）。
+    size_t record_bytes() const { return sample_bytes(tree_nodes); }
 };
 
 // 批次状态。它不是装饰：续跑只允许发生在非 complete 的批次上，
@@ -175,8 +182,8 @@ private:
     BatchManifest snapshot(BatchState state) const;
     // 重新读一次清单，把别的写者提交的分片算进来（节流：最多每 250ms 一次）。
     void refresh_batch_samples() const;
-    uint64_t buffered_samples() const { return buffer_.size() / kSampleBytes; }
-    uint64_t capacity_bytes() const { return shard_samples_ * kSampleBytes; }
+    uint64_t buffered_samples() const { return buffer_.size() / meta_.record_bytes(); }
+    uint64_t capacity_bytes() const { return shard_samples_ * meta_.record_bytes(); }
 
     std::string data_dir_;
     std::string shards_dir_;

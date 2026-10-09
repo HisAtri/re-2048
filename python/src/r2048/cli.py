@@ -216,6 +216,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "要并行跑谱请用 --join 多进程（每进程 1 线程）"
         ),
     )
+    selfplay.add_argument(
+        "--tree-nodes",
+        type=int,
+        default=0,
+        help="记录里放几个搜索树内部节点（0 = 不采集；v3 记录格式，见 ADR 0041）",
+    )
     selfplay.add_argument("--shard-samples", type=int, default=100000)
     selfplay.add_argument("--max-batch", type=int, default=16384)
     selfplay.add_argument("--device", default="cuda", help="cuda / cpu（默认 cuda）")
@@ -299,6 +305,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default="greedy",
         choices=["uniform", "greedy"],
         help="首轮纯 C++ 教师的 rollout 续弈策略（默认 greedy，见 ADR 0030）",
+    )
+    iterate.add_argument(
+        "--tree-nodes",
+        type=int,
+        default=0,
+        help="记录里放几个搜索树内部节点（0 = 不采集；见 ADR 0041，v3 记录格式）",
     )
     iterate.add_argument("--c-puct", type=float, default=1.5)
     iterate.add_argument("--device", default="cuda")
@@ -650,6 +662,7 @@ def _command_selfplay(args: argparse.Namespace) -> int:
         search_threads=args.search_threads,
         shard_samples=args.shard_samples,
         max_batch=args.max_batch,
+        tree_nodes=args.tree_nodes,
         control_path=args.control or "",
         resume=args.continue_,
         join=args.join,
@@ -762,6 +775,7 @@ def _command_iterate(args: argparse.Namespace) -> int:
         search_threads=args.search_threads,
         data_workers=args.data_workers,
         rollout_policy=args.rollout_policy,
+        tree_nodes=args.tree_nodes,
         c_puct=args.c_puct,
         device=args.device,
         eval_games=args.eval_games,

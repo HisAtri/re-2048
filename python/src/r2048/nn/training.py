@@ -506,10 +506,9 @@ class _Metrics:
         self.value_targets_used: set[str] = set()
 
     def add_ranking(self, ranking: torch.Tensor, batch: Batch) -> None:
-        """累计排序项（按这一批的候选质量加权，与损失里的口径一致）。"""
-        weight = float(batch.candidate_weight.sum())
-        self._ranking_sum += float(ranking) * weight
-        self._ranking_weight += weight
+        """累计排序项（按样本平均——损失里的那一项是按"候选集合数"归一的，两者口径一致）。"""
+        self._ranking_sum += float(ranking) * len(batch)
+        self._ranking_weight += len(batch)
 
     def ranking_loss(self) -> float:
         """排序项的加权均值（**分数单位**，与候选 MAE 同一量纲，便于比较两者量级）。"""
@@ -668,35 +667,18 @@ def _value_loss(
 _RANKING_MARGIN_POINTS = 20.0
 
 
-def _ranking_loss(prediction: torch.Tensor, batch: Batch, score_scale: float) -> torch.Tensor:
-    """Q 空间的同根成对排序项：按 Q 间隔加权的**软成对后悔**。
+def _pairwise_regret(
+    q_predicted: torch.Tensor, q_target: torch.Tensor, valid: torch.Tensor, margin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """一组候选集合的「软成对后悔」之和，以及"有可用对"的集合数（供归一化）。
 
-    为什么在 Q = r + A 空间做：引擎的选择值就是 `one_ply = r + A`（ADR 0034）。把 r 加在
-    预测与目标两边**不改变预测误差**——`(pred+r) − (target+r) = pred − target`，所以 Huber
-    在两种口径下逐值相同，这也是"价值头只能训 A"的由来（r 不是 afterstate 的函数，网络学
-    不到它）。**但成对的标签会变**：A 口径比 `target_a vs target_b`，Q 口径比
-    `target_a + r_a vs target_b + r_b`，在 r6 的批上 12.9% 的根给出不同的 argmax。所以这一项
-    不是"换个度量再训一遍"，它喂给网络的监督本身不同。
-
-    形状：对每根的每对合法候选，令 g = 目标 Q 间隔、h = 预测 Q 间隔，取
-
-        |g| · τ · softplus(−h · sign(g) / τ)
-
-    * `τ·softplus(x/τ)` 是 `relu(x)` 的平滑版（τ→0 就是它），所以这一项**在极限上等于成对
-      后悔**：符号错就罚 |g|·|h|，符号对（且间隔超过 τ）就趋 0。用 |g| 当权重 = "按这一对值
-      多少分罚"，于是它的量纲与 Huber 的 MAE 可比，`value_ranking_weight` 有直接含义
-      （1.0 = 一分软后悔与一分 MAE 同权）。
-    * 只看**符号**而不要求间隔匹配：决策只取决于 argmax，间隔差多少不影响走哪一步。
-    * 目标间隔为 0 的对不计入（没有可学的排序）。
+    形状 (N, 4)：N 个候选集合（轨迹根，或一个树内节点），每个最多 4 个候选。
+    每个对的损失 = |目标 Q 间隔| · τ·softplus(−预测间隔·sign(目标间隔)/τ)，
+    `τ·softplus(x/τ)` 是 `relu(x)` 的平滑版，所以极限上它就是**成对后悔**：符号错罚
+    |ΔQ|·|ΔQ̂|，符号对（且间隔超过 τ）趋 0。
     """
-    margin = _RANKING_MARGIN_POINTS / score_scale
-    count = batch.decision.shape[0]
-    predicted = prediction.reshape(count, int(r2048_core.NUM_ACTIONS))
-    valid = batch.candidate_weight > 0
-    q_predicted = predicted + batch.candidate_reward
-    q_target = batch.candidate_value + batch.candidate_reward
-    total = torch.zeros((), dtype=torch.float32, device=prediction.device)
-    used = torch.zeros(count, dtype=torch.bool, device=prediction.device)
+    total = torch.zeros((), dtype=torch.float32, device=q_predicted.device)
+    used = torch.zeros(q_predicted.shape[0], dtype=torch.bool, device=q_predicted.device)
     for first, second in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
         pair_valid = valid[:, first] & valid[:, second]
         if not bool(pair_valid.any()):
@@ -710,14 +692,60 @@ def _ranking_loss(prediction: torch.Tensor, batch: Batch, score_scale: float) ->
         pair_loss = margin * F.softplus(-gap_predicted * gap_target.sign() / margin)
         total = total + (pair_loss * pair_weight)[usable].sum()
         used = used | usable
-    # 按**根**归一化：这一项于是是"每一步决策的软后悔（分数）"，与候选 MAE（每个候选的误差，
-    # 分数）同一量纲、同一量级，`value_ranking_weight` 才有可比的含义。按间隔和归一化会被
-    # "间隔大、本来就容易对"的那些对稀释，同一个错误报出来的数会小一个量级。
-    return total / used.double().sum().clamp_min(1.0)
+    return total, used.double().sum()
+
+
+def _ranking_loss(
+    base_prediction: torch.Tensor,
+    tree_prediction: torch.Tensor | None,
+    batch: Batch,
+    score_scale: float,
+) -> torch.Tensor:
+    """Q 空间的同根成对排序项：**轨迹根候选 + 树内节点候选**（ADR 0035/0041）。
+
+    为什么在 Q = r + A 空间做：引擎的选择值就是 `one_ply = r + A`。把 r 加在预测与目标两边
+    **不改变预测误差**（所以 Huber 在两种口径下逐值相同），但会改变**成对的标签**——在 r6 的
+    批上 12.9% 的根给出不同的 argmax（ADR 0034）。所以"在 Q 空间做排序监督"与"在 A 空间做"
+    不是同一件事，而 Q 空间的排序目标恰好是教师自己的边均值 Q：对搜索输出最忠实的蒸馏。
+
+    为什么还要树内节点：价值头在搜索里被**直接使用**的地方是叶节点与未被访问的边，而根那一点
+    有几百次模拟，搜索自己就把排序算出来了（ADR 0035 实测：只监督根，贪心臂 +19% 而搜索臂的
+    转移很小）。树内节点的访问数少、平均弱，价值头在那里直接决定 Q，所以它们是这一项真正的
+    作用位置。
+
+    * 树内节点只用**访问数 > 0** 的边：未访问边的"标签"是教师自己的一次性估计（`one_ply`），
+      训它等于让学生复制自己，没有新信息（与根候选用 `candidate_weight > 0` 同一口径）。
+    * 归一化按**候选集合数**（根 + 树内节点）而不是按间隔和：于是这一项就是"每个决策点的软后悔
+      （分数）"，与候选 MAE 同一量纲、同一量级，`value_ranking_weight` 才有可比的含义。
+      按间隔和归一化会被"间隔大、本来就容易对"的那些对稀释，同一个错误报出来的数会小一个量级。
+    """
+    margin = torch.tensor(_RANKING_MARGIN_POINTS / score_scale, device=base_prediction.device)
+    count = batch.decision.shape[0]
+    total, groups = _pairwise_regret(
+        base_prediction.reshape(count, int(r2048_core.NUM_ACTIONS)) + batch.candidate_reward,
+        batch.candidate_value + batch.candidate_reward,
+        batch.candidate_weight > 0,
+        margin,
+    )
+    if tree_prediction is not None and tree_prediction.numel() > 0:
+        # (B, K, 4) 摊平成 (B*K, 4)：每个树内节点是一个独立的候选集合。
+        tree_total, tree_groups = _pairwise_regret(
+            tree_prediction.reshape(-1, int(r2048_core.NUM_ACTIONS)) + batch.tree_reward.reshape(-1, 4),
+            batch.tree_value.reshape(-1, 4) + batch.tree_reward.reshape(-1, 4),
+            (batch.tree_visits > 0).reshape(-1, 4),
+            margin,
+        )
+        total = total + tree_total
+        groups = groups + tree_groups
+    return total / groups.clamp_min(1.0)
 
 
 def _add_ranking(
-    metrics: _Metrics, config: TrainConfig, prediction: torch.Tensor, batch: Batch
+    metrics: _Metrics,
+    config: TrainConfig,
+    base_prediction: torch.Tensor,
+    tree_prediction: torch.Tensor | None,
+    batch: Batch,
 ) -> torch.Tensor:
     """算排序项并把它加进损失；顺带把"排序项自己有多大"记进指标。
 
@@ -725,8 +753,8 @@ def _add_ranking(
     权重取值是否合理只能从这两个数上读出来——否则"加了排序项"会变成一个看不见的配方改动。
     """
     if config.value_ranking_weight <= 0:
-        return torch.zeros((), dtype=torch.float32, device=prediction.device)
-    ranking = _ranking_loss(prediction, batch, metrics.score_scale)
+        return torch.zeros((), dtype=torch.float32, device=base_prediction.device)
+    ranking = _ranking_loss(base_prediction, tree_prediction, batch, metrics.score_scale)
     metrics.add_ranking(ranking.detach(), batch)
     return config.value_ranking_weight * ranking
 
@@ -809,24 +837,42 @@ def _run_epoch(
                 metrics.value_targets_used.add("candidate" if use_candidates else "trajectory")
             count = batch.decision.shape[0]
 
+            # 价值头的输入行：候选（或主轨迹 afterstate）**加上树内节点**（K>0 且开了排序项时）。
+            # 树内节点的 afterstate 不在原来的前向里，必须一起喂进去才算得上监督；并成一次前向
+            # 而不是两次，是为了不让 GPU 多等一轮（ADR 0027 的利用率要求）。
+            base_rows = (
+                batch.candidate_afterstate.reshape(-1, BOARD_CELLS) if use_candidates else batch.afterstate
+            )
+            tree_rows = (
+                batch.tree_afterstate.reshape(-1, BOARD_CELLS)
+                if config.value_ranking_weight > 0 and batch.tree_count.max() > 0
+                else None
+            )
+            value_rows = torch.cat([base_rows, tree_rows], dim=0) if tree_rows is not None else base_rows
+            base_count = base_rows.shape[0]
+
             if config.mode in JOINT_MODES:
                 # 一次前向覆盖两种行：决策局面喂策略头、候选 afterstate 喂价值头。
-                if use_candidates:
-                    candidate_rows = batch.candidate_afterstate.reshape(-1, BOARD_CELLS)
-                    rows = torch.cat([batch.decision, candidate_rows], dim=0)
-                else:
-                    rows = torch.cat([batch.decision, batch.afterstate], dim=0)
+                rows = torch.cat([batch.decision, value_rows], dim=0)
                 values, logits = _forward(model, rows, amp_dtype, config.channels_last)
                 values = values.float()
                 logits = logits.float()
                 if want_value:
-                    value_loss, value_pred = _value_loss(values[count:], batch, use_candidates, config)
+                    value_loss, value_pred = _value_loss(
+                        values[count : count + base_count], batch, use_candidates, config
+                    )
                     loss = loss + config.value_weight * value_loss
                     if use_candidates:
                         metrics.add_candidates(
                             value_pred, batch.candidate_value, batch.candidate_weight, batch.candidate_reward
                         )
-                        loss = loss + _add_ranking(metrics, config, values[count:], batch)
+                        loss = loss + _add_ranking(
+                            metrics,
+                            config,
+                            values[count : count + base_count],
+                            values[count + base_count :] if tree_rows is not None else None,
+                            batch,
+                        )
                     else:
                         metrics.add_value(value_pred, batch.value_target)
                 if want_policy:
@@ -835,21 +881,24 @@ def _run_epoch(
                         loss = loss + config.policy_weight * stats.loss
                         metrics.add_policy(stats)
             else:
-                if want_value and use_candidates:
-                    boards = batch.candidate_afterstate.reshape(-1, BOARD_CELLS)
-                else:
-                    boards = batch.afterstate if want_value else batch.decision
+                boards = value_rows if want_value else batch.decision
                 values, logits = _forward(model, boards, amp_dtype, config.channels_last)
                 values = values.float()
                 logits = logits.float()
                 if want_value:
-                    value_loss, value_pred = _value_loss(values, batch, use_candidates, config)
+                    value_loss, value_pred = _value_loss(values[:base_count], batch, use_candidates, config)
                     loss = loss + config.value_weight * value_loss
                     if use_candidates:
                         metrics.add_candidates(
                             value_pred, batch.candidate_value, batch.candidate_weight, batch.candidate_reward
                         )
-                        loss = loss + _add_ranking(metrics, config, values, batch)
+                        loss = loss + _add_ranking(
+                            metrics,
+                            config,
+                            values[:base_count],
+                            values[base_count:] if tree_rows is not None else None,
+                            batch,
+                        )
                     else:
                         metrics.add_value(value_pred, batch.value_target)
                 if want_policy:

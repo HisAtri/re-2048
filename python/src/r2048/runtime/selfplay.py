@@ -50,6 +50,9 @@ class SelfplayConfig:
     c_puct: float = 1.5
     temperature: float = 1.0
     temperature_moves: int = 30
+    # 记录里放几个树内节点（0 = 不采集，记录 192 字节；见 ADR 0041）。它是**格式参数**：
+    # 不改变任何一局的走法，但决定记录字节数，因此进清单、进续跑闸门、进 verify 重放。
+    tree_nodes: int = 0
     cache_entries: int = 1 << 17
     shard_samples: int = 100000
     max_batch: int = 16384
@@ -155,6 +158,7 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
         "c_puct": config.c_puct,
         "temperature": config.temperature,
         "temperature_moves": config.temperature_moves,
+        "tree_nodes": config.tree_nodes,
         "cache_entries": config.cache_entries,
         "search_threads": config.search_threads,
         "score_scale": float(r2048_core.SCORE_SCALE),

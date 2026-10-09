@@ -20,7 +20,12 @@ from typing import Self
 import numpy as np
 import torch
 
-from r2048.data.shards import RECORD_DTYPE, SCORE_SCALE, BatchManifest, BatchReader
+from r2048.data.shards import (
+    SCORE_SCALE,
+    BatchManifest,
+    BatchReader,
+    record_dtype,
+)
 
 
 @dataclass(frozen=True)
@@ -207,6 +212,19 @@ class MultiSourceReader:
             offset += samples
             self._readers.append(reader)
 
+        # 记录布局必须一致：gather 会把各来源的样本拼进同一个数组，而数组只有一个 dtype。
+        # 混了 K=0 与 K=2 的批，读出来就会错位——那是最难查的一类错误（看起来像棋盘）。
+        layouts = {reader.manifest.tree_nodes for reader in self._readers}
+        if len(layouts) > 1:
+            detail = "，".join(
+                f"{reader.data_dir.name}（K={reader.manifest.tree_nodes}）" for reader in self._readers
+            )
+            raise ValueError(
+                f"训练来源的记录布局不一致：{detail}。同一次训练只能用 tree_nodes 相同的批次"
+                "（布局由批次的 tree_nodes 声明，见 ADR 0041）。"
+            )
+        self.dtype = self._readers[0].dtype if self._readers else record_dtype(0)
+        self.tree_nodes = self._readers[0].manifest.tree_nodes if self._readers else 0
         self.sources: tuple[SourceView, ...] = tuple(sources)
         # 权重与来源一一对应，并且已经按去重结果对齐：调用方拿到的就是"实际会用到的那些来源"。
         self.weights: tuple[float, ...] = tuple(kept_weights)
@@ -224,7 +242,7 @@ class MultiSourceReader:
 
     def gather(self, indices: np.ndarray) -> np.ndarray:
         indices = np.asarray(indices, dtype=np.int64)
-        out = np.empty(len(indices), dtype=RECORD_DTYPE)
+        out = np.empty(len(indices), dtype=self.dtype)
         if len(indices) == 0:
             return out
         bounds = np.asarray([source.offset for source in self.sources] + [self._total], dtype=np.int64)
@@ -365,6 +383,15 @@ class Batch:
     candidate_reward: torch.Tensor  # (B, 4) float32：r(s,a)，与 candidate_value 同量纲
     candidate_visits: torch.Tensor  # (B, 4) float32：该候选边的根访问数
     candidate_weight: torch.Tensor  # (B, 4) float32：sqrt(访问数)，非法/未访达/无候选处为 0
+    # --- 树内节点块（schema v3；批次声明的 K=0 时这些维度为 0）---
+    # 价值头在搜索里被**直接使用**的位置上的监督：叶节点与未被访问的边（那里的 Q 就是 r + A）。
+    # 候选块只覆盖轨迹根，而搜索在根上有几百次模拟，自己就把排序算出来了（ADR 0035/0041）。
+    tree_afterstate: torch.Tensor  # (B, K, 4, 16) uint8：该节点各候选的 afterstate
+    tree_value: torch.Tensor  # (B, K, 4) float32：Q̄ − r（已归一化，与 candidate_value 同定义）
+    tree_reward: torch.Tensor  # (B, K, 4) float32：r
+    tree_visits: torch.Tensor  # (B, K, 4) float32：该节点上这条边的访问数
+    tree_depth: torch.Tensor  # (B, K) float32：该节点到根经过的步数（诊断用）
+    tree_count: torch.Tensor  # (B,) int64：这条记录实际写了几个节点（0 = 没采到）
 
     def __len__(self) -> int:
         return int(self.decision.shape[0])
@@ -385,6 +412,12 @@ class Batch:
             candidate_reward=self.candidate_reward.to(device),
             candidate_visits=self.candidate_visits.to(device),
             candidate_weight=self.candidate_weight.to(device),
+            tree_afterstate=self.tree_afterstate.to(device),
+            tree_value=self.tree_value.to(device),
+            tree_reward=self.tree_reward.to(device),
+            tree_visits=self.tree_visits.to(device),
+            tree_depth=self.tree_depth.to(device),
+            tree_count=self.tree_count.to(device),
         )
 
     def candidate_q(self) -> torch.Tensor:
@@ -471,7 +504,57 @@ class BatchStream:
         # 位域展开成 (B,4)：D4 变换要按方向重排掩码与访问分布，位域形式没法直接变换。
         raw_mask = records["legal_mask"].astype(np.uint8)[:, None]
         legal_mask = ((raw_mask >> np.arange(4, dtype=np.uint8)[None, :]) & 1).astype(np.float32)
+        tree_nodes = int(self.reader.tree_nodes)
+        if tree_nodes > 0:
+            # 每个节点块按 slot 拼成 (B, K, ...)：与 C++ 侧的偏移表逐项对应，不做逐条 Python 解码。
+            tree_afterstate = np.stack(
+                [records[f"tree{slot}_afterstate"] for slot in range(tree_nodes)], axis=1
+            )
+            tree_value = np.stack(
+                [
+                    (records[f"tree{slot}_value"].astype(np.float32) / self.score_scale)
+                    for slot in range(tree_nodes)
+                ],
+                axis=1,
+            )
+            tree_reward = np.stack(
+                [
+                    (records[f"tree{slot}_reward"].astype(np.float32) / self.score_scale)
+                    for slot in range(tree_nodes)
+                ],
+                axis=1,
+            )
+            tree_visits = np.stack(
+                [records[f"tree{slot}_visits"].astype(np.float32) for slot in range(tree_nodes)], axis=1
+            )
+            tree_legal = np.stack(
+                [
+                    ((records[f"tree{slot}_legal_mask"][:, None] >> np.arange(4, dtype=np.uint8)) & 1)
+                    for slot in range(tree_nodes)
+                ],
+                axis=1,
+            ).astype(np.float32)
+            tree_depth = np.stack(
+                [records[f"tree{slot}_depth"].astype(np.float32) for slot in range(tree_nodes)], axis=1
+            )
+            # 非法槽位清零：引擎写的是合法方向的真值，非法方向写 0；这里再乘一次掩码，
+            # 让"非法方向的槽位恒为 0"成为下游可以直接依赖的性质（与候选块同一口径）。
+            tree_value = tree_value * tree_legal
+            tree_reward = tree_reward * tree_legal
+            tree_visits = tree_visits * tree_legal
+        else:
+            tree_afterstate = np.zeros((len(records), 0, 4, 16), dtype=np.uint8)
+            tree_value = np.zeros((len(records), 0, 4), dtype=np.float32)
+            tree_reward = np.zeros((len(records), 0, 4), dtype=np.float32)
+            tree_visits = np.zeros((len(records), 0, 4), dtype=np.float32)
+            tree_depth = np.zeros((len(records), 0), dtype=np.float32)
         return Batch(
+            tree_afterstate=torch.from_numpy(np.ascontiguousarray(tree_afterstate)),
+            tree_value=torch.from_numpy(np.ascontiguousarray(tree_value)),
+            tree_reward=torch.from_numpy(np.ascontiguousarray(tree_reward)),
+            tree_visits=torch.from_numpy(np.ascontiguousarray(tree_visits)),
+            tree_depth=torch.from_numpy(np.ascontiguousarray(tree_depth)),
+            tree_count=torch.from_numpy(records["tree_count"].astype(np.int64)),
             decision=torch.from_numpy(np.ascontiguousarray(records["decision"])),
             afterstate=torch.from_numpy(np.ascontiguousarray(records["afterstate"])),
             action=torch.from_numpy(records["action"].astype(np.int64)),

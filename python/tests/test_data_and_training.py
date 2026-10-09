@@ -23,6 +23,19 @@ from r2048.nn.augment import apply_boards, augment_policy, transform_policy_targ
 from r2048.nn.training import DatasetSpec, TrainConfig, policy_loss, run_training
 
 
+def _tree_zeros(count: int, nodes: int = 0) -> dict:
+    """Batch 的树内节点字段（v3）。默认 K=0——这些用例测的是根候选与损失口径，
+    树内节点由 `test_ranking_loss_covers_tree_nodes` 单独覆盖。"""
+    return {
+        "tree_afterstate": torch.zeros(count, nodes, 4, 16, dtype=torch.uint8),
+        "tree_value": torch.zeros(count, nodes, 4),
+        "tree_reward": torch.zeros(count, nodes, 4),
+        "tree_visits": torch.zeros(count, nodes, 4),
+        "tree_depth": torch.zeros(count, nodes),
+        "tree_count": torch.zeros(count, dtype=torch.int64),
+    }
+
+
 def training_config(data: str | Path, output: str | Path, **overrides) -> TrainConfig:
     """测试里的 TrainConfig 构造：数据来源写成 DatasetSpec，避免每个断言点都重复一遍。"""
     payload = {"datasets": [DatasetSpec(path=str(data))], "output": str(output)}
@@ -274,6 +287,7 @@ def test_candidate_value_loss_and_metrics() -> None:
         candidate_reward=torch.zeros(count, 4),
         candidate_visits=weight,
         candidate_weight=weight,
+        **_tree_zeros(count),
     )
     config = TrainConfig(datasets=[DatasetSpec(path="x")], output="y", mode="value", value_loss="huber")
 
@@ -406,11 +420,12 @@ def test_ranking_loss_only_punishes_decisions() -> None:
         candidate_reward=reward,
         candidate_visits=torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
         candidate_weight=torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+        **_tree_zeros(count),
     )
 
     def loss(predicted_a: list[float]) -> float:
         prediction = torch.tensor([predicted_a]) / scale
-        return float(_ranking_loss(prediction, batch, scale)) * scale
+        return float(_ranking_loss(prediction, None, batch, scale)) * scale
 
     assert loss([1000.0, 1200.0, 0.0, 0.0]) == pytest.approx(0.0, abs=1e-3), "完美预测必须为 0"
     assert loss([1600.0, 1000.0, 0.0, 0.0]) == pytest.approx(0.0, abs=1e-3), (
@@ -421,6 +436,72 @@ def test_ranking_loss_only_punishes_decisions() -> None:
     assert loss([800.0, 1800.0, 0.0, 0.0]) > wrong_decision, "错得越离谱，罚得越重"
     # 合法失败的极端情形仍有界：上界是"这一对的 Q 间隔"（成对后悔的定义）。
     assert wrong_decision < 312.0, "软 hinge 的有界性：不会超过该对的目标 Q 间隔"
+
+
+def test_ranking_loss_covers_tree_nodes() -> None:
+    """排序项必须覆盖**树内节点**，不只是轨迹根（ADR 0041）。
+
+    价值头在搜索里被直接使用的位置是叶节点与未被访问的边（那里的 Q 就是 r + A），而根那一点
+    有几百次模拟、搜索自己就把排序算出来了（ADR 0035）。这条用例钉住三件事：
+
+    1. 树内节点的候选**参与**这一项：把它们的排序预测搞错，损失必须上升；
+    2. 未访问的边（`tree_visits == 0`）**不参与**——它的"标签"是教师自己的一次性估计，
+       训它等于让学生复制自己（与根候选用 candidate_weight>0 同一口径）；
+    3. K=0 的批（没有树内块）行为与从前完全一致：传 None 不改变任何数。
+    """
+    from r2048.nn.training import _ranking_loss
+
+    scale = 1024.0
+    count = 1
+    legal = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    # 树内节点一个：up(r=512, A=1000) / left(r=0, A=1200) ⇒ 目标 Q = [1512, 1200]，最优 up。
+    tree_value = torch.tensor([[[1000.0, 1200.0, 0.0, 0.0]]]) / scale
+    tree_reward = torch.tensor([[[512.0, 0.0, 0.0, 0.0]]]) / scale
+    tree_visits = torch.tensor([[[5.0, 3.0, 0.0, 0.0]]])
+    batch = Batch(
+        decision=torch.zeros(count, 16, dtype=torch.uint8),
+        afterstate=torch.zeros(count, 16, dtype=torch.uint8),
+        action=torch.zeros(count, dtype=torch.int64),
+        legal_mask=legal,
+        visits=torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+        policy_target=torch.zeros(count, 4),
+        value_target=torch.zeros(count),
+        move_score=torch.zeros(count),
+        episode=torch.zeros(count, dtype=torch.int64),
+        candidate_afterstate=torch.zeros(count, 4, 16, dtype=torch.uint8),
+        candidate_value=torch.zeros(count, 4),  # 根候选没有监督（权重 0）⇒ 这一项只由树内节点决定
+        candidate_reward=torch.zeros(count, 4),
+        candidate_visits=torch.zeros(count, 4),
+        candidate_weight=torch.zeros(count, 4),
+        tree_afterstate=torch.zeros(count, 1, 4, 16, dtype=torch.uint8),
+        tree_value=tree_value,
+        tree_reward=tree_reward,
+        tree_visits=tree_visits,
+        tree_depth=torch.ones(count, 1),
+        tree_count=torch.ones(count, dtype=torch.int64),
+    )
+
+    def loss(tree_predicted_a: list[float]) -> float:
+        prediction = torch.tensor([tree_predicted_a]) / scale  # (1, 4)？—— 见下
+        return float(_ranking_loss(torch.zeros(count, 4), prediction.reshape(1, 1, 4), batch, scale)) * scale
+
+    assert loss([1000.0, 1200.0, 0.0, 0.0]) == pytest.approx(0.0, abs=1e-3), "树内节点的完美预测必须为 0"
+    assert loss([1600.0, 1000.0, 0.0, 0.0]) == pytest.approx(0.0, abs=1e-3), (
+        "A 排序错但引擎判决没变（2112 > 1512）⇒ 树内节点同样不该罚"
+    )
+    assert loss([1000.0, 1600.0, 0.0, 0.0]) > 5.0, "让引擎在树内节点上改选 left ⇒ 必须罚"
+
+    # 未访问的边不参与：只把"未访问"的那条边搞错，损失必须仍为 0。
+    batch_extra = Batch(**{**batch.__dict__, "tree_visits": torch.tensor([[[5.0, 0.0, 0.0, 0.0]]])})
+    swapped = torch.tensor([[1000.0, 1600.0, 0.0, 0.0]]) / scale
+    assert float(
+        _ranking_loss(torch.zeros(count, 4), swapped.reshape(1, 1, 4), batch_extra, scale)
+    ) == pytest.approx(0.0, abs=1e-6), (
+        "left 那条边访问数为 0 ⇒ 它的排序不参与（标签只是教师自己的一次性估计）"
+    )
+
+    # 没有树内块时（tree_prediction=None）这一项只看根候选：这里根候选权重全 0 ⇒ 恰好为 0。
+    assert float(_ranking_loss(torch.zeros(count, 4), None, batch, scale)) == pytest.approx(0.0, abs=1e-6)
 
 
 def test_improved_policy_target_arithmetic_and_limits() -> None:
@@ -456,6 +537,7 @@ def test_improved_policy_target_arithmetic_and_limits() -> None:
         candidate_reward=reward,
         candidate_visits=visits,
         candidate_weight=weight,
+        **_tree_zeros(count),
     )
     # Q = r + A = [110, 90]；π̂ = [0.8, 0.2]；V = 106；Â = [4, −16]；同根 std = 10。
     # β=1 ⇒ 权重 = [1, e^{−2}] ⇒ π̃ ∝ [0.8, 0.2·e^{−2}, 0, 0]。

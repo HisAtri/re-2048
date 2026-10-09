@@ -77,9 +77,9 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
             continue;
         }
         const uint64_t bytes = file_size(path);
-        if (bytes != shard.samples * kSampleBytes) {
+        if (bytes != shard.samples * manifest.meta.record_bytes()) {
             report.problems.push_back(tag + " 字节数与记录数不符：" + std::to_string(bytes) + " != " +
-                                      std::to_string(shard.samples * kSampleBytes));
+                                      std::to_string(shard.samples * manifest.meta.record_bytes()));
             continue;
         }
         // 这里**不再检查"除末片外必须攒满容量"**：多写者下每个写者退出时都会留下一个未满的
@@ -97,11 +97,12 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
         // lane 的完赛顺序不定）；分片自带 [first_episode, last_episode] 区间，读取端从记录
         // 里的局号还原，顺序不参与语义。区间内出现某条记录超界，才是真的坏了。
         uint32_t seen_records = 0;
-        for (uint64_t offset = 0; offset + kSampleBytes <= data.size(); offset += kSampleBytes) {
-            const Sample sample = decode_sample(data.data() + offset);
+        for (uint64_t offset = 0; offset + manifest.meta.record_bytes() <= data.size();
+             offset += manifest.meta.record_bytes()) {
+            const Sample sample = decode_sample(data.data() + offset, manifest.meta.tree_nodes);
             seen_records++;
             if (sample.episode < shard.first_episode || sample.episode > shard.last_episode) {
-                report.problems.push_back(tag + " 第 " + std::to_string(offset / kSampleBytes) +
+                report.problems.push_back(tag + " 第 " + std::to_string(offset / manifest.meta.record_bytes()) +
                                           " 条记录的局号 " + std::to_string(sample.episode) +
                                           " 落在清单声明的区间 [" +
                                           std::to_string(shard.first_episode) + ", " +
@@ -111,7 +112,7 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
             // 局号必须落在本批已发放的号段内：跨越 next_episode 说明清单与数据不是同一次
             // 运行写出来的（便宜的单遍检查，不需要额外内存）。
             if (sample.episode >= manifest.next_episode) {
-                report.problems.push_back(tag + " 第 " + std::to_string(offset / kSampleBytes) +
+                report.problems.push_back(tag + " 第 " + std::to_string(offset / manifest.meta.record_bytes()) +
                                           " 条记录的局号 " + std::to_string(sample.episode) +
                                           " 不小于 next_episode(" +
                                           std::to_string(manifest.next_episode) + "）");

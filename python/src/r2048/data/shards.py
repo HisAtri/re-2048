@@ -15,8 +15,24 @@ from pathlib import Path
 import numpy as np
 
 # 与 cpp/core/version.h、cpp/dataio/sample.h 对齐的契约常量。
-RECORD_BYTES = 192
-SCHEMA_VERSION = 2
+# v3 起记录长度是 **基础块 + K × 树内节点块**，K 由清单的 tree_nodes 声明（0 = 没有这块）。
+# 因此这里没有单一的 RECORD_BYTES，只有一个函数——两份定义迟早会分叉。
+BASE_RECORD_BYTES = 192
+TREE_NODE_BYTES = 108
+TREE_NODES_MAX = 4
+SCHEMA_VERSION = 3
+
+
+def record_dtype(tree_nodes: int) -> np.dtype:
+    """按清单声明的 K 构造记录 dtype。K 不符时记录的字节数就错了（读出来的会是垃圾）。"""
+    if not 0 <= tree_nodes <= TREE_NODES_MAX:
+        raise ValueError(f"tree_nodes 超出范围 0..{TREE_NODES_MAX}：{tree_nodes}")
+    fields = _BASE_FIELDS + [
+        (f"tree{slot}_{spec[0]}", *spec[1:]) for slot in range(tree_nodes) for spec in _TREE_FIELDS
+    ]
+    return np.dtype(fields, align=False)
+
+
 RULES_VERSION = 1
 # 分数归一化尺度来自规则契约（cpp/core/version.h 的 kScoreScale）。记录里不存它，
 # 因为它是语义常量而不是每条样本的属性；测试里会与 C++ 侧暴露的值做一致性校验。
@@ -30,34 +46,48 @@ CANDIDATE_TARGET_DEFINITION = "q_mean_minus_reward"
 
 # 偏移表与 cpp/dataio/sample.h 的注释逐项对应；末尾保留字节以 _padX 命名，
 # 便于将来加字段时只改这里和 C++ 侧（记录长度不变）。
-RECORD_DTYPE = np.dtype(
-    [
-        ("decision", "u1", (16,)),  # 0
-        ("afterstate", "u1", (16,)),  # 16
-        ("action", "u1"),  # 32
-        ("legal_mask", "u1"),  # 33
-        ("step", "<u2"),  # 34
-        ("episode", "<u4"),  # 36
-        ("simulations", "<u2"),  # 40
-        ("move_score", "<u4"),  # 42
-        ("_pad0", "u1", (2,)),  # 46
-        ("mc_return", "<i8"),  # 48
-        ("_pad1", "u1", (8,)),  # 56
-        ("visits", "<u2", (4,)),  # 64
-        ("_pad2", "u1", (8,)),  # 72
-        # --- v2 候选块：按方向下标对齐，槽位 a 恒对应方向 a ---
-        ("candidate_afterstate", "u1", (4, 16)),  # 80
-        ("candidate_value", "<i4", (4,)),  # 144：A(u_a) = Q̄(a) − r(s,a)，原始分数单位
-        ("candidate_reward", "<u4", (4,)),  # 160：r(s,a)
-        ("candidate_visits", "<u2", (4,)),  # 176：该候选边的根访问数
-        ("candidate_count", "u1"),  # 184：0 = 无候选监督
-        ("_pad3", "u1", (7,)),  # 185
-    ],
-    align=False,
-)
+_BASE_FIELDS = [
+    ("decision", "u1", (16,)),  # 0
+    ("afterstate", "u1", (16,)),  # 16
+    ("action", "u1"),  # 32
+    ("legal_mask", "u1"),  # 33
+    ("step", "<u2"),  # 34
+    ("episode", "<u4"),  # 36
+    ("simulations", "<u2"),  # 40
+    ("move_score", "<u4"),  # 42
+    ("_pad0", "u1", (2,)),  # 46
+    ("mc_return", "<i8"),  # 48
+    ("_pad1", "u1", (8,)),  # 56
+    ("visits", "<u2", (4,)),  # 64
+    ("_pad2", "u1", (8,)),  # 72
+    # --- v2 候选块：按方向下标对齐，槽位 a 恒对应方向 a ---
+    ("candidate_afterstate", "u1", (4, 16)),  # 80
+    ("candidate_value", "<i4", (4,)),  # 144：A(u_a) = Q̄(a) − r(s,a)，原始分数单位
+    ("candidate_reward", "<u4", (4,)),  # 160：r(s,a)
+    ("candidate_visits", "<u2", (4,)),  # 176：该候选边的根访问数
+    ("candidate_count", "u1"),  # 184：0 = 无候选监督
+    ("tree_count", "u1"),  # 185：实际写出的树内节点数（0..K）
+    ("_pad3", "u1", (6,)),  # 186
+]
 
-if RECORD_DTYPE.itemsize != RECORD_BYTES:  # pragma: no cover - 契约自检
-    raise RuntimeError(f"记录布局与 C++ 契约不一致：{RECORD_DTYPE.itemsize} != {RECORD_BYTES}")
+# v3 树内节点块：每个节点 108 字节，按方向下标对齐（与 cpp/dataio/sample.h 的偏移表逐项对应）。
+# 它是"价值头真正说了算"的位置上的监督——价值头在搜索里被直接使用的地方是叶节点与未被访问的
+# 边，而候选块只覆盖轨迹根（那一点搜索自己就把排序算出来了，见 ADR 0035/0041）。
+_TREE_FIELDS = [
+    ("legal_mask", "u1"),  # +0
+    ("count", "u1"),  # +1
+    ("depth", "u1"),  # +2
+    ("pad", "u1"),  # +3（4 字节对齐）
+    ("value", "<i4", (4,)),  # +4：Q̄(a) − r(s,a)，原始分数单位
+    ("reward", "<u4", (4,)),  # +20：r(s,a)
+    ("visits", "<u2", (4,)),  # +36：该节点上这条边的访问数
+    ("afterstate", "u1", (4, 16)),  # +44
+]
+
+if record_dtype(0).itemsize != BASE_RECORD_BYTES:  # pragma: no cover - 契约自检
+    raise RuntimeError(f"基础布局与 C++ 契约不一致：{record_dtype(0).itemsize} != {BASE_RECORD_BYTES}")
+if record_dtype(1).itemsize != BASE_RECORD_BYTES + TREE_NODE_BYTES:  # pragma: no cover
+    raise RuntimeError("树内节点块的字节数与 C++ 契约不一致")
 
 
 @dataclass(frozen=True)
@@ -106,6 +136,11 @@ class BatchManifest:
         按 complete 算——旧协议只在跑完时才写 manifest，这个默认值与事实一致。
         """
         return str(self.data.get("state", "complete"))
+
+    @property
+    def tree_nodes(self) -> int:
+        """这批数据每条记录里放了几个树内节点（0 = 没有这一块）。"""
+        return tree_nodes_of(self.data)
 
     @property
     def shard_layout(self) -> int:
@@ -189,6 +224,21 @@ def source_identity(data: dict) -> tuple[str, int]:
     return digest.hex(), int.from_bytes(digest, "little")
 
 
+def record_bytes(tree_nodes: int) -> int:
+    """一条记录的字节数（基础块 + K 个树内节点块）。"""
+    return BASE_RECORD_BYTES + int(tree_nodes) * TREE_NODE_BYTES
+
+
+def tree_nodes_of(data: dict) -> int:
+    """清单里声明的树内节点数 K。缺失或越界都直接失败：它决定记录长度，猜不得。"""
+    if "tree_nodes" not in data:
+        raise ValueError(f"清单缺少 tree_nodes：这不是 v{SCHEMA_VERSION} 格式的数据批（旧格式请见归档说明）")
+    value = int(data["tree_nodes"])
+    if not 0 <= value <= TREE_NODES_MAX:
+        raise ValueError(f"清单的 tree_nodes={value} 超出本实现支持的范围 0..{TREE_NODES_MAX}")
+    return value
+
+
 def read_manifest(data_dir: str | Path, check_versions: bool = True) -> BatchManifest:
     """读取并校验 manifest。
 
@@ -207,8 +257,14 @@ def read_manifest(data_dir: str | Path, check_versions: bool = True) -> BatchMan
             )
         if int(data["rules_version"]) != RULES_VERSION:
             raise ValueError(f"数据批的规则版本 {data['rules_version']} 与本实现 {RULES_VERSION} 不一致")
-        if int(data["record_bytes"]) != RECORD_BYTES:
-            raise ValueError(f"数据批的记录长度 {data['record_bytes']} 与本地布局 {RECORD_BYTES} 不一致")
+        # 记录长度由清单声明的 tree_nodes 决定（v3）：这里是"声明与推导必须一致"的自检，
+        # 而不是把某个常量再抄一遍。缺 tree_nodes 的批次属于 v2 或更早，已在版本闸门处失败。
+        expected_bytes = record_bytes(tree_nodes_of(data))
+        if int(data["record_bytes"]) != expected_bytes:
+            raise ValueError(
+                f"数据批的记录长度 {data['record_bytes']} 与 tree_nodes={tree_nodes_of(data)} "
+                f"推出的 {expected_bytes} 不一致"
+            )
     return BatchManifest(path=path, data=data)
 
 
@@ -239,6 +295,9 @@ class BatchReader:
     def __init__(self, data_dir: str | Path, check_versions: bool = True):
         self.data_dir = Path(data_dir)
         self.manifest = read_manifest(self.data_dir, check_versions=check_versions)
+        # 记录布局由清单声明的 K 决定：所有读路径都从这里取 dtype，不再有全局的 RECORD_DTYPE。
+        self.dtype = record_dtype(self.manifest.tree_nodes)
+        self.tree_nodes = self.manifest.tree_nodes
         self._arrays: list[np.ndarray] = []
         self._cumulative: np.ndarray | None = None
         self._episodes: np.ndarray | None = None
@@ -247,7 +306,7 @@ class BatchReader:
         cumulative = [0]
         for shard in self.manifest.data["shards"]:
             path = self.data_dir / shard["path"]
-            array = np.memmap(path, dtype=RECORD_DTYPE, mode="r")
+            array = np.memmap(path, dtype=self.dtype, mode="r")
             expected = int(shard["samples"])
             if array.shape[0] != expected:
                 raise ValueError(f"{shard['path']} 的记录数 {array.shape[0]} 与清单 {expected} 不一致")
@@ -282,7 +341,7 @@ class BatchReader:
 
     def gather(self, indices: np.ndarray) -> np.ndarray:
         """按全局样本下标取记录。跨分片时按分片分组后再取，避免逐条 Python 循环。"""
-        out = np.empty(len(indices), dtype=RECORD_DTYPE)
+        out = np.empty(len(indices), dtype=self.dtype)
         if len(indices) == 0:
             return out
         shard_of = np.searchsorted(self._cumulative[1:], indices, side="right")

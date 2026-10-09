@@ -469,8 +469,9 @@ TEST(engine_records_candidate_targets) {
     const std::vector<uint8_t> raw =
         read_binary_for_test(dir.sub("batch") + "/" + manifest.shards.front().path);
     int checked = 0;
-    for (size_t offset = 0; offset + kSampleBytes <= raw.size(); offset += kSampleBytes) {
-        const Sample sample = decode_sample(raw.data() + offset);
+    for (size_t offset = 0; offset + manifest.meta.record_bytes() <= raw.size();
+         offset += manifest.meta.record_bytes()) {
+        const Sample sample = decode_sample(raw.data() + offset, manifest.meta.tree_nodes);
         int legal = 0;
         for (int action = 0; action < kNumActions; action++) legal += (sample.legal_mask >> action) & 1;
         expect_equal_u64(sample.candidates.count, static_cast<uint64_t>(legal), "候选数量等于合法方向数");

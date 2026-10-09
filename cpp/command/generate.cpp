@@ -57,7 +57,8 @@ int run_generate(int argc, const char* const* argv) {
         print_usage();
         return 0;
     }
-    args.expect_only({"policy", "samples", "seed", "simulations", "temperature-moves", "rollout-policy",
+    args.expect_only({"policy", "samples", "seed", "simulations", "temperature-moves", "tree-nodes",
+                      "rollout-policy",
                       "shard-samples", "workers", "out", "batch-id", "model-id", "continue", "control",
                       "progress-json", "quiet", "help"});
 
@@ -70,6 +71,9 @@ int run_generate(int argc, const char* const* argv) {
     config.samples_target = args.u64("samples", 0);  // 0 = 不限量
     config.simulations = static_cast<uint32_t>(args.i32("simulations", 64));
     config.temperature_moves = static_cast<uint32_t>(args.i32("temperature-moves", 30));
+    // 树内节点块（ADR 0041）：它是**格式参数**，不是逐局协议参数——采集不改变任何一局的走法，
+    // 但它决定记录的字节数，所以进清单、并且续跑时必须一致（见 compare_resume_meta）。
+    config.tree_nodes = static_cast<uint8_t>(args.i32("tree-nodes", 0));
     config.seed = args.has("seed") ? args.u64("seed", 0) : default_seed();
     // 续弈策略：只认 uniform / greedy，未知值直接报错（不做静默回退——一个拼错的策略名
     // 会让整批数据来自另一个教师，而它看起来是"跑完了"）。

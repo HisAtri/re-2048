@@ -139,6 +139,7 @@ struct BatchedEngine::Impl {
         meta.policy = "nn";
         meta.simulations = config.decision_mode == kDecisionSearch ? config.simulations : 0;
         meta.temperature_moves = config.temperature_moves;
+        meta.tree_nodes = config.tree_nodes;
         meta.seed = config.seed;
         // 并发对局数记**整批**的值：多线程搜索时它 = 各引擎 lanes 之和（见 ADR 0003/0028）。
         meta.workers = config.lanes_total > 0 ? config.lanes_total : config.lanes;
@@ -725,8 +726,53 @@ struct BatchedEngine::Impl {
             }
             const CandidateTargets candidates =
                 build_candidate_targets(lane.board, lane.legal_mask, q_mean, candidate_visits);
+            // 树内节点块（ADR 0041）：挑访问数最大的 K 个**内部**决策节点。
+            // 为什么是"访问数最大"：标签可信度随访问数上升（访问数 = 模拟平均的次数），而访问数
+            // 随深度衰减，所以按访问数取等同于取"标签还可信、但价值头仍然说了算"的那一段——
+            // 根那一点（几百次模拟）搜索自己就把排序算出来了，价值头在那里是多余的（ADR 0035）。
+            // 选取必须**确定性**（重放校验依赖它）：访问数降序，并列取节点下标小者。
+            std::array<TreeNodeTarget, kTreeNodesMax> tree{};
+            uint8_t tree_count = 0;
+            if (config.tree_nodes > 0) {
+                std::vector<std::pair<uint32_t, uint32_t>> ranked;  // (visits, node index)
+                for (uint32_t index = 1; index < lane.nodes.size(); index++) {
+                    const Node& node = lane.nodes[index];
+                    if (node.kind != kDecision || node.state != kEvaluated) continue;
+                    if (node.parent == kNoNode) continue;  // 根不算树内节点
+                    if (node.visits == 0) continue;
+                    ranked.emplace_back(node.visits, index);
+                }
+                std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
+                    return left.first != right.first ? left.first > right.first
+                                                     : left.second < right.second;
+                });
+                const size_t take = std::min<size_t>(config.tree_nodes, ranked.size());
+                for (size_t slot = 0; slot < take; slot++) {
+                    const uint32_t at = ranked[slot].second;
+                    const Node& node = lane.nodes[at];
+                    uint8_t depth = 0;
+                    for (uint32_t walk = at; lane.nodes[walk].parent != kNoNode;
+                         walk = lane.nodes[walk].parent) {
+                        depth++;
+                    }
+                    int32_t node_q_mean[kNumActions] = {0, 0, 0, 0};
+                    uint16_t node_visits[kNumActions] = {0, 0, 0, 0};
+                    for (int candidate = 0; candidate < kNumActions; candidate++) {
+                        if ((node.legal_mask & (1u << candidate)) == 0) continue;
+                        const uint32_t raw = node.edge_visits[candidate];
+                        const float q = raw > 0 ? node.edge_q_sum[candidate] / static_cast<float>(raw)
+                                                : node.one_ply[candidate];
+                        node_q_mean[candidate] = static_cast<int32_t>(std::lround(q));
+                        node_visits[candidate] = static_cast<uint16_t>(std::min<uint32_t>(raw, 0xFFFF));
+                    }
+                    tree[slot] =
+                        build_tree_node(node.board, node.legal_mask, depth, node_q_mean, node_visits);
+                    tree_count++;
+                }
+            }
             lane.recorder.add(lane.board, move.board, action, lane.legal_mask,
-                              static_cast<uint32_t>(move.score), visits, &candidates);
+                              static_cast<uint32_t>(move.score), visits, &candidates, tree.data(),
+                              tree_count);
         }
         applied.score_delta = move.score;
         lane.total_score += move.score;

@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python" / "src"))
-from r2048.data.shards import RECORD_DTYPE
+from r2048.data.shards import read_manifest, record_dtype
 
 FIELDS = (
     "decision",
@@ -57,9 +57,12 @@ def load_batch(path: Path, fields: tuple[str, ...] = FIELDS) -> dict[str, np.nda
     shards = sorted((path / "shards").glob("*.bin"))
     if not shards:
         raise SystemExit(f"{path} 下没有分片")
+    # 记录布局由清单声明的 tree_nodes 决定（v3）：探针只用根候选块，但**字节数**必须按 K 算，
+    # 否则读出来会错位（看起来像棋盘）。
+    dtype = record_dtype(read_manifest(path).tree_nodes)
     parts: dict[str, list[np.ndarray]] = {name: [] for name in fields}
     for shard in shards:
-        view = np.memmap(shard, dtype=RECORD_DTYPE, mode="r")
+        view = np.memmap(shard, dtype=dtype, mode="r")
         for name in fields:
             parts[name].append(np.array(view[name]))
     return {name: np.concatenate(chunks) for name, chunks in parts.items()}

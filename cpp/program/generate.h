@@ -20,6 +20,9 @@ struct GenerateConfig {
     uint64_t shard_samples = 100000;
     uint32_t workers = 0;  // 0 = 自动取硬件并发数
     uint32_t temperature_moves = 0;
+    // 记录里放几个树内节点（0 = 不采集，记录 192 字节）。它是**格式参数**：不改变任何一局的
+    // 走法，但决定记录字节数，因此进清单、进续跑闸门、进 verify 的重放（ADR 0041）。
+    uint8_t tree_nodes = 0;
     // rollout 的续弈策略（仅 policy=mcts 有效）：false = 均匀随机（历史行为），
     // true = 一步启发式。它改变候选价值标签的信息量，属协议参数（见 RolloutMctsConfig）。
     bool greedy_rollout = false;

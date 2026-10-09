@@ -36,6 +36,9 @@ struct EngineConfig {
     // 展开节点自带的 5 个局面），CPU 搜索与 GPU 推理才真正重叠起来。
     uint32_t in_flight_per_lane = 8;
     float c_puct = 1.5f;              // PUCT 探索系数
+    // 记录里放几个树内节点（0 = 不采集，记录 192 字节；见 ADR 0041）。它是**格式参数**：
+    // 决定记录字节数，进清单、进续跑闸门。采集本身不改变搜索行为，所以不进逐局协议。
+    uint8_t tree_nodes = 0;
     uint32_t temperature_moves = 30;  // 开局多少步按访问分布采样
     float temperature = 1.0f;         // 访问数开 1/T 次幂后采样；0 表示直接取最大
     // 搜索线程数（= K 个引擎，各持一份叶子缓存，共用一个写入侧与一个合并推理线程）。

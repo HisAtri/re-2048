@@ -121,9 +121,9 @@ TEST(dataio_sample_roundtrip) {
         sample.candidates.visits[action] = static_cast<uint16_t>(action * 3);
     }
 
-    uint8_t encoded[kSampleBytes];
-    encode_sample(sample, encoded);
-    const Sample decoded = decode_sample(encoded);
+    std::vector<uint8_t> encoded(sample_bytes(2));
+    encode_sample(sample, encoded.data(), 2);
+    const Sample decoded = decode_sample(encoded.data(), 2);
 
     expect_true(decoded.decision == sample.decision, "决策局面往返一致");
     expect_true(decoded.afterstate == sample.afterstate, "afterstate 往返一致");
@@ -150,11 +150,55 @@ TEST(dataio_sample_roundtrip) {
                          "候选访问数往返一致");
     }
 
+    // 树内节点块（v3）：K=2 时逐字段往返，且**逐字节**与手工偏移一致。
+    Sample with_tree = sample;
+    with_tree.tree_count = 2;
+    for (uint8_t node = 0; node < 2; node++) {
+        TreeNodeTarget& target = with_tree.tree[node];
+        target.legal_mask = 0b1011;
+        target.count = 3;  // 与 build_tree_node 的口径一致：合法方向数
+        target.depth = static_cast<uint8_t>(node + 1);
+        for (int action = 0; action < kNumActions; action++) {
+            for (int cell = 0; cell < kBoardCells; cell++) {
+                target.afterstate[action].tiles[cell] = static_cast<uint8_t>(node * 37 + action * 5 + cell);
+            }
+            target.value[action] = action * 211 - 400;  // 含负值
+            target.reward[action] = static_cast<uint32_t>(node * 13 + action);
+            target.visits[action] = static_cast<uint16_t>(node * 9 + action * 2);
+        }
+    }
+    std::vector<uint8_t> tree_bytes(sample_bytes(2));
+    encode_sample(with_tree, tree_bytes.data(), 2);
+    const Sample tree_decoded = decode_sample(tree_bytes.data(), 2);
+    expect_equal_u64(tree_decoded.tree_count, 2, "树内节点数往返一致");
+    // K=2 的记录必须比 K=0 的长 216 字节（两倍 kTreeNodeBytes）——这是"K 决定记录长度"的直接证据。
+    expect_equal_u64(sample_bytes(2), sample_bytes(0) + 2 * kTreeNodeBytes, "记录长度 = 基础 + K × 节点块");
+    for (uint8_t node = 0; node < 2; node++) {
+        const TreeNodeTarget& want = with_tree.tree[node];
+        const TreeNodeTarget& got = tree_decoded.tree[node];
+        expect_equal_u64(got.legal_mask, want.legal_mask, "节点合法掩码往返一致");
+        expect_equal_u64(got.count, want.count, "节点候选数往返一致");
+        expect_equal_u64(got.depth, want.depth, "节点深度往返一致");
+        for (int action = 0; action < kNumActions; action++) {
+            expect_true(got.afterstate[action] == want.afterstate[action], "节点 afterstate 往返一致");
+            expect_true(got.value[action] == want.value[action], "节点价值目标往返一致（含负值）");
+            expect_equal_u64(got.reward[action], want.reward[action], "节点立即得分往返一致");
+            expect_equal_u64(got.visits[action], want.visits[action], "节点访问数往返一致");
+        }
+    }
+    // 基础布局（v2）在 v3 里偏移不变：K=0 时记录仍是 192 字节，且逐字节等价于 v2 的写法。
+    std::vector<uint8_t> base_only(sample_bytes(0));
+    encode_sample(sample, base_only.data(), 0);
+    expect_equal_u64(base_only.size(), kSampleBaseBytes, "K=0 时记录长度仍是 192");
+
     // 保留字节必须写 0：否则未来加字段时无法区分“旧数据未使用”与“旧的垃圾值”。
     for (size_t offset = 72; offset < 80; offset++) expect_equal_u64(encoded[offset], 0, "保留字节为 0");
-    for (size_t offset = 185; offset < kSampleBytes; offset++) {
-        expect_equal_u64(encoded[offset], 0, "v2 保留字节为 0");
+    // 185 是树内节点数（显式），186..192 仍是保留位。
+    expect_equal_u64(encoded[185], 0, "K=2 但没采到节点时，185 写 0");
+    for (size_t offset = 186; offset < kSampleBaseBytes; offset++) {
+        expect_equal_u64(encoded[offset], 0, "其余保留字节为 0");
     }
+    expect_equal_u64(tree_bytes[185], 2, "185 记录实际写出的树内节点数");
 }
 
 TEST(dataio_recorder_labels) {

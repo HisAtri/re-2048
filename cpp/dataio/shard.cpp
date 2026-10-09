@@ -87,6 +87,8 @@ void compare_resume_meta(const BatchMeta& existing, const BatchMeta& requested, 
     require_equal_u64("temperature_moves", existing.temperature_moves, requested.temperature_moves);
     require_equal_u64("seed", existing.seed, requested.seed);
     require_equal_u64("shard_samples", existing.shard_samples, shard_samples);
+    // 记录长度由它决定：不一致就必须拒绝，否则接着写下去的记录会错位（ADR 0041）。
+    require_equal_u64("tree_nodes", existing.tree_nodes, requested.tree_nodes);
     compare_protocol_params(existing, requested);
 }
 
@@ -142,7 +144,9 @@ Json manifest_to_json(const BatchManifest& manifest) {
     root.set("temperature_moves", Json::integer(manifest.meta.temperature_moves));
     root.set("seed", Json::integer(static_cast<int64_t>(manifest.meta.seed)));
     root.set("model_id", Json::str(manifest.meta.model_id));
-    root.set("record_bytes", Json::integer(static_cast<int64_t>(kSampleBytes)));
+    // 记录长度由 tree_nodes 决定（v3 的树内节点块），清单声明它，读侧照着解码。
+    root.set("tree_nodes", Json::integer(static_cast<int64_t>(manifest.meta.tree_nodes)));
+    root.set("record_bytes", Json::integer(static_cast<int64_t>(manifest.meta.record_bytes())));
     root.set("shard_samples", Json::integer(manifest.meta.shard_samples));
     root.set("samples_target", Json::integer(static_cast<int64_t>(manifest.meta.samples_target)));
     root.set("samples", Json::integer(static_cast<int64_t>(manifest.samples)));
@@ -193,6 +197,16 @@ BatchManifest manifest_from_json(const Json& json) {
     manifest.state = json.has("state") ? batch_state_from_name(json.at("state").as_string())
                                        : BatchState::kComplete;
     manifest.shard_layout = json.has("shard_layout") ? static_cast<int>(json.at("shard_layout").as_int()) : 1;
+    if (!json.has("tree_nodes")) {
+        // v3 起记录长度由它决定，缺了就无法解码——不猜，直接失败（ADR 0007 的版本闸门）。
+        throw std::runtime_error("清单缺少 tree_nodes：这不是 v" +
+                                 std::to_string(kSampleSchemaVersion) + " 格式的数据批");
+    }
+    manifest.meta.tree_nodes = static_cast<uint8_t>(json.at("tree_nodes").as_int());
+    if (manifest.meta.tree_nodes > kTreeNodesMax) {
+        throw std::runtime_error("清单声明的 tree_nodes 超出本构建支持的上界: " +
+                                 std::to_string(manifest.meta.tree_nodes));
+    }
     // build_id 同样是后加的字段；缺它说明清单来自更早的实现，留空即可（续跑会因此拒绝，
     // 这正是想要的：没有产出者身份就不能续写）。
     manifest.meta.build_id = json.has("build_id") ? json.at("build_id").as_string() : "";
@@ -327,7 +341,7 @@ ShardWriter::ShardWriter(std::string data_dir, uint64_t shard_samples, BatchMeta
     meta_.build_id = R2048_BUILD_ID;
     shards_dir_ = data_dir_ + "/shards";
     ensure_dir(shards_dir_);
-    buffer_.reserve(static_cast<size_t>(shard_samples_) * kSampleBytes);
+    buffer_.reserve(static_cast<size_t>(shard_samples_) * meta_.record_bytes());
     // 分片文件名带写者标识：多进程同时写时不可能撞名（撞名 = 覆盖别人的分片 = 丢数据）。
     writer_tag_ = std::to_string(::getpid()) + "-" +
                   std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
@@ -371,7 +385,7 @@ ShardWriter ShardWriter::resume(const std::string& data_dir, uint64_t shard_samp
         const ShardInfo last = writer.shards_.back();
         if (last.samples < shard_samples) {
             const std::vector<uint8_t> bytes = read_binary(join_path(data_dir, last.path));
-            if (bytes.size() != last.samples * kSampleBytes) {
+            if (bytes.size() != last.samples * meta.record_bytes()) {
                 throw std::runtime_error("末分片 " + last.path + " 的字节数与清单不符，拒绝续写");
             }
             // 只核对**跨度**（实际 min/max），不假设内容有序：同一写者的多局完赛顺序不定，
@@ -379,8 +393,9 @@ ShardWriter ShardWriter::resume(const std::string& data_dir, uint64_t shard_samp
             // "局号与清单不符，拒绝续写"（实测踩到）。
             uint32_t lowest = UINT32_MAX;
             uint32_t highest = 0;
-            for (uint64_t offset = 0; offset + kSampleBytes <= bytes.size(); offset += kSampleBytes) {
-                const uint32_t episode = decode_sample(bytes.data() + offset).episode;
+            for (uint64_t offset = 0; offset + meta.record_bytes() <= bytes.size();
+                 offset += meta.record_bytes()) {
+                const uint32_t episode = decode_sample(bytes.data() + offset, meta.tree_nodes).episode;
                 lowest = std::min(lowest, episode);
                 highest = std::max(highest, episode);
             }
@@ -398,9 +413,10 @@ ShardWriter ShardWriter::resume(const std::string& data_dir, uint64_t shard_samp
             writer.reuse_shard_path_ = last.path;     // 原地重写：换名字等于把同一段写两遍
             // 把读回来的那些局号也放进"本片已收"的集合：否则重写这一片时它只报新增的局数，
             // 整批局数会少算（实测少 2 局，正是末片里的那两局）。
-            for (uint64_t offset = 0; offset + kSampleBytes <= writer.buffer_.size();
-                 offset += kSampleBytes) {
-                writer.buffer_episodes_.insert(decode_sample(writer.buffer_.data() + offset).episode);
+            for (uint64_t offset = 0; offset + meta.record_bytes() <= writer.buffer_.size();
+                 offset += meta.record_bytes()) {
+                writer.buffer_episodes_.insert(
+                    decode_sample(writer.buffer_.data() + offset, meta.tree_nodes).episode);
             }
             writer.flushed_samples_ -= last.samples;
         }
@@ -452,7 +468,7 @@ void ShardWriter::check_episode_order(uint32_t episode) const {
 void ShardWriter::add_episode(uint32_t episode, const std::vector<Sample>& samples) {
     check_episode_order(episode);
 
-    uint8_t encoded[kSampleBytes];
+    std::vector<uint8_t> encoded(meta_.record_bytes());
     for (const Sample& sample : samples) {
         if (sample.episode != episode) throw std::runtime_error("样本的局号与所属局不一致");
         if (buffer_.empty()) {
@@ -465,8 +481,8 @@ void ShardWriter::add_episode(uint32_t episode, const std::vector<Sample>& sampl
             buffered_first_episode_ = std::min(buffered_first_episode_, episode);
             buffered_last_episode_ = std::max(buffered_last_episode_, episode);
         }
-        encode_sample(sample, encoded);
-        buffer_.insert(buffer_.end(), encoded, encoded + kSampleBytes);
+        encode_sample(sample, encoded.data(), meta_.tree_nodes);
+        buffer_.insert(buffer_.end(), encoded.begin(), encoded.end());
     }
     buffer_episodes_.insert(episode);
     // 分片只在**局边界**上切分（攒满容量之后的第一局末尾）。这条规则换来两件事：
@@ -487,13 +503,13 @@ void ShardWriter::flush_shard() {
 
     ShardInfo info;
     info.path = relative;
-    info.samples = buffer_.size() / kSampleBytes;
+    info.samples = buffer_.size() / meta_.record_bytes();
     info.episodes = static_cast<uint32_t>(buffer_episodes_.size());
     info.first_episode = buffered_first_episode_;
     info.last_episode = buffered_last_episode_;
     info.sha256 = sha256_hex(buffer_.data(), buffer_.size());
     shards_.push_back(info);
-    flushed_samples_ += buffer_.size() / kSampleBytes;
+    flushed_samples_ += buffer_.size() / meta_.record_bytes();
     buffer_.clear();
     buffer_episodes_.clear();
     // 每落一片就提交一次清单（在文件锁下与别的写者合并）：清单是提交日志，

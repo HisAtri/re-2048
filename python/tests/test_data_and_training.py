@@ -486,9 +486,18 @@ def test_improved_policy_target_arithmetic_and_limits() -> None:
     # 新默认训出的 `value-<数据>` 与历史上按 A 口径挑出的同名（ADR 0030 §5.7 的同名事故）。
     default_value = TrainConfig(datasets=[DatasetSpec(path="/data/批")], output="x", mode="value")
     legacy = TrainConfig(
-        datasets=[DatasetSpec(path="/data/批")], output="x", mode="value", value_selection="best_hit"
+        datasets=[DatasetSpec(path="/data/批")],
+        output="x",
+        mode="value",
+        value_selection="best_hit",
+        value_ranking_weight=0.0,  # 这一段只测挑选口径，把排序项的默认后缀摘掉
     )
-    assert model_id_for(default_value, "candidate") == "value-批+q_best_hit"
+    # 默认还带排序项的权重（ADR 0035 默认 λ=1）：三个旋钮都要能从名字里读出来。
+    assert model_id_for(default_value, "candidate") == "value-批+q_best_hit+rank1"
+    no_rank = TrainConfig(
+        datasets=[DatasetSpec(path="/data/批")], output="x", mode="value", value_ranking_weight=0.0
+    )
+    assert model_id_for(no_rank, "candidate") == "value-批+q_best_hit"
     assert model_id_for(legacy, "candidate") == "value-批+best_hit"
     assert model_id_for(default_value, "candidate") != model_id_for(legacy, "candidate")
     # 策略模式不训价值头，挑选口径与它无关，不该进名字。

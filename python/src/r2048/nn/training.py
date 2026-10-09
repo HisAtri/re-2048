@@ -128,12 +128,16 @@ class TrainConfig:
     # π̂ 上的均匀伪访问数：让搜索未访问过的候选也能拿到质量。0 = 严格乘法重加权。
     improve_floor: float = 0.0
     val_fraction: float = 0.05
-    # Q 空间的同根成对排序损失权重（0 = 关）。Q = r + A 是引擎的选择值：把 r 加在
-    # 预测与目标两边**不改变预测误差**（所以 Huber 在两种口径下逐值相同），但会改变
-    # **成对的标签**——在 r6 的批上 12.9% 的根给出不同的 argmax（ADR 0034）。因此
-    # "在 Q 空间做排序监督"与"在 A 空间做"不是同一件事，而 Q 空间的排序目标恰好是
-    # 教师自己的边均值 Q：对搜索输出最忠实的蒸馏。见 ADR 0035。
-    value_ranking_weight: float = 0.0
+    # Q 空间的同根成对排序损失权重（0 = 关；**默认 1.0 = 开**）。Q = r + A 是引擎的选择值：
+    # 把 r 加在预测与目标两边**不改变预测误差**（所以 Huber 在两种口径下逐值相同），但会改变
+    # **成对的标签**——在 r6 的批上 12.9% 的根给出不同的 argmax（ADR 0034）。因此"在 Q 空间
+    # 做排序监督"与"在 A 空间做"不是同一件事，而 Q 空间的排序目标恰好是教师自己的边均值 Q：
+    # 对搜索输出最忠实的蒸馏。
+    #
+    # 为什么默认开（ADR 0035）：同一批数据/init/种子下，它让搜索臂在 8/16/64 模拟上**显著**变强
+    # （各 4000 局：+466 / +399 / +371；400 局的 256 模拟档分辨不出这个量级，点估计 +405）。
+    # 它零推理成本，代价是候选 MAE 略升（40.6 → 41.8 分）——用一点拟合精度换判决质量。
+    value_ranking_weight: float = 1.0
     # 价值头 checkpoint 的挑选依据：q_best_hit = r+A 口径（**默认**，与引擎的选择值
     # `one_ply = r + A` 同口径）；best_hit = A 口径（旧口径，保留用于复现历史产物）。
     # 只影响"留哪个 epoch 的权重"，不影响损失——价值头原理上只能学 A（r 不是 afterstate
@@ -258,7 +262,9 @@ def model_id_for(config: TrainConfig, value_target: str) -> str:
         # 后缀，新默认训出的 `value-<数据>` 会与历史上按 A 口径挑出的同名——正是 ADR 0030
         # §5.7 那次事故的形状（两份不同权重、一个名字，评分池按 model_id 去重会合并它们）。
         base = f"{base}+{config.value_selection}"
-    if config.value_ranking_weight > 0:
+    if trains_value(config.mode) and config.value_ranking_weight > 0:
+        # 排序项只作用在价值头上（它在价值损失里），所以策略模式不带这个后缀——
+        # 那份权重里没有任何与它相关的东西。
         base = f"{base}+rank{config.value_ranking_weight:g}"
     return base
 

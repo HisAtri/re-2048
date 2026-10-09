@@ -40,7 +40,7 @@ ADR 解释为什么整体是这个形状。
 | [0032](0032-advantage-weighted-policy-improvement.md) | 策略改进算子（Â 加权一步改进）首轮实测：不改善、强推变差；归一化尺度在弱信号处反而推得更狠 | 已采纳（负结果；默认仍是 visits） |
 | [0033](0033-continuous-selfplay-monitoring.md) | 连续自举五轮的监控：没有劣化、仍未收敛，进步全在价值头而非策略头 | 已采纳 |
 | [0034](0034-a-versus-r-plus-a-ranking.md) | 候选排序的两套口径：引擎用 r + A、训练与离线指标用 A；**默认挑选口径已改为 r+A** | 已采纳（度量的口径错误已无条件修掉；在 r6 数据上该错误尚未显现：两臂权重逐位相同） |
-| [0035](0035-q-space-pairwise-ranking-loss.md) | Q 空间的同根成对排序项：贪心判决 +19%（显著），256 模拟的搜索不动 | 已采纳（机制在瞄准的口径上生效；默认关闭） |
+| [0035](0035-q-space-pairwise-ranking-loss.md) | Q 空间的同根成对排序项：贪心判决 +19%、搜索臂在 8/16/64 模拟上显著变强 | 已采纳（默认开启；初版「256 模拟不转移」已订正为分辨率不足） |
 | [0036](0036-record-text-format.md) | 棋谱文本格式：一行一命令、生成块显式化、值域键表、解析与应用分两层 | 已采纳 |
 | [0037](0037-engine-arbitrary-root-and-step-drive.md) | 引擎的任意局面与逐步驱动（会话模式）：在批引擎上加 set_root / begin_analysis / report_root / commit_step | 已采纳 |
 | [0038](0038-session-process-and-text-protocol.md) | 会话进程与文本协议（三层结构）：一行一命令、空行结束应答、棋谱是唯一事实源 | 已采纳 |

@@ -50,9 +50,13 @@ class SelfplayConfig:
     c_puct: float = 1.5
     temperature: float = 1.0
     temperature_moves: int = 30
-    # 记录里放几个树内节点（0 = 不采集，记录 192 字节；见 ADR 0041）。它是**格式参数**：
-    # 不改变任何一局的走法，但决定记录字节数，因此进清单、进续跑闸门、进 verify 重放。
-    tree_nodes: int = 0
+    # 记录里放几个树内节点（0 = 不采集）。它是**格式参数**：不改变任何一局的走法，但决定
+    # 记录字节数，因此进清单、进续跑闸门、进 verify 重放。
+    #
+    # **默认打开（ADR 0042 的订正）**：头被查询的位置 >90% 在搜索树内部，而监督面曾经只有
+    # 每步一个根——那是训练分布与部署分布错配，不是「值不值得付 2 倍存储」的取舍。一致性
+    # 优先，成本（记录 2.1 倍、价值前向行数 3 倍）接受并记账。
+    tree_nodes: int = 2
     cache_entries: int = 1 << 17
     shard_samples: int = 100000
     max_batch: int = 16384

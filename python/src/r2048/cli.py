@@ -219,8 +219,8 @@ def _build_parser() -> argparse.ArgumentParser:
     selfplay.add_argument(
         "--tree-nodes",
         type=int,
-        default=0,
-        help="记录里放几个搜索树内部节点（0 = 不采集；v3 记录格式，见 ADR 0041）",
+        default=2,
+        help="记录里放几个搜索树内部节点（0 = 不采集；默认 2，见 ADR 0041/0042）",
     )
     selfplay.add_argument("--shard-samples", type=int, default=100000)
     selfplay.add_argument("--max-batch", type=int, default=16384)
@@ -309,8 +309,8 @@ def _build_parser() -> argparse.ArgumentParser:
     iterate.add_argument(
         "--tree-nodes",
         type=int,
-        default=0,
-        help="记录里放几个搜索树内部节点（0 = 不采集；见 ADR 0041，v3 记录格式）",
+        default=2,
+        help="记录里放几个搜索树内部节点（0 = 不采集；默认 2，见 ADR 0041/0042）",
     )
     iterate.add_argument("--c-puct", type=float, default=1.5)
     iterate.add_argument("--device", default="cuda")

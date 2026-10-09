@@ -1,0 +1,129 @@
+/* 稳定的组件 ID 是样式边界，避免依赖 Gradio 生成的类名与 DOM 顺序。 */
+.gradio-container {
+  --studio-ink: #24352e; --studio-muted: #64746b; --studio-line: #dce4dc;
+  --studio-accent: #28634b;
+  width: 100% !important; max-width: 1280px !important; box-sizing: border-box;
+  margin: auto !important; padding: 28px !important;
+  background: #f5f6f1; color: var(--studio-ink);
+  font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+body { background: #f5f6f1; }
+.gradio-container main { padding: 0 !important; }
+.gradio-container .prose, .gradio-container input, .gradio-container button {
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+.r2048-brand { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; }
+.r2048-logo { display: grid; place-items: center; width: 58px; height: 58px;
+  background: #28634b; color: white; border-radius: 17px; font-size: 19px; font-weight: 800; }
+.r2048-brand h1 { margin: 0; font-size: 28px; letter-spacing: -.8px; color: #24352e; }
+.r2048-brand p { margin: 5px 0 0; font-size: 13px; color: #64746b; }
+.r2048-eyebrow { color: #28634b; font-size: 11px; font-weight: 700; letter-spacing: 1.8px; }
+.r2048-heading { margin: 0 0 8px; }
+.r2048-heading h2 { font-size: 19px; color: #24352e; margin: 5px 0; }
+.r2048-heading p { font-size: 13px; line-height: 1.7; color: #64746b; margin: 0; }
+#r2048-session, #r2048-play, #r2048-insight, #r2048-editor-controls,
+#r2048-editor-preview, #r2048-replay-controls, #r2048-replay-board {
+  background: #fff; border: 1px solid #dce4dc; border-radius: 20px; padding: 24px;
+  box-shadow: 0 4px 18px #24352e05; min-width: 0 !important; flex-wrap: nowrap;
+}
+#r2048-session { margin-bottom: 20px; }
+#r2048-connection-row, #r2048-settings-grid { align-items: flex-end; gap: 16px; }
+/* Gradio 会把相邻字段包进 form 并取消间距，行间距不会自动传到这些字段。 */
+#r2048-connection-row > .form, #r2048-settings-grid > .form {
+  gap: 16px; background: transparent !important; border: 0 !important;
+}
+#r2048-settings-grid > .form { display: grid; grid-template-columns: 2fr repeat(3, minmax(0, 1fr)); }
+#r2048-settings-grid .r2048-session-field { min-width: 0 !important; }
+#r2048-connection-actions { flex-direction: row; flex-wrap: nowrap; gap: 12px; align-items: flex-end; }
+#r2048-connection-actions button { min-width: 0; height: 42px; padding: 8px 12px; }
+#r2048-session .r2048-session-field { padding: 0 !important; border: 0 !important; }
+#r2048-session .r2048-session-field input[type="number"] { height: 42px; box-sizing: border-box; }
+#r2048-settings { border-top: 1px solid #dce4dc; padding-top: 20px; margin-top: 4px; gap: 12px; }
+.r2048-settings-title { font-size: 15px; font-weight: 600; color: #24352e; }
+.r2048-settings-help { font-size: 12px; line-height: 1.7; color: #64746b; }
+#r2048-tabs > .tab-nav { border-bottom: 1px solid #dce4dc; gap: 20px; margin-bottom: 22px; }
+#r2048-tabs > .tab-nav button { border: 0; background: transparent; border-radius: 0;
+  padding: 14px 4px; font-size: 15px; color: #64746b; }
+#r2048-tabs > .tab-nav button.selected { color: #28634b; border-bottom: 3px solid #28634b; }
+#r2048-workspace, #r2048-editor-layout, #r2048-replay-layout { gap: 22px; align-items: stretch; }
+#r2048-board, #r2048-editor-board, #r2048-replay-view { background: transparent; border: 0; padding: 0; }
+.r2048-board { max-width: 440px; margin: 0 auto; gap: 9px; padding: 14px;
+  border-radius: 16px; background: #b8aa9a; grid-template-columns: 18px repeat(4, 1fr); }
+.r2048-label { color: #fff; }
+.r2048-tile { border-radius: 10px; }
+.r2048-spawn { box-shadow: inset 0 0 0 3px #28634b; }
+#r2048-dpad { gap: 6px; width: 158px; margin: auto; }
+#r2048-dpad .row { gap: 6px; justify-content: center; flex-wrap: nowrap; }
+#r2048-dpad button { width: 46px; height: 42px; min-height: 42px; padding: 4px;
+  white-space: nowrap; border-radius: 12px; }
+#r2048-board-tools { margin-top: 16px; align-items: center; gap: 14px; }
+#r2048-board-tools > .r2048-control-hint { flex: 1; }
+.r2048-control-hint { font-size: 12px; color: #64746b; line-height: 1.8; }
+.r2048-control-hint strong { display: block; color: #24352e; font-size: 13px; }
+#r2048-actions { margin-top: 10px; }
+.gradio-container button { transition: background .15s, box-shadow .15s; }
+.gradio-container button.primary { background: #28634b !important; border-color: #28634b !important;
+  color: #fff !important; box-shadow: none !important; }
+.gradio-container button.primary:hover { background: #1f503c !important; }
+.gradio-container button.secondary { background: #f5f7f3; color: #24352e; border-color: #dce4dc; }
+.gradio-container button:focus-visible { outline: 3px solid #86b69b; outline-offset: 3px; }
+.gradio-container button:disabled { opacity: .45; cursor: not-allowed; }
+.r2048-chips { padding: 4px 0 14px; gap: 8px; }
+.r2048-chip { background: #eaf0e9; color: #4f6257; padding: 6px 11px; font-size: 12px; }
+.r2048-chip.key { background: #e1ebe3; color: #28634b; max-width: 100%; overflow-wrap: anywhere; }
+.r2048-empty { min-height: 250px; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; text-align: center; border: 1px dashed #dce4dc;
+  background: #fafbf8; border-radius: 14px; padding: 24px; }
+.r2048-empty-symbol { width: 48px; height: 48px; display: grid; place-items: center;
+  background: #e9efe6; color: #28634b; border-radius: 14px; font-size: 24px; margin-bottom: 14px; }
+.r2048-empty h3 { color: #24352e; font-size: 16px; margin: 0 0 8px; }
+.r2048-empty p { color: #64746b; font-size: 13px; line-height: 1.8; margin: 0; }
+.r2048-analysis-context { font-size: 12px; color: #64746b; margin-bottom: 12px; }
+.r2048-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px; margin: 0 0 18px; }
+.r2048-metric { background: #f5f7f3; border-radius: 12px; padding: 14px 12px; }
+.r2048-metric span { color: #64746b; font-size: 11px; display: block; margin-bottom: 5px; }
+.r2048-metric strong { color: #24352e; font-size: 21px; font-variant-numeric: tabular-nums; }
+.r2048-analysis-scroll { overflow-x: auto; width: 100%; }
+.r2048-panel { width: 100%; text-align: left; white-space: nowrap; }
+.gradio-container .r2048-panel, .gradio-container .r2048-panel th,
+.gradio-container .r2048-panel td { border: 0; }
+.gradio-container .r2048-panel td { border-bottom: 1px solid #edf0eb; }
+.r2048-panel th { background: #f5f7f3; color: #64746b; padding: 12px 9px; font-size: 11px; }
+.r2048-panel td { padding: 14px 9px; border-bottom: 1px solid #edf0eb; font-size: 13px; }
+.r2048-panel tr.chosen td { background: #eaf3eb; color: #28634b; }
+.r2048-panel tr.illegal td { color: #87938b; }
+.r2048-note { color: #64746b; font-size: 12px; line-height: 1.8; margin-top: 12px; }
+.r2048-err, .r2048-ok { padding: 12px 16px; border-radius: 12px; line-height: 1.6;
+  font-size: 13px; overflow-wrap: anywhere; }
+.r2048-err { background: #fff0ee; color: #a23f32; }
+.r2048-ok { background: #edf5ed; color: #28634b; }
+#r2048-feedback { min-height: 0; }
+#r2048-editor-grid { gap: 10px; }
+#r2048-editor-grid .row { flex-wrap: nowrap; gap: 8px; }
+#r2048-editor-grid .block { min-width: 0 !important; }
+#r2048-save { border-top: 1px solid #dce4dc; padding-top: 20px; margin-top: 20px; }
+.r2048-footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  color: #64746b; font-size: 11px; margin: 26px 0 8px; }
+.r2048-footer details { max-width: 100%; overflow-wrap: anywhere; }
+@media (max-width: 800px) {
+  #r2048-settings-grid > .form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .gradio-container { padding: 20px 14px !important; }
+  #r2048-workspace, #r2048-editor-layout, #r2048-replay-layout { flex-direction: column; }
+  /* 桌面的 flex 比例只分配宽度；改成纵向后必须恢复自然高度，否则内容会被挤出卡片。 */
+  #r2048-play, #r2048-insight, #r2048-editor-controls, #r2048-editor-preview,
+  #r2048-replay-controls, #r2048-replay-board { flex: none !important; width: 100%; }
+  #r2048-session, #r2048-play, #r2048-insight, #r2048-editor-controls,
+  #r2048-editor-preview, #r2048-replay-controls, #r2048-replay-board { padding: 18px; }
+  .r2048-brand h1 { font-size: 24px; }
+  .r2048-board { gap: 6px; padding: 10px; }
+  .r2048-d1, .r2048-d2 { font-size: clamp(24px, 7vw, 32px); }
+  .r2048-d4 { font-size: clamp(16px, 4vw, 21px); }
+  #r2048-tabs > .tab-nav { gap: 14px; }
+}
+@media (max-width: 480px) {
+  #r2048-settings-grid > .form { grid-template-columns: minmax(0, 1fr); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gradio-container button { transition: none; }
+}

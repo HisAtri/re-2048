@@ -8,10 +8,10 @@
 SHELL := /bin/bash
 ROOT  := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 
-# 三个目录都可以用环境变量覆盖；默认全部落在本地 ext4 上。
+# 构建与虚拟环境默认放在仓库外；数据和模型默认归档在仓库的 output/。
 WORK   ?= $(HOME)/r2048
 BUILD  ?= $(WORK)/build
-OUTPUT ?= $(WORK)/output
+OUTPUT ?= $(ROOT)/output
 VENV   ?= $(WORK)/venv
 
 PY    := $(VENV)/bin/python

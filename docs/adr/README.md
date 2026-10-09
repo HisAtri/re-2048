@@ -50,6 +50,8 @@ ADR 解释为什么整体是这个形状。
 | [0042](0042-tree-node-supervision-results.md) | 树内节点监督首轮实测：真实但微弱（+105，四档一致但只一档显著），贪心臂反而变差 | 已采纳（默认 K 经订正为 2：一致性优先于成本） |
 | [0043](0043-tree-node-independent-labels.md) | 树内节点的独立标注（记录 v4）：树内排序标签脱离当前头、共享续弈原语；默认采样由 0044 订正 | 已采纳（机制） |
 | [0044](0044-tree-label-ab-and-training-gates.md) | 独立树内标签的训练闸门、单变量 A/B 与默认配方验收 | 已采纳（rollout + top_visits） |
+| [0045](0045-webui-workspace-design.md) | Gradio 工作台设计系统、响应式布局与编辑复盘流程 | 已采纳 |
+| [0046](0046-project-output-root.md) | 数据集与模型默认归档在项目 output/ | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

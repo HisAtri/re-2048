@@ -17,8 +17,8 @@
 2. **工具链**：GCC 13（`-std=c++20`）、CMake ≥ 3.24、Ninja、ccache。cmake/ninja 用
    `uv tool install` 安装（无需 sudo，版本比 22.04 自带的 3.22 新），ccache 走 apt。
    `make env-check` 负责检测并打印缺失项的安装命令。
-3. **构建目录、虚拟环境、跑谱数据一律放在本地 ext4**（默认 `$HOME/r2048/{build,venv,output}`），
-   不放在 `/mnt/e`。三者都可用环境变量覆盖。
+3. **构建目录和虚拟环境默认放在本地 ext4**（`$HOME/r2048/{build,venv}`）；数据与模型
+   默认放在仓库的 `output/`（见 ADR 0046）。`BUILD`、`VENV` 和 `R2048_OUTPUT_DIR` 可覆盖。
 4. **CUDA 不进入 CMake**：GPU 只通过 PyTorch 使用。CUDA toolkit（本机 13.0）与
    `/usr/lib/wsl/lib` 的直通驱动仅用于诊断。未来若真要做 C++ 内置推理后端，
    再按 KataGo 的 `USE_BACKEND` 形态单独引入，并保留“无后端也能构建”的默认。
@@ -29,8 +29,9 @@
 ## 理由
 
 * 9p 挂载对 C++ 编译（大量小文件写入）与自对弈落盘（GB 级顺序写）都明显慢于本地 ext4；
-  ext4 根分区可用空间也更大。把三者移出仓库是零成本换性能。
-* 仓库仍在 `/mnt/e`，Windows 侧的编辑器与备份照旧可用——只有“产物”离开。
+  因此构建与虚拟环境外置。数据和模型则以项目内归档易用性优先，路径仍可重定向。
+* 仓库仍在 `/mnt/e`，Windows 侧的编辑器与备份照旧可用；高频构建文件留在 ext4，
+  实验产物按 ADR 0046 统一放在项目 `output/`。
 * 不引入 MSVC 分支：省掉的是两套编译器行为差异、`/arch:AVX2` 之类的第二套标志、
   以及每加一个 C++20 特性都要考虑 MSVC 支持度的负担。
 * CMake 里不出现 CUDA，是把 KataGo 最大的复杂度来源（7 个后端、cuDNN/TensorRT 探测、

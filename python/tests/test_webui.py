@@ -25,7 +25,7 @@ from r2048 import records
 from r2048.session import Session, SessionConfig
 from r2048.session_io import SessionClient, session_argv
 from r2048.webui import inventory
-from r2048.webui.app import render_analysis, render_board, render_status
+from r2048.webui.app import AppState, render_analysis, render_board, render_status
 
 
 @pytest.fixture(scope="module")
@@ -121,6 +121,52 @@ def test_analysis_labels_prior_and_engine_choice_separately() -> None:
     assert "策略头先验" in html, "先验必须被标成策略头的倾向，而不是引擎的选择"
     assert "引擎选招" in html
     assert "批组成与评测不同" in html, "口径差异必须显式出现，否则看的人会以为跟评测是同一个数"
+
+
+def test_analysis_context_and_narrow_table_are_explicit() -> None:
+    payload = {
+        "best_action": 0,
+        "simulations": 8,
+        "seconds": 0.1,
+        "root_value": 1,
+        "protocol": {"strategy": "search"},
+        "directions": [],
+    }
+    rendered = render_analysis(payload, context="上一步决策")
+    assert "上一步决策的搜索结果" in rendered
+    assert "r2048-analysis-scroll" in rendered and "aria-label='方向搜索分析'" in rendered
+    assert "Q（含立即分）" in rendered and "策略头先验" in rendered
+
+
+def test_attach_recreates_session_when_device_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from r2048.webui import app as webui_app
+
+    created = []
+
+    class FakeClient:
+        def __init__(self, argv) -> None:
+            self.argv = argv
+            self.closed = False
+            created.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(webui_app, "SessionClient", FakeClient)
+    monkeypatch.setattr(webui_app, "session_argv", lambda **kwargs: kwargs)
+    state = AppState()
+    state.attach("model.pt", "cpu", "search", 64, 0)
+    original = state.client
+    state.attach("model.pt", "cpu", "search", 64, 0)
+    assert state.client is original and len(created) == 1
+
+    state.attach("model.pt", "cuda", "search", 64, 0)
+    assert original.closed
+    assert state.client is not original and state.device == "cuda"
+    previous = state.client
+    state.attach("other-model.pt", "cuda", "search", 64, 0)
+    assert previous.closed and state.checkpoint == "other-model.pt"
+    state.close()
 
 
 def test_analysis_without_result_is_not_an_error() -> None:
@@ -382,15 +428,72 @@ def test_run_and_stop_share_one_slot() -> None:
 
     demo, state = _fresh_app()
     try:
+        state.last_state = {
+            "board": [1, 0, 0, 0] + [0] * 12,
+            "model_id": "test",
+            "device": "cpu",
+            "score": 0,
+            "moves": 0,
+            "max_face": 2,
+            "seed": 1,
+            "empty": False,
+            "terminal": False,
+        }
         buttons = [b for b in demo.blocks.values() if type(b).__name__ == "Button"]
         start = next(b for b in buttons if str(b.value).startswith("▶"))
         stop = next(b for b in buttons if str(b.value).startswith("■"))
         assert start.visible is True and stop.visible is False, "初始只该看到「自动执行」"
+        stop_handler = next(d for d in demo.fns.values() if d.fn.__name__ == "on_auto_stop")
+        assert stop_handler.queue is False, "停止不能等待自动执行的生成器退出"
 
         descriptor = next(d for d in demo.fns.values() if d.fn.__name__ == "on_auto_start")
         first = next(descriptor.fn(*[_dummy(component) for component in descriptor.inputs]))
         assert first[4]["visible"] is False, "开始执行后「自动执行」要藏起来"
         assert first[5]["visible"] is True, "并露出「停止」"
         assert all(update["interactive"] is False for update in first[6:]), "自动执行期间手动控件要置灰"
+    finally:
+        state.close()
+
+
+def test_editor_preview_and_failed_replay_do_not_keep_stale_positions() -> None:
+    pytest.importorskip("gradio", reason="webui 是可选组件（ADR 0039）")
+    demo, state = _fresh_app()
+    try:
+        handlers = {descriptor.fn.__name__: descriptor.fn for descriptor in demo.fns.values()}
+        rendered = handlers["on_editor_preview"]("2048", *[records.EMPTY_TOKEN] * 15)
+        assert ">2048<" in rendered and int(state.editor[0]) == 11
+        assert "<style>" not in rendered, "实时预览不能每次重新注入全局样式"
+        state.replay = [records.Clear()]
+        state.replay_upto = 1
+        slider, _, message = handlers["on_replay_load"](None)
+        assert not state.replay and state.replay_upto == 0
+        assert slider["interactive"] is False and 'role="alert"' in message
+        exported = handlers["on_export"]()
+        assert "请先载入棋谱" in exported[-1]
+    finally:
+        state.close()
+
+
+def test_auto_execution_rejects_empty_or_terminal_positions() -> None:
+    pytest.importorskip("gradio", reason="webui 是可选组件（ADR 0039）")
+    demo, state = _fresh_app()
+    try:
+        descriptor = next(d for d in demo.fns.values() if d.fn.__name__ == "on_auto_start")
+        values = [_dummy(component) for component in descriptor.inputs]
+        for condition, message in (("empty", "盘面为空"), ("terminal", "已终局")):
+            state.last_state = {
+                "board": [0] * 16 if condition == "empty" else [1] * 16,
+                "model_id": "test",
+                "device": "cpu",
+                "score": 0,
+                "moves": 0,
+                "max_face": 2,
+                "seed": 1,
+                "empty": condition == "empty",
+                "terminal": condition == "terminal",
+            }
+            frame = next(descriptor.fn(*values))
+            assert message in frame[3]
+            assert state.auto_running is False
     finally:
         state.close()

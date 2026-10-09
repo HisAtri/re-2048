@@ -10,7 +10,7 @@
   「停止」，停下来再变回来（靠 `visible` 互换；不能只用一个按钮，因为 Gradio 会把同一控件的
   第二次点击排进队列，那样"停止"就点不动了）。自动执行期间手动控件置灰。
 * **设置改动立即生效**：每次分析/落子前都把设置发给会话，所以没有"应用设置"这一步。
-  不常用的旋钮（模拟数、限时、自走间隔）收进折叠面板，主视图只留模型、设备与策略。
+  模拟数、限时、自走间隔常驻显示，方便在分析时核对；说明文字放在字段行下方以保持对齐。
 * **自动执行与分析都是流式的**：一次生成器调用里逐帧 yield，浏览器只维持一条长连接。
   曾经用 `gr.Timer` 每 250ms 打一次会话，实测一屏 50 req/s 的请求洪水（ADR 0039 决策 4）。
 """
@@ -20,6 +20,7 @@ from __future__ import annotations
 import html
 import threading
 import time
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -104,7 +105,9 @@ def _chip(text: str, tone: str = "", bold: str = "") -> str:
     return f'<span class="r2048-chip {tone}">{body}</span>'
 
 
-def render_status(state: dict | None, settings: dict | None = None, running: bool = False) -> str:
+def render_status(
+    state: dict | None, settings: dict | None = None, running: bool = False, *, include_styles: bool = True
+) -> str:
     """一行状态：玩的是什么（模型/设备/策略）、走到哪了（分数/步数/最大块）、能不能走。
 
     状态放在一块，是因为"我现在看着哪个模型、什么口径"必须一眼可见——它决定了屏幕上的数字
@@ -115,7 +118,7 @@ def render_status(state: dict | None, settings: dict | None = None, running: boo
         parts.append(_chip("自动执行中", "ok"))
     if not state:
         parts.append(_chip("会话未连接", "muted"))
-        return _STYLE + f'<div class="r2048-chips">{"".join(parts)}</div>'
+        return (_STYLE if include_styles else "") + f'<div class="r2048-chips">{"".join(parts)}</div>'
     settings = settings or {}
     parts.append(_chip((state.get("model_id") or "-").split("+")[0], "key"))
     parts.append(_chip(state.get("device", "")))
@@ -125,7 +128,7 @@ def render_status(state: dict | None, settings: dict | None = None, running: boo
         )
     )
     parts.append(_chip(f"得分 {state['score']} · 步数 {state['moves']} · 最大块 {state['max_face'] or '-'}"))
-    if state.get("seed"):
+    if state.get("seed") is not None:
         parts.append(_chip(f"种子 {state['seed']}"))
     if state.get("empty"):
         parts.append(_chip("空盘面 · 点「新开一局」开始", "warn"))
@@ -133,7 +136,7 @@ def render_status(state: dict | None, settings: dict | None = None, running: boo
         parts.append(_chip("终局", "bad"))
     else:
         parts.append(_chip("可走", "ok"))
-    return _STYLE + f'<div class="r2048-chips">{"".join(parts)}</div>'
+    return (_STYLE if include_styles else "") + f'<div class="r2048-chips">{"".join(parts)}</div>'
 
 
 def _font_class(face: int) -> str:
@@ -146,13 +149,14 @@ def render_board(
     best_action: int | None = None,
     spawn_index: int | None = None,
     note: str = "",
+    include_styles: bool = True,
 ) -> str:
     """棋盘组件：4×4 网格 + 行列坐标（a..d 是列、1..4 是行，a1 在左上）。
 
     坐标必须在棋盘上显示出来——手摆与复盘时用户要能对着棋谱文字数格子（ADR 0036 决策 4）。
     """
     cells = np.asarray(board, dtype=np.uint8).reshape(-1)
-    parts = [_STYLE, '<div class="r2048-board">', '<div class="r2048-label"></div>']
+    parts = [_STYLE if include_styles else "", '<div class="r2048-board">', '<div class="r2048-label"></div>']
     parts += [f'<div class="r2048-label">{chr(ord("a") + column)}</div>' for column in range(4)]
     for row in range(4):
         parts.append(f'<div class="r2048-label">{row + 1}</div>')
@@ -181,17 +185,19 @@ def render_board(
     return "".join(parts)
 
 
-def render_analysis(payload: dict | None) -> str:
+def render_analysis(payload: dict | None, *, context: str = "当前局面", include_styles: bool = True) -> str:
     """分析面板。
 
     **"策略头先验"与"引擎选招"分开标**：项目从一开始就不让探针做 argmax（选招口径只有引擎
     一处，见 ADR 0006），所以先验只是"策略头觉得哪个方向好"，引擎真走哪一步看选招。
     另外会话的批组成与评测不同（单盘面，ADR 0017），这件事跟着结果一起标出来。
     """
+    stylesheet = _STYLE if include_styles else ""
     if not payload:
         return (
-            f'{_STYLE}<div class="r2048-note">还没有分析结果：'
-            "点「新开一局」或摆好盘面，再点「分析当前局面」</div>"
+            f'{stylesheet}<div class="r2048-empty"><div class="r2048-empty-symbol" aria-hidden="true">↗</div>'
+            "<h3>还没有分析结果</h3><p>先连接会话，再点「新开一局」或发送一个局面。"
+            "<br>点击「分析当前局面」，比较四个方向的搜索结果。</p></div>"
         )
     rows = []
     for direction in payload["directions"]:
@@ -219,11 +225,19 @@ def render_analysis(payload: dict | None) -> str:
     )
     note = protocol.get("note", "")
     return (
-        _STYLE + "<table class='r2048-panel'>"
-        "<tr><th>方向</th><th>合法</th><th>访问数</th><th>Q（含立即分）</th>"
-        "<th>r + A(u)</th><th>策略头先验</th></tr>"
+        stylesheet
+        + f'<div class="r2048-analysis-context">{html.escape(context)}的搜索结果</div>'
+        + '<div class="r2048-metrics">'
+        + f'<div class="r2048-metric"><span>实际模拟</span><strong>{payload["simulations"]:,}</strong></div>'
+        + f'<div class="r2048-metric"><span>搜索耗时</span><strong>{payload["seconds"]:.3f}s</strong></div>'
+        + f'<div class="r2048-metric"><span>根值</span><strong>{payload["root_value"]:.0f}</strong></div></div>'
+        + "<div class='r2048-analysis-scroll' tabindex='0' aria-label='方向搜索分析'>"
+        + "<table class='r2048-panel'><thead>"
+        "<tr><th scope='col'>方向</th><th scope='col'>合法</th><th scope='col'>访问数</th>"
+        "<th scope='col'>Q（含立即分）</th><th scope='col'>r + A(u)</th>"
+        "<th scope='col'>策略头先验</th></tr></thead><tbody>"
         + "".join(rows)
-        + "</table>"
+        + "</tbody></table></div>"
         + f'<div class="r2048-note">{html.escape(footer)}'
         + (f"<br>{html.escape(str(note))}" if note else "")
         + "</div>"
@@ -236,6 +250,8 @@ class AppState:
     def __init__(self) -> None:
         self.client: SessionClient | None = None
         self.checkpoint = ""
+        self.device = ""
+        self.settings: dict = {}
         self.lock = threading.Lock()
         self.last_move_at = 0.0
         self.auto_running = False
@@ -248,7 +264,7 @@ class AppState:
         self.last_state: dict | None = None
 
     def attach(self, checkpoint: str, device: str, strategy: str, simulations: int, time_ms: int) -> None:
-        if self.client is not None and checkpoint == self.checkpoint:
+        if self.client is not None and checkpoint == self.checkpoint and device == self.device:
             return  # 同一个模型不重建会话：重建会丢掉当前盘面与棋谱
         self.close()
         self.client = SessionClient(
@@ -261,6 +277,7 @@ class AppState:
             )
         )
         self.checkpoint = checkpoint
+        self.device = device
         self.last_state = None
 
     def close(self) -> None:
@@ -302,107 +319,280 @@ def build_app(state: AppState | None = None):
         state.call(f"set_strategy {STRATEGY_LABELS[strategy_label]}")
         state.call(f"set_simulations {max(0, int(simulations or 0))}")
         state.call(f"set_time_ms {max(0, int(time_ms or 0))}")
-        return {
+        state.settings = {
             "strategy": STRATEGY_LABELS[strategy_label],
             "simulations": max(0, int(simulations or 0)),
         }
+        return state.settings
 
-    with gr.Blocks(title="re-2048") as demo:
-        gr.Markdown(f"**re-2048** · 输出根 `{paths.output_root()}`")
+    # 页面只加载一次样式；独立渲染函数保留自带样式，供报告和无浏览器验证使用。
+    board_view = partial(render_board, include_styles=False)
+    status_view = partial(render_status, include_styles=False)
+    analysis_view = partial(render_analysis, include_styles=False)
+    ui_html = partial(gr.HTML, padding=False)
 
+    def heading(kicker, title, description):
+        return (
+            f'<div class="r2048-heading"><span class="r2048-eyebrow">{kicker}</span>'
+            f"<h2>{title}</h2><p>{description}</p></div>"
+        )
+
+    css = _STYLE.removeprefix("<style>").removesuffix("</style>")
+    css += Path(__file__).with_name("workspace.css").read_text(encoding="utf-8")
+    theme = gr.themes.Soft(
+        primary_hue="emerald",
+        neutral_hue="slate",
+        radius_size="lg",
+        font=["Segoe UI", "Microsoft YaHei", "system-ui", "sans-serif"],
+    ).set(
+        body_background_fill="#f5f6f1",
+        body_text_color="#24352e",
+        body_text_color_subdued="#64746b",
+        block_label_background_fill="transparent",
+        block_label_text_color="#24352e",
+        block_label_padding="0",
+        block_label_margin="0",
+        block_label_text_size="13px",
+        input_border_color="#dce4dc",
+        input_border_width="1px",
+        input_shadow="none",
+        input_shadow_focus="0 0 0 2px #86b69b",
+        button_secondary_shadow="none",
+        button_secondary_shadow_hover="none",
+        block_title_background_fill="transparent",
+        block_title_text_color="#24352e",
+        block_title_padding="0",
+    )
+    # 棋盘沿用标准 2048 配色，控件也统一为纸面主题，避免系统暗色把输入区变成另一套色板。
+    theme.set(
+        **{
+            key: getattr(theme, key[:-5])
+            for key in vars(theme)
+            if key.endswith("_dark") and key[:-5] in vars(theme)
+        }
+    )
+    js = Path(__file__).with_name("workspace.js").read_text(encoding="utf-8")
+    with gr.Blocks(title="re-2048 · 对局工作台", theme=theme, css=css, js=js) as demo:
+        ui_html(
+            '<header class="r2048-brand"><div class="r2048-logo">2048</div><div>'
+            "<h1>对局工作台</h1><p>re-2048 / 探索局面，理解每一步决策</p></div></header>"
+        )
         models = inventory.list_models()
-        with gr.Row():
-            model_box = gr.Dropdown(
-                choices=[entry.label() for entry in models],
-                value=inventory.default_model(models),
-                label="模型（相对输出根的路径；可直接输入过滤）",
-                scale=5,
-            )
-            device_box = gr.Dropdown(choices=["cpu", "cuda"], value="cpu", label="设备", scale=1)
-            connect = gr.Button("连接模型", variant="primary", scale=1)
-            refresh_models = gr.Button("重新扫描", scale=1)
-        with gr.Accordion("搜索设置（改动立即生效）", open=False), gr.Row():
-            strategy_box = gr.Dropdown(
-                choices=list(STRATEGY_LABELS), value="搜索（NN-MCTS）", label="AI 策略", scale=2
-            )
-            sims_box = gr.Number(value=256, precision=0, label="搜索模拟数（0 = 不限）", scale=1)
-            time_box = gr.Number(value=0, precision=0, label="最大搜索时间 毫秒（0 = 不限）", scale=1)
-            interval_box = gr.Number(value=2000, precision=0, label="自走间隔 毫秒（≥100）", scale=1)
-            include_resume = gr.Checkbox(value=False, label="模型列表含续跑点 last.pt", scale=1)
-
-        with gr.Tabs():
-            with gr.Tab("计算 / 分析"), gr.Row():
-                # 左：棋盘 + 方向键 + 动作。方向键与棋盘是**同一件事**，摆在一起——上一版把方向键
-                # 单独放一行，结果整块被挤到折线以下，一进页面根本看不到它。
-                with gr.Column(scale=0, min_width=470):
-                    status_html = gr.HTML(render_status(None))
-                    with gr.Row(equal_height=False):
-                        board_html = gr.HTML(render_board(np.zeros(16, dtype=np.uint8)))
-                        with gr.Column(scale=0, min_width=130, elem_id="r2048-dpad"):
-                            dpad_up = gr.Button(DIRECTION_LABELS["up"], min_width=44)
-                            with gr.Row():
-                                dpad_left = gr.Button(DIRECTION_LABELS["left"], min_width=44)
-                                dpad_right = gr.Button(DIRECTION_LABELS["right"], min_width=44)
-                            dpad_down = gr.Button(DIRECTION_LABELS["down"], min_width=44)
-                    direction_buttons = [dpad_up, dpad_right, dpad_down, dpad_left]
-                    with gr.Row():
-                        newgame_btn = gr.Button("新开一局", variant="primary", min_width=96)
-                        analyze_btn = gr.Button("分析当前局面", min_width=96)
-                        undo_btn = gr.Button("撤销一步", min_width=84)
-                        clear_btn = gr.Button("清空", min_width=64)
-                    with gr.Row():
-                        # 运行与停止**同一个位置**：点自动执行之后它变成停止，停下来再变回来。
-                        auto_start = gr.Button("▶ 自动执行", variant="primary")
-                        auto_stop = gr.Button("■ 停止", variant="stop", visible=False)
-                # 右：分析结果。这是"看着数字决定下一步"的地方，给足宽度。
-                with gr.Column(scale=1, min_width=430):
-                    analysis_html = gr.HTML(render_analysis(None))
-                    with gr.Row():
-                        record_name = gr.Textbox(value="game", label="棋谱名", scale=3)
-                        save_btn = gr.Button("保存棋谱", scale=1, min_width=90)
-                    note_html = gr.HTML()
-
-            with gr.Tab("棋盘编辑器"):
-                gr.Markdown(
-                    "手摆一个局面发到计算页（「新开一局」与之无关：那是标准开局）。"
-                    "**没有合法方向的局面会被拒绝**；上限 131072（2^17，4×4 的理论上界）。"
+        with gr.Column(elem_id="r2048-session"):
+            ui_html(
+                heading(
+                    "SESSION",
+                    "模型与会话",
+                    "选择模型和运行设备，连接后开始对局。更换模型或设备后请重新连接。",
                 )
-                tile_boxes: list = []
-                face_choices = [records.EMPTY_TOKEN] + [
-                    str(1 << exponent) for exponent in range(1, records.MAX_EXPONENT + 1)
-                ]
-                for row in range(4):
-                    with gr.Row():
-                        for column in range(4):
-                            tile_boxes.append(
-                                gr.Dropdown(
-                                    choices=face_choices,
-                                    value=records.EMPTY_TOKEN,
-                                    label=f"{chr(ord('a') + column)}{row + 1}",
-                                    scale=1,
-                                )
+            )
+            with gr.Row(elem_id="r2048-connection-row"):
+                model_box = gr.Dropdown(
+                    choices=[entry.label() for entry in models],
+                    value=inventory.default_model(models) or None,
+                    label="模型",
+                    scale=6,
+                    min_width=240,
+                    elem_classes=["r2048-session-field"],
+                )
+                device_box = gr.Dropdown(
+                    choices=[("CPU", "cpu"), ("CUDA · GPU", "cuda")],
+                    value="cpu",
+                    label="运行设备",
+                    scale=1,
+                    min_width=130,
+                    elem_classes=["r2048-session-field"],
+                )
+                with gr.Column(scale=2, min_width=300, elem_id="r2048-connection-actions"):
+                    connect = gr.Button("连接 / 重新连接", variant="primary")
+                    refresh_models = gr.Button("刷新模型列表")
+            ui_html(
+                '<div class="r2048-settings-help">模型支持输入关键词筛选，名称包含训练目录与目标。'
+                "更换模型或设备会重建会话，请先保存需要保留的棋谱。</div>"
+            )
+            with gr.Column(elem_id="r2048-settings"):
+                ui_html('<div class="r2048-settings-title">搜索与执行设置</div>')
+                with gr.Row(elem_id="r2048-settings-grid"):
+                    strategy_box = gr.Dropdown(
+                        choices=list(STRATEGY_LABELS),
+                        value="搜索（NN-MCTS）",
+                        label="决策策略",
+                        scale=2,
+                        min_width=200,
+                        elem_classes=["r2048-session-field"],
+                    )
+                    sims_box = gr.Number(
+                        value=256,
+                        precision=0,
+                        minimum=0,
+                        label="模拟预算",
+                        min_width=130,
+                        elem_classes=["r2048-session-field"],
+                    )
+                    time_box = gr.Number(
+                        value=0,
+                        precision=0,
+                        minimum=0,
+                        label="搜索限时 / ms",
+                        min_width=130,
+                        elem_classes=["r2048-session-field"],
+                    )
+                    interval_box = gr.Number(
+                        value=2000,
+                        precision=0,
+                        minimum=100,
+                        label="自动落子间隔 / ms",
+                        min_width=150,
+                        elem_classes=["r2048-session-field"],
+                    )
+                ui_html(
+                    '<div class="r2048-settings-help">模拟预算与搜索限时设为 0 表示不限；'
+                    "落子间隔控制最快速度，最小 100 ms。参数在下一次分析或落子时生效。</div>"
+                )
+                include_resume = gr.Checkbox(value=False, label="显示续跑 checkpoint（last.pt）")
+
+        with gr.Tabs(elem_id="r2048-tabs") as tabs:
+            with gr.Tab("对局与分析", id="play"):
+                status_html = ui_html(status_view(None))
+                note_html = ui_html(elem_id="r2048-feedback")
+                with gr.Row(elem_id="r2048-workspace"):
+                    with gr.Column(scale=5, min_width=300, elem_id="r2048-play"):
+                        ui_html(
+                            heading(
+                                "BOARD", "当前局面", "绿色边框标记最近生成的数字块。坐标从左上角 a1 开始。"
                             )
-                with gr.Row():
-                    editor_new = gr.Button("清空编辑器")
-                    editor_to_game = gr.Button("发送到计算页", variant="primary")
+                        )
+                        with gr.Row():
+                            newgame_btn = gr.Button("新开一局", min_width=110)
+                            auto_start = gr.Button("▶ 自动执行", variant="primary", min_width=110)
+                            auto_stop = gr.Button("■ 停止", variant="stop", visible=False, min_width=110)
+                        board_html = ui_html(board_view(np.zeros(16, dtype=np.uint8)), elem_id="r2048-board")
+                        with gr.Row(elem_id="r2048-board-tools"):
+                            ui_html(
+                                '<div class="r2048-control-hint"><strong>手动落子</strong>方向按钮或键盘 ↑ ↓ ← →</div>'
+                            )
+                            with gr.Column(scale=0, min_width=158, elem_id="r2048-dpad"):
+                                dpad_up = gr.Button("↑ 上", min_width=46, elem_id="r2048-up")
+                                with gr.Row():
+                                    dpad_left = gr.Button("← 左", min_width=46, elem_id="r2048-left")
+                                    dpad_right = gr.Button("右 →", min_width=46, elem_id="r2048-right")
+                                dpad_down = gr.Button("↓ 下", min_width=46, elem_id="r2048-down")
+                        direction_buttons = [dpad_up, dpad_right, dpad_down, dpad_left]
+                        with gr.Row(elem_id="r2048-actions"):
+                            undo_btn = gr.Button("撤销一步", min_width=110)
+                            clear_btn = gr.Button("清空局面", min_width=110)
+                    with gr.Column(scale=7, min_width=300, elem_id="r2048-insight"):
+                        ui_html(
+                            heading(
+                                "INSIGHT", "决策分析", "查看引擎选招及方向评分，策略头先验仅表示模型倾向。"
+                            )
+                        )
+                        analyze_btn = gr.Button("分析当前局面", variant="primary")
+                        analysis_html = ui_html(analysis_view(None))
+                        with gr.Accordion("如何阅读指标", open=False):
+                            gr.Markdown(
+                                "**访问数**：搜索分配给该方向的次数。**Q**：含立即得分的搜索均值。"
+                                "**r + A(u)**：立即得分与一步估值之和。**策略头先验**：模型的方向倾向。"
+                                "引擎选招以标记为准；交互分析的批组成与离线评测不同。"
+                            )
+                        with gr.Row(elem_id="r2048-save"):
+                            record_name = gr.Textbox(value="game", label="棋谱名称", scale=3, min_width=160)
+                            save_btn = gr.Button("保存棋谱", scale=1, min_width=100)
 
-            with gr.Tab("复盘"):
-                gr.Markdown(
-                    "载入一份棋谱逐步回放。回放喂的是棋谱里的 `set`，**不重新生成块**——"
-                    "这正是棋谱不含随机性（ADR 0036 决策 3）的用处。"
-                )
-                with gr.Row():
-                    record_box = gr.Dropdown(label="棋谱（扫 records/）", scale=3)
-                    refresh_records = gr.Button("重新扫描", scale=1)
-                    replay_load = gr.Button("载入", variant="primary", scale=1)
-                    export_btn = gr.Button("以当前局面开新一局", scale=1)
-                replay_slider = gr.Slider(minimum=0, maximum=1, value=0, step=1, label="步进")
-                replay_html = gr.HTML()
-                replay_note = gr.HTML()
+            with gr.Tab("局面编辑", id="editor"), gr.Row(elem_id="r2048-editor-layout"):
+                with gr.Column(scale=6, min_width=300, elem_id="r2048-editor-controls"):
+                    ui_html(
+                        heading("COMPOSE", "摆一个局面", "按坐标选择数字，右侧同步预览。空格表示无数字块。")
+                    )
+                    tile_boxes: list = []
+                    face_choices = [("空", records.EMPTY_TOKEN)] + [
+                        (str(1 << exponent), str(1 << exponent))
+                        for exponent in range(1, records.MAX_EXPONENT + 1)
+                    ]
+                    with gr.Column(elem_id="r2048-editor-grid"):
+                        for row in range(4):
+                            with gr.Row():
+                                for column in range(4):
+                                    tile_boxes.append(
+                                        gr.Dropdown(
+                                            choices=face_choices,
+                                            value=records.EMPTY_TOKEN,
+                                            label=f"{chr(ord('a') + column)}{row + 1}",
+                                            scale=1,
+                                            min_width=0,
+                                            filterable=False,
+                                        )
+                                    )
+                    with gr.Row():
+                        editor_new = gr.Button("清空编辑器")
+                        editor_to_game = gr.Button("发送到对局", variant="primary")
+                    editor_note = ui_html(
+                        '<div class="r2048-note">数字上限 131072。发送后可在对局页分析或继续走棋。</div>'
+                    )
+                with gr.Column(scale=5, min_width=300, elem_id="r2048-editor-preview"):
+                    ui_html(heading("PREVIEW", "局面预览", "检查数字与位置，确认后发送到对局工作台。"))
+                    editor_board = ui_html(board_view(state.editor), elem_id="r2048-editor-board")
+
+            with gr.Tab("棋谱复盘", id="replay"), gr.Row(elem_id="r2048-replay-layout"):
+                with gr.Column(scale=5, min_width=300, elem_id="r2048-replay-controls"):
+                    ui_html(
+                        heading(
+                            "REPLAY",
+                            "回看每一步",
+                            "载入已保存的棋谱，拖动进度查看局面，或从某个局面继续对局。",
+                        )
+                    )
+                    record_entries = inventory.list_records()
+                    record_box = gr.Dropdown(
+                        choices=[entry.label() for entry in record_entries],
+                        label="棋谱",
+                        value=None,
+                        info="在对局页保存棋谱后刷新列表",
+                    )
+                    with gr.Row():
+                        replay_load = gr.Button("载入棋谱", variant="primary")
+                        refresh_records = gr.Button("刷新列表")
+                    replay_slider = gr.Slider(
+                        minimum=0, maximum=1, value=0, step=1, label="记录位置", interactive=False
+                    )
+                    with gr.Row():
+                        replay_prev = gr.Button("← 上一条")
+                        replay_next = gr.Button("下一条 →")
+                    replay_note = ui_html(
+                        '<div class="r2048-note">尚未载入棋谱。记录位置包含开局与数字生成；实际步数会单独显示。</div>'
+                    )
+                    export_btn = gr.Button("从此局面继续对局")
+                with gr.Column(scale=6, min_width=300, elem_id="r2048-replay-board"):
+                    ui_html(heading("POSITION", "回放局面", "按棋谱还原数字块，保留每一步的真实位置。"))
+                    replay_html = ui_html(
+                        board_view(np.zeros(16, dtype=np.uint8)), elem_id="r2048-replay-view"
+                    )
+
+        ui_html(
+            '<footer class="r2048-footer"><span>re-2048 · 对局 / 分析 / 复盘</span>'
+            f"<details><summary>存储位置</summary>{html.escape(str(paths.output_root()))}</details></footer>"
+        )
 
         # ---- 回调 -----------------------------------------------------------
 
-        manual = [newgame_btn, analyze_btn, undo_btn, clear_btn, *direction_buttons]
+        manual = [
+            newgame_btn,
+            analyze_btn,
+            undo_btn,
+            clear_btn,
+            *direction_buttons,
+            connect,
+            model_box,
+            device_box,
+            refresh_models,
+            include_resume,
+            strategy_box,
+            sims_box,
+            time_box,
+            interval_box,
+            editor_to_game,
+            export_btn,
+        ]
         outputs = [
             board_html,
             status_html,
@@ -428,21 +618,35 @@ def build_app(state: AppState | None = None):
                     spawn = int(step["spawn_index"])
             board = current["board"] if current else [0] * records.BOARD_CELLS
             return (
-                render_board(board, best_action=(report or {}).get("best_action"), spawn_index=spawn),
-                render_status(current, settings, running=running),
-                render_analysis(report),
-                f'<div class="r2048-note">{html.escape(note)}</div>' if note else "",
+                # 落子帧的分析属于移动前的根，不能把旧方向标在移动后的棋盘上。
+                board_view(
+                    board,
+                    best_action=None if spawn is not None else (report or {}).get("best_action"),
+                    spawn_index=spawn,
+                ),
+                status_view(current, settings or state.settings, running=running),
+                analysis_view(report, context="上一步决策" if spawn is not None else "当前局面"),
+                f'<div class="r2048-note" role="status">{html.escape(note)}</div>' if note else "",
                 gr.update(visible=not running),
                 gr.update(visible=running),
                 *[gr.update(interactive=not running) for _ in manual],
             )
 
         def fail(error: Exception):
-            return view([], str(error))
+            result = list(view([]))
+            result[3] = f'<div class="r2048-err" role="alert">{html.escape(str(error))}</div>'
+            return tuple(result)
 
-        def on_refresh_models(include_resume):
+        def on_identity_change():
+            return '<div class="r2048-note" role="status">选择已更改，请重新连接以使用当前模型与设备。</div>'
+
+        def on_refresh_models(include_resume, selected):
             found = inventory.list_models(include_resume=include_resume)
-            return gr.update(choices=[entry.label() for entry in found], value=inventory.default_model(found))
+            choices = [entry.label() for entry in found]
+            return gr.update(
+                choices=choices,
+                value=selected if selected in choices else inventory.default_model(found) or None,
+            )
 
         def on_connect(model_label, include_resume, device, strategy_label, simulations, time_ms):
             entry = inventory.find_model(model_label, include_resume=include_resume) if model_label else None
@@ -459,7 +663,7 @@ def build_app(state: AppState | None = None):
                     settings = apply_settings(strategy_label, simulations, time_ms)
                     frames = state.call("state")
                 note = (
-                    "已连接；盘面是空的——点「新开一局」开始一局标准对局"
+                    "已连接；点「新开一局」开始对局，或继续操作当前局面"
                     if checkpoint
                     else "没有选模型：编辑与复盘可用，分析与落子会报错"
                 )
@@ -529,9 +733,9 @@ def build_app(state: AppState | None = None):
             try:
                 with state.lock:
                     state.call(f"save {target}")
-                return f'<div class="r2048-ok">已写入 {html.escape(str(target))}</div>'
+                return f'<div class="r2048-ok" role="status">已写入 {html.escape(str(target))}</div>'
             except (SessionError, RuntimeError) as error:
-                return f'<div class="r2048-err">{html.escape(str(error))}</div>'
+                return f'<div class="r2048-err" role="alert">{html.escape(str(error))}</div>'
 
         def on_auto_start(strategy_label, simulations, time_ms, interval_ms):
             """自动执行：**一次生成器调用**里每一步流式推给界面，不轮询。
@@ -541,6 +745,12 @@ def build_app(state: AppState | None = None):
             """
             if state.auto_running:
                 yield view([], "已经在自动执行")
+                return
+            if not state.last_state or state.last_state.get("empty"):
+                yield view([], "盘面为空：请连接会话并新开一局")
+                return
+            if state.last_state.get("terminal"):
+                yield view([], "已终局：请新开一局或撤销一步")
                 return
             state.auto_running = True
             state.auto_stop = False
@@ -554,24 +764,39 @@ def build_app(state: AppState | None = None):
                         frames = state.call("genmove")
                         state.last_move_at = time.monotonic()
                     yield view(frames, f"自动执行中（间隔 {interval * 1000:.0f} ms）", settings)
+                    if state.last_state and state.last_state.get("terminal"):
+                        break
                     remaining = interval - (time.monotonic() - state.last_move_at)
                     if remaining > 0:
                         time.sleep(remaining)
             except (SessionError, RuntimeError) as error:
                 state.auto_running = False
-                yield view([], str(error))
+                yield fail(error)
                 return
             finally:
                 state.auto_running = False
-            yield view([], "自动执行已停止")
+            yield view(
+                [],
+                "对局已结束" if state.last_state and state.last_state.get("terminal") else "自动执行已停止",
+            )
 
         def on_auto_stop():
             state.auto_stop = True
-            return '<div class="r2048-note">正在停止（走完当前这一步）…</div>'
+            return '<div class="r2048-note" role="status">正在停止（走完当前这一步）…</div>'
 
         def on_editor_new():
             state.editor = np.zeros(records.BOARD_CELLS, dtype=np.uint8)
-            return [gr.update(value=records.EMPTY_TOKEN) for _ in range(16)]
+            return [*[gr.update(value=records.EMPTY_TOKEN) for _ in range(16)], board_view(state.editor)]
+
+        def on_editor_preview(*values):
+            state.editor = np.array(
+                [
+                    records.FACE_TO_EXPONENT[str(value)] if value and value != records.EMPTY_TOKEN else 0
+                    for value in values
+                ],
+                dtype=np.uint8,
+            )
+            return board_view(state.editor)
 
         def on_editor_send(*values):
             board = np.zeros(records.BOARD_CELLS, dtype=np.uint8)
@@ -587,12 +812,22 @@ def build_app(state: AppState | None = None):
             ]
             try:
                 with state.lock:
+                    if state.client is None:
+                        state.attach("", "cpu", "search", 256, 0)
                     frames: list[dict] = []
                     for command in commands:
                         frames = state.call(command)
-                return view(frames, "已发送到计算页")
+                return (
+                    *view(frames, "已发送到对局页"),
+                    gr.update(selected="play"),
+                    '<div class="r2048-ok" role="status">局面已发送</div>',
+                )
             except (SessionError, RuntimeError) as error:
-                return fail(error)
+                return (
+                    *fail(error),
+                    gr.update(),
+                    f'<div class="r2048-err" role="alert">{html.escape(str(error))}</div>',
+                )
 
         def on_refresh_records():
             labels = [entry.label() for entry in inventory.list_records()]
@@ -606,26 +841,31 @@ def build_app(state: AppState | None = None):
 
         def on_replay_load(label: str):
             path = _record_path(label)
+            # 载入失败必须撤销旧回放，否则空预览旁的「继续对局」会发送上一份棋谱。
+            state.replay = []
+            state.replay_upto = 0
             if path is None:
                 return (
-                    gr.update(maximum=1, value=0),
-                    render_board(np.zeros(16, dtype=np.uint8)),
-                    ('<div class="r2048-err">没有选中棋谱：先在 records/ 里有一份，或在计算页保存一份</div>'),
+                    gr.update(maximum=1, value=0, interactive=False),
+                    board_view(np.zeros(16, dtype=np.uint8)),
+                    '<div class="r2048-err" role="alert">请先选择棋谱；可以在对局页保存一份后刷新列表。</div>',
                 )
             try:
-                state.replay = records.load(path)
+                commands = records.load(path)
+                result = records.apply(commands)
             except records.RecordError as error:
                 return (
-                    gr.update(maximum=1, value=0),
-                    render_board(np.zeros(16, dtype=np.uint8)),
-                    f'<div class="r2048-err">{html.escape(str(error))}</div>',
+                    gr.update(maximum=1, value=0, interactive=False),
+                    board_view(np.zeros(16, dtype=np.uint8)),
+                    f'<div class="r2048-err" role="alert">{html.escape(str(error))}</div>',
                 )
+            state.replay = commands
             state.replay_upto = len(state.replay)
             steps = sum(1 for command in state.replay if isinstance(command, records.Move))
-            board = records.apply(state.replay).board
+            board = result.board
             return (
-                gr.update(maximum=max(1, len(state.replay)), value=len(state.replay)),
-                render_board(board, note=f"{path.name}（{steps} 步）"),
+                gr.update(maximum=max(1, len(state.replay)), value=len(state.replay), interactive=True),
+                board_view(board, note=f"{path.name}（{steps} 步）"),
                 (
                     f'<div class="r2048-note">已载入 {html.escape(path.name)}：'
                     f"{len(state.replay)} 条命令，{steps} 步</div>"
@@ -634,13 +874,19 @@ def build_app(state: AppState | None = None):
 
         def on_replay_step(prefix) -> tuple[str, str]:
             if not state.replay:
-                return render_board(np.zeros(16, dtype=np.uint8)), ""
+                return board_view(np.zeros(16, dtype=np.uint8)), ""
             state.replay_upto = max(0, min(len(state.replay), int(prefix)))
             result = records.apply(state.replay[: state.replay_upto])
             return (
-                render_board(result.board, note=f"前 {state.replay_upto} 条命令"),
+                board_view(result.board, note=f"前 {state.replay_upto} 条命令"),
                 f'<div class="r2048-note">得分 {result.total_score}，已走 {result.move_count} 步</div>',
             )
+
+        def on_replay_prev():
+            return max(0, state.replay_upto - 1)
+
+        def on_replay_next():
+            return min(len(state.replay), state.replay_upto + 1)
 
         def on_export():
             """把回放到的局面**当成新开一局**发给计算页。
@@ -650,32 +896,55 @@ def build_app(state: AppState | None = None):
             一个块——盘面立刻就不是棋谱里那盘了。
             """
             if not state.replay:
-                return fail(SessionError("还没有载入棋谱"))
+                return (
+                    *fail(SessionError("还没有载入棋谱")),
+                    gr.update(),
+                    '<div class="r2048-err" role="alert">请先载入棋谱</div>',
+                )
             if state.auto_running:
-                return view([], "自动执行中：先点「停止」")
+                return (
+                    *view([], "自动执行中：先点「停止」"),
+                    gr.update(),
+                    '<div class="r2048-note" role="status">请先停止自动执行</div>',
+                )
             board = records.apply(state.replay[: state.replay_upto]).board
             try:
                 with state.lock:
+                    if state.client is None:
+                        state.attach("", "cpu", "search", 256, 0)
                     frames = state.call("clear")
                     for index, exponent in enumerate(board):
                         if exponent:
                             face = records.EXPONENT_TO_FACE[int(exponent)]
                             frames = state.call(f"set {face} {records.index_to_coordinate(index)}")
-                return view(frames, f"已以第 {state.replay_upto} 条命令处的局面开新一局")
+                return (
+                    *view(frames, f"已以第 {state.replay_upto} 条命令处的局面开新一局"),
+                    gr.update(selected="play"),
+                    '<div class="r2048-ok" role="status">局面已发送到对局页</div>',
+                )
             except (SessionError, RuntimeError) as error:
-                return fail(error)
+                return (
+                    *fail(error),
+                    gr.update(),
+                    f'<div class="r2048-err" role="alert">{html.escape(str(error))}</div>',
+                )
 
         # ---- 绑定 -----------------------------------------------------------
 
         settings_inputs = [strategy_box, sims_box, time_box]
-        refresh_models.click(on_refresh_models, inputs=[include_resume], outputs=[model_box])
+        refresh_models.click(on_refresh_models, inputs=[include_resume, model_box], outputs=[model_box])
+        include_resume.change(on_refresh_models, inputs=[include_resume, model_box], outputs=[model_box])
+        model_box.change(on_identity_change, outputs=[note_html])
+        device_box.change(on_identity_change, outputs=[note_html])
         connect.click(
             on_connect,
             inputs=[model_box, include_resume, device_box, *settings_inputs],
             outputs=outputs,
         )
         newgame_btn.click(on_newgame, inputs=settings_inputs, outputs=outputs)
-        analyze_btn.click(on_analyze, inputs=settings_inputs, outputs=outputs)
+        # 分析和自走会流式持有一条请求；Gradio 默认会在所有输入/输出上画持续进度线，
+        # 视觉上像整块控件被描边。运行状态由页面自己的 status 与反馈区呈现。
+        analyze_btn.click(on_analyze, inputs=settings_inputs, outputs=outputs, show_progress="hidden")
         undo_btn.click(on_undo, outputs=outputs)
         clear_btn.click(on_clear, outputs=outputs)
         for name, button in zip(records.DIRECTIONS, direction_buttons):
@@ -687,16 +956,26 @@ def build_app(state: AppState | None = None):
                 outputs=outputs,
             )
         save_btn.click(on_save, inputs=[record_name], outputs=[note_html])
-        auto_start.click(on_auto_start, inputs=[*settings_inputs, interval_box], outputs=outputs)
-        auto_stop.click(on_auto_stop, outputs=[note_html])
+        auto_start.click(
+            on_auto_start,
+            inputs=[*settings_inputs, interval_box],
+            outputs=outputs,
+            show_progress="hidden",
+        )
+        # 停止不能排到正在运行的生成器后面，否则按钮可见但永远点不动。
+        auto_stop.click(on_auto_stop, outputs=[note_html], queue=False, concurrency_limit=None)
 
-        editor_new.click(on_editor_new, outputs=tile_boxes)
-        editor_to_game.click(on_editor_send, inputs=tile_boxes, outputs=outputs)
+        editor_new.click(on_editor_new, outputs=[*tile_boxes, editor_board])
+        for tile in tile_boxes:
+            tile.input(on_editor_preview, inputs=tile_boxes, outputs=[editor_board])
+        editor_to_game.click(on_editor_send, inputs=tile_boxes, outputs=[*outputs, tabs, editor_note])
         refresh_records.click(on_refresh_records, outputs=[record_box])
         replay_load.click(
             on_replay_load, inputs=[record_box], outputs=[replay_slider, replay_html, replay_note]
         )
         replay_slider.change(on_replay_step, inputs=[replay_slider], outputs=[replay_html, replay_note])
-        export_btn.click(on_export, outputs=outputs)
+        replay_prev.click(on_replay_prev, outputs=[replay_slider])
+        replay_next.click(on_replay_next, outputs=[replay_slider])
+        export_btn.click(on_export, outputs=[*outputs, tabs, replay_note])
 
     return demo, state

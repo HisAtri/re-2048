@@ -689,6 +689,10 @@ def _pairwise_regret(
     `τ·softplus(x/τ)` 是 `relu(x)` 的平滑版，所以极限上它就是**成对后悔**：符号错罚
     |ΔQ|·|ΔQ̂|，符号对（且间隔超过 τ）趋 0。
     """
+    # 「成对后悔」的**软化指示子**：σ(−x/τ) 在 x ≫ τ 时趋 0、x ≪ −τ 时趋 1，所以
+    # `|目标间隔| × σ(…)` 的量纲是**分数**（不是分数平方）——它就是这个对的期望后悔，
+    # 于是归一化后的这一项真的是"每个决策点的软后悔（分）"，与候选 MAE 同量纲、λ 才有可比的
+    # 含义（早先用 τ·softplus(x/τ) 是 relu 的软化版、量纲是分数平方，那个解释不成立）。
     total = torch.zeros((), dtype=torch.float32, device=q_predicted.device)
     used = torch.zeros(q_predicted.shape[0], dtype=torch.bool, device=q_predicted.device)
     for first, second in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
@@ -701,7 +705,7 @@ def _pairwise_regret(
         if not bool(usable.any()):
             continue
         gap_predicted = (q_predicted[:, first] - q_predicted[:, second]) * pair_valid
-        pair_loss = margin * F.softplus(-gap_predicted * gap_target.sign() / margin)
+        pair_loss = torch.sigmoid(-gap_predicted * gap_target.sign() / margin)
         total = total + (pair_loss * pair_weight)[usable].sum()
         used = used | usable
     return total, used.double().sum()
@@ -991,6 +995,9 @@ def run_training(config: TrainConfig) -> TrainResult:
         raise ValueError(f"value_ranking_weight 必须 ≥ 0（0 = 关），收到 {config.value_ranking_weight}")
     if config.tree_label_source not in TREE_LABEL_SOURCES:
         raise ValueError(f"未知树内标签来源: {config.tree_label_source}，可选 {list(TREE_LABEL_SOURCES)}")
+    # 「以 rollout 为标签来源、但数据里没有独立标签」必须显式失败：生成端在 tree_label_plays=0
+    # 时把 rollout 全写 0，当成"零价值标签"用会安静地什么都不监督（所有间隔为 0 ⇒ 无可用对）。
+    # 那一轮看起来"跑了、没报错、指标也正常"，正是这个仓库最不能接受的一类失效。
     if config.value_selection not in VALUE_SELECTIONS:
         raise ValueError(f"未知 checkpoint 挑选口径: {config.value_selection}，可选 {list(VALUE_SELECTIONS)}")
     if config.policy_target == "improved" and config.improve_beta <= 0:
@@ -1023,6 +1030,20 @@ def run_training(config: TrainConfig) -> TrainResult:
         val_fraction=config.val_fraction,
         seed=config.split_seed,
     )
+    if (
+        config.tree_label_source == "rollout"
+        and config.value_ranking_weight > 0
+        and reader.tree_nodes > 0
+        and reader.tree_label_plays == 0
+    ):
+        # 数据里有树内节点块、却没有独立标注（生成时 --tree-label-plays 0）⇒ rollout 字段全是 0，
+        # 排序项在每个节点上都拿不到"目标间隔非零"的对，于是**安静地什么都不监督**：训练照跑、
+        # 指标正常、没有任何报错。这类"改了参数却没生效"必须变成开跑前的显式失败。
+        raise ValueError(
+            "tree_label_source=rollout 需要数据带独立标注，但这批数据声明 tree_label_plays=0："
+            "排序项会安静地什么都不监督。用带标注的批次（生成时 --tree-label-plays > 0），"
+            "或显式改回 --tree-label-source qmean。"
+        )
     if reader.duplicates:
         repeated = "，".join(f"{name}（{key}）" for key, name in reader.duplicates)
         print(f"警告：以下来源在配置里重复出现，已按来源身份去重：{repeated}")

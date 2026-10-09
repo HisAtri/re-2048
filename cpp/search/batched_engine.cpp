@@ -750,40 +750,37 @@ struct BatchedEngine::Impl {
                 std::array<Pick, kTreeNodesMax> chosen{};
                 size_t chosen_count = 0;
 
-                // 各深度的当前最优（按访问数降序、并列取下标小者）。深度上限取一个安全上界：
-                // 树深不会超过模拟次数，也不需要更精细的界。
+                // 各深度上访问数最大的那个节点（并列取下标小者）。
                 constexpr uint32_t kMaxDepth = 64;
                 std::array<Pick, kMaxDepth + 1> best_at_depth{};
 
-                // top-K 的当前集合（按 (访问数, 下标) 排序，用插入法维护）。
+                // top-K 的当前集合：维护成**严格按 (访问数降序, 下标升序)**排列的前 K 个。
+                // 早先的实现拿"是否优于该深度的最优"当插入判据，于是钻进来的节点会被无条件插到
+                // 首位、列表也不再有序——那样 kTreeLabelTopVisits 取不到访问数最大的 K 个，而它正是
+                // ADR 0043 步骤 A 的单变量对照，前提不能破。
+                const auto precedes = [](const Pick& left, const Pick& right) {
+                    return left.visits != right.visits ? left.visits > right.visits
+                                                       : left.index < right.index;
+                };
                 for (uint32_t index = 1; index < lane.nodes.size(); index++) {
                     const Node& node = lane.nodes[index];
                     if (node.kind != kDecision || node.state != kEvaluated) continue;
                     if (node.parent == kNoNode) continue;  // 根不算树内节点
                     if (node.visits == 0) continue;
+                    // 深度按**边**数：搜索树交替经过决策节点与随机节点，所以内部决策节点的深度是
+                    // 2、4、6…（不是 1、2、3…）。分层选择因此必须按"实际存在的深度"取。
                     uint8_t depth = 0;
                     for (uint32_t walk = index; lane.nodes[walk].parent != kNoNode;
                          walk = lane.nodes[walk].parent) {
                         depth++;
                     }
+                    const uint32_t slot = std::min<uint32_t>(depth, kMaxDepth);
                     const Pick pick{index, depth, node.visits};
-                    const bool better = [](const Pick& left, const Pick& right) {
-                        return left.visits != right.visits ? left.visits > right.visits
-                                                           : left.index < right.index;
-                    }(pick, best_at_depth[std::min<uint32_t>(depth, kMaxDepth)]);
-                    if (better) best_at_depth[std::min<uint32_t>(depth, kMaxDepth)] = pick;
+                    if (precedes(pick, best_at_depth[slot])) best_at_depth[slot] = pick;
 
-                    // top-K：插到第一个比自己差的位置，超出的丢掉。
                     size_t at = 0;
-                    while (at < chosen_count && !better) {
-                        const bool worse = [](const Pick& left, const Pick& right) {
-                            return left.visits != right.visits ? left.visits < right.visits
-                                                               : left.index > right.index;
-                        }(chosen[at], pick);
-                        if (worse) break;
-                        at++;
-                    }
-                    if (at >= kTreeNodesMax) continue;
+                    while (at < chosen_count && precedes(chosen[at], pick)) at++;
+                    if (at >= kTreeNodesMax) continue;  // 比已有的 K 个都差（或并列但下标更大）
                     for (size_t shift = std::min<size_t>(kTreeNodesMax - 1, chosen_count);
                          shift > at; shift--) {
                         chosen[shift] = chosen[shift - 1];
@@ -793,13 +790,16 @@ struct BatchedEngine::Impl {
                 }
 
                 if (config.tree_label_policy == kTreeLabelDepthStratified) {
-                    // 按深度分层：每个深度取访问数最大的那个节点（K = 覆盖的深度数）。
-                    // 为什么分层：头的查询面**遍布各深度**，而"按访问数取 top-K"会把槽位全堆在浅层
-                    // ——浅层既最像根（信息冗余），也恰好是树内标签最不像头自己回声的地方。分层把
-                    // 监督铺到深层，而那里正是 `one_ply` 直接决定 Q 的区域（ADR 0043）。
+                    // 按深度分层：取**实际存在的**最浅 K 个深度（升序），每个深度取访问数最大的节点。
+                    // 浅层访问数更多、标签更实，这是"从可信的一端向深处铺"的顺序。
+                    // 早先按深度下标 1..K 递增的写法在交替树结构下会浪费槽位（内部决策节点只在
+                    // 偶数深度），默认 K=2 实际只选到一个节点——既付了两颗节点的存储，又只拿到
+                    // 一个节点的监督。为什么分层：头的查询面遍布各深度，而 top-K 会把槽位全堆在
+                    // 浅层（那里最像根、信息最冗余）（ADR 0043）。
                     chosen_count = 0;
-                    for (uint8_t depth = 1; depth <= config.tree_nodes; depth++) {
-                        const Pick& pick = best_at_depth[std::min<uint32_t>(depth, kMaxDepth)];
+                    for (uint32_t depth = 1; depth <= kMaxDepth && chosen_count < config.tree_nodes;
+                         depth++) {
+                        const Pick& pick = best_at_depth[depth];
                         if (pick.visits == 0) continue;  // 该深度没有可用的决策节点
                         chosen[chosen_count++] = pick;
                     }

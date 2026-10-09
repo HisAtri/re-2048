@@ -225,6 +225,7 @@ class MultiSourceReader:
             )
         self.dtype = self._readers[0].dtype if self._readers else record_dtype(0)
         self.tree_nodes = self._readers[0].manifest.tree_nodes if self._readers else 0
+        self.tree_label_plays = self._readers[0].manifest.tree_label_plays if self._readers else 0
         self.sources: tuple[SourceView, ...] = tuple(sources)
         # 权重与来源一一对应，并且已经按去重结果对齐：调用方拿到的就是"实际会用到的那些来源"。
         self.weights: tuple[float, ...] = tuple(kept_weights)

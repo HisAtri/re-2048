@@ -142,6 +142,11 @@ class BatchManifest:
         return str(self.data.get("state", "complete"))
 
     @property
+    def tree_label_plays(self) -> int:
+        """树内节点每个候选跑了几次独立 playout（0 = 这批数据没有独立标签）。"""
+        return int(self.data.get("tree_label_plays", 0))
+
+    @property
     def tree_nodes(self) -> int:
         """这批数据每条记录里放了几个树内节点（0 = 没有这一块）。"""
         return tree_nodes_of(self.data)

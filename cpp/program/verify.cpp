@@ -172,14 +172,25 @@ VerifyReport verify_batch(const std::string& data_dir, const VerifyOptions& opti
     //   * 切分规则必须与当前实现一致：规则变了，哈希当然不同，那不是“数据错了”；
     //   * 这一批必须已经跑完：未跑完的批次没有确定终点，而不限量的批次（目标 0）
     //     更是永远跑不到头，重放会一直生成下去。
-    const bool replayable = manifest.shard_layout == kShardLayout && complete &&
+    // 第三个前提是**教师必须是 C++ 生成器能复现的**：重放走的是 `generate`（只认 random/mcts），
+    // NN 自对弈的教师是网络，C++ 侧没有这条重放路径；而且 NN 叶值依赖批组成、本就不逐字节
+    // 可复现（ADR 0017/0031），比对哈希无从谈起。对它硬做会撞上 `make_selector` 的“未知策略”
+    // ——那个抛出点在 worker 线程里、per-episode 的 try/catch 之外，异常跨线程逃逸直接 terminate
+    // （实测：verify 一个 NN 批次核心转储）。缺教师在这里表现为一条说明，不是一次崩溃。
+    const bool cpp_policy = manifest.meta.policy == "random" || manifest.meta.policy == "mcts";
+    const bool replayable = cpp_policy && manifest.shard_layout == kShardLayout && complete &&
                             manifest.meta.samples_target > 0;
     if (options.replay && !replayable) {
-        report.replay_note = manifest.shard_layout != kShardLayout
-                                 ? ("该批由旧的分片切分规则产出（shard_layout=" +
-                                    std::to_string(manifest.shard_layout) + "），当前实现无法重放比对")
-                                 : ("该批未跑完（state=" + report.state +
-                                    "）或样本目标不限量，重放没有可比的终点");
+        if (!cpp_policy) {
+            report.replay_note = "该批由 NN 自对弈产出（policy=" + manifest.meta.policy +
+                                 "）：重放只实现在 C++ 生成器里（random/mcts），无法比对";
+        } else if (manifest.shard_layout != kShardLayout) {
+            report.replay_note = "该批由旧的分片切分规则产出（shard_layout=" +
+                                 std::to_string(manifest.shard_layout) + "），当前实现无法重放比对";
+        } else {
+            report.replay_note =
+                "该批未跑完（state=" + report.state + "）或样本目标不限量，重放没有可比的终点";
+        }
     }
 
     if (options.replay && replayable && report.problems.empty()) {

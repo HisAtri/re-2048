@@ -430,6 +430,30 @@ TEST(dataio_verify_detects_corruption) {
     expect_true(!broken.ok, "清单条数被改动后必须校验失败");
 }
 
+TEST(dataio_verify_does_not_replay_nn_batch) {
+    // NN 批次的教师是网络，而重放只实现在 C++ 生成器里（random/mcts）。对它硬做的后果不是
+    // "报告重放失败"，而是撞上 make_selector 的"未知策略"异常——抛出点在 worker 线程里、
+    // per-episode 的 try/catch 之外，异常跨线程逃逸直接 terminate（实测：verify 一个 NN 批次
+    // 核心转储）。缺教师应当表现为一条说明，结构校验照常通过。
+    TempDir dir("verify-nn");
+    const std::string data_dir = dir.sub("batch");
+    run_generate(small_config(data_dir, "random", 2));
+    // 清单里的 policy 是数据自述的来源，改它等价于"这批数据由 NN 产出"（分片摘要不受影响）。
+    const std::string manifest_path = data_dir + "/manifest.json";
+    std::string text = read_text_file(manifest_path);
+    const std::string from = "\"policy\": \"random\"";
+    const size_t found = text.find(from);
+    expect_true(found != std::string::npos, "清单里能找到策略字段");
+    text.replace(found, from.size(), "\"policy\": \"nn\"");
+    write_text_atomic(manifest_path, text);
+
+    VerifyOptions replay;  // 默认就是要重放
+    const VerifyReport report = verify_batch(data_dir, replay);
+    expect_true(report.ok, "NN 批次的结构与摘要校验仍应通过");
+    expect_true(!report.replay_checked, "NN 批次不该被重放");
+    expect_contains(report.replay_note, "NN", "说明里指出这是 NN 批次");
+}
+
 TEST(dataio_generate_refuses_to_overwrite) {
     TempDir dir("overwrite");
     const std::string data_dir = dir.sub("batch");

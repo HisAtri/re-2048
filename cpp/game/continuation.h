@@ -21,8 +21,9 @@ enum class ContinuationPolicy : uint8_t { kUniform = 0, kGreedy = 1 };
 
 // 一步启发式：走"走完空位最多"的方向（并列取立即得分更高者）。这是 ADR 0030 §6.1 里
 // 被证实的那一条；它比均匀随机贵约 4.4 倍算力，但换来的标签区分度更高（按算力算更划算）。
-inline int greedy_continuation(const Board& board, uint8_t mask) {
-    int best = -1;
+inline MoveOutcome greedy_continuation_move(const Board& board, uint8_t mask, int& best) {
+    best = -1;
+    MoveOutcome selected{board, 0, false};
     int best_empty = -1;
     uint32_t best_score = 0;
     for (int action = 0; action < kNumActions; action++) {
@@ -34,8 +35,15 @@ inline int greedy_continuation(const Board& board, uint8_t mask) {
             best = action;
             best_empty = empties;
             best_score = outcome.score;
+            selected = outcome;
         }
     }
+    return selected;
+}
+
+inline int greedy_continuation(const Board& board, uint8_t mask) {
+    int best;
+    greedy_continuation_move(board, mask, best);
     if (best < 0) throw std::runtime_error("续弈里没有合法方向：入口应先用 legal_mask 过滤");
     return best;
 }
@@ -63,10 +71,19 @@ inline int continuation_action(const Board& board, uint8_t mask, ContinuationPol
 inline float playout(Board board, Rng& rng, ContinuationPolicy policy) {
     uint64_t total = 0;
     for (;;) {
-        const uint8_t mask = legal_mask(board);
-        if (mask == 0) break;
-        const int action = continuation_action(board, mask, policy, rng);
-        const MoveOutcome outcome = apply_move(board, action);
+        MoveOutcome outcome;
+        if (policy == ContinuationPolicy::kGreedy) {
+            // 同一次移动同时判断合法性、选择方向并保留 afterstate，避免每步重复移动棋盘。
+            // 动作遍历与并列判定保持原序；贪心选择不消费 RNG，所以逐局标签不变。
+            int action;
+            outcome = greedy_continuation_move(board, 0xF, action);
+            if (!outcome.valid) break;
+        } else {
+            const uint8_t mask = legal_mask(board);
+            if (mask == 0) break;
+            const int action = continuation_action(board, mask, policy, rng);
+            outcome = apply_move(board, action);
+        }
         total += outcome.score;
         board = outcome.board;
         spawn_tile(board, rng);

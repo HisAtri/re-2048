@@ -106,6 +106,14 @@ body { background: #f5f6f1; }
 .r2048-footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
   color: #64746b; font-size: 11px; margin: 26px 0 8px; }
 .r2048-footer details { max-width: 100%; overflow-wrap: anywhere; }
+/* 摘要和结果使用整个内容宽度；长身份可换行，避免重新制造横向挤压。 */
+.r2048-experiment-summary table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+.r2048-experiment-summary th, .r2048-experiment-summary td {
+  padding: 10px 14px; border: 1px solid #dce4df; text-align: left; overflow-wrap: anywhere;
+}
+.r2048-experiment-summary th:first-child, .r2048-experiment-summary td:first-child { width: 36%; }
+.r2048-experiment-summary th { background: #eaf0ec; }
+.r2048-experiment-summary tr:nth-child(even) { background: #f7f9f7; }
 @media (max-width: 800px) {
   #r2048-settings-grid > .form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .gradio-container { padding: 20px 14px !important; }

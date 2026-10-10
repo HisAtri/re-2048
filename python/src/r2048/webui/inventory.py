@@ -77,6 +77,11 @@ def _read_checkpoint_metadata(path: Path) -> dict:
     import torch
 
     try:
+        if path.suffix == ".safetensor":
+            from safetensors import safe_open
+
+            with safe_open(str(path), framework="pt", device="cpu") as handle:
+                return json.loads((handle.metadata() or {})["metadata"])
         payload = torch.load(str(path), map_location="meta", weights_only=False)
     except Exception:  # noqa: BLE001 - 列清单不该因为一个坏文件就整体失败
         return {}
@@ -87,7 +92,7 @@ def _read_checkpoint_metadata(path: Path) -> dict:
 
 
 def list_models(root: Path | None = None, include_resume: bool = False) -> list[ModelEntry]:
-    """扫输出根下所有 `*.pt`。
+    """扫输出根下所有 `*.pt` 与已发布的 `*.safetensor`。
 
     整个根递归而不是写死 `runs/`、`models/`：模型的实际落点一直在长（训练 run 下、`models/`
     的发布位、实验目录），写死子目录会让"新放出来的模型在下拉里看不见"，而看不见的原因完全
@@ -101,7 +106,10 @@ def list_models(root: Path | None = None, include_resume: bool = False) -> list[
     if not base.is_dir():
         return []
     entries: list[ModelEntry] = []
-    for path in sorted(base.rglob("*.pt")):
+    candidates = [*base.rglob("*.pt"), *base.rglob("*.safetensor")]
+    for path in sorted(candidates):
+        if any(part.startswith(".publish-") for part in path.relative_to(base).parts):
+            continue
         if not include_resume and path.name == "last.pt":
             continue
         metadata = _read_checkpoint_metadata(path)

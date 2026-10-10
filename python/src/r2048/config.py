@@ -30,7 +30,7 @@ _DATASET_KEYS = ("path", "weight", "limit")
 # 需要取反的布尔开关：argparse 用 `--no-xxx`，配置字段是正向的 `xxx`。
 NEGATED_FLAGS = {"no_augment": "augment", "no_channels_last": "channels_last"}
 # 不映射到配置字段的参数：`--data` 是 datasets 的简写，另两个不是训练参数。
-NON_CONFIG_ARGS = ("command", "config", "data")
+NON_CONFIG_ARGS = ("command", "config", "data", "performance_profile")
 # 回调是运行期接进来的（见 training.config_payload），配置文件与 CLI 都不该设它。
 UNSETTABLE_FIELDS = ("on_progress",)
 
@@ -175,4 +175,29 @@ def build_train_config(args: argparse.Namespace) -> TrainConfig:
 
     if not payload.get("datasets"):
         raise SystemExit("必须给出训练数据：--data <数据批>，或在 --config 里写 datasets")
+    from r2048.performance import resolve
+
+    defaults = TrainConfig()
+    resume_path = Path(payload.get("output", "")) / "last.pt"
+    restored = None
+    if payload.get("resume") and resume_path.exists():
+        from r2048.nn.model import read_checkpoint_payload
+
+        restored = read_checkpoint_payload(str(resume_path)).get("config", {})
+        if "batch_size" not in payload:
+            payload["batch_size"] = restored["batch_size"]
+    effective, performance = resolve(
+        "train",
+        {
+            "device": payload.get("device", defaults.device),
+            "batch_size": payload.get("batch_size"),
+            "mode": payload.get("mode", defaults.mode),
+            "freeze_value": payload.get("freeze_value", False),
+        },
+        payload.get("init_checkpoint", ""),
+        recipe=payload,
+        mode=getattr(args, "performance_profile", "auto"),
+    )
+    payload["batch_size"] = effective["batch_size"]
+    payload["performance"] = restored.get("performance", performance) if restored else performance
     return TrainConfig(**payload)

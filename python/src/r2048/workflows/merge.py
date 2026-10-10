@@ -19,9 +19,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import torch
-
 from r2048.fileio import save_torch_atomic
+from r2048.nn.lineage import file_sha256, lineage_fields, make_lineage, merge_lineages, resolve_lineage
+from r2048.nn.model import canonical_id, read_checkpoint_payload
 
 # 策略路径的参数名前缀。与 `nn/model.py` 的命名一致：合并就是把"属于价值路径的"
 # 与"属于策略路径的"按名字分开，不做任何形状推断。
@@ -48,10 +48,12 @@ def merge_halves(
 ) -> MergeResult:
     """`value_checkpoint` 提供非策略张量，`policy_checkpoint` 提供策略张量。"""
     value_path, policy_path = Path(value_checkpoint), Path(policy_checkpoint)
-    value_payload = torch.load(value_path, map_location="cpu", weights_only=False)
-    policy_payload = torch.load(policy_path, map_location="cpu", weights_only=False)
+    value_payload = read_checkpoint_payload(value_path)
+    policy_payload = read_checkpoint_payload(policy_path)
     value_meta = dict(value_payload.get("metadata", {}))
     policy_meta = dict(policy_payload.get("metadata", {}))
+    for metadata in (value_meta, policy_meta):
+        metadata["architecture"] = canonical_id(metadata["architecture"])
 
     for field in COMPATIBLE_METADATA:
         before, after = value_meta.get(field), policy_meta.get(field)
@@ -99,7 +101,25 @@ def merge_halves(
     # "价值半是 dual 训出来的"——正是这条记录要回答的问题（首次按新规范实跑时踩到）。
     value_target = str(value_meta.get("training_target", ""))
     policy_target = str(policy_meta.get("training_target", ""))
-    metadata = value_meta
+    value_lineage = resolve_lineage(value_path)
+    policy_lineage = resolve_lineage(policy_path)
+    parents = policy_lineage["parent_models"]
+    if (
+        len(parents) == 1
+        and parents[0]["model_id"] == value_id
+        and parents[0]["sha256"] == file_sha256(value_path)
+    ):
+        # 本轮价值半模型也是合并输入，其数据属于本轮；只有它的祖先属于完整模型的继承量。
+        # 以身份和摘要确认内部初始化关系，不能仅靠相似的 run 名称消除父模型。
+        policy_lineage = make_lineage(
+            policy_lineage["current"],
+            [{**value_lineage, "datasets": value_lineage["inherited"]}],
+            value_lineage["parent_models"],
+            policy_lineage["issues"],
+        )
+    lineage = merge_lineages(value_lineage, policy_lineage)
+    metadata = dict(value_meta)
+    metadata.update(lineage_fields(lineage))
     metadata["model_id"] = f"{value_id}+{policy_id}"
     # 合并后的模型**两个头都训过**，所以 `training_target` 是 `dual`（评测侧的闸门用它判断
     # "这份权重能不能拿来跑 nn_policy"，见 workflows/evaluate.py）。沿用价值那一半的 "value"
@@ -108,12 +128,20 @@ def merge_halves(
     metadata["merged_from"] = {
         # 逐半记来源：这是"这份权重是哪两半拼的"唯一凭据（比一个新编的名字有用得多）。
         "value": {
+            "sha256": file_sha256(value_path),
+            "sources": value_meta.get("sources", []),
+            "parent": value_meta.get("parent", ""),
+            "source_checkpoint_sha256": value_meta.get("source_checkpoint_sha256", ""),
             "path": str(value_path),
             "model_id": value_id,
             "training_target": value_target,
             "config_digest": value_meta.get("config_digest", ""),
         },
         "policy": {
+            "sha256": file_sha256(policy_path),
+            "sources": policy_meta.get("sources", []),
+            "parent": policy_meta.get("parent", ""),
+            "source_checkpoint_sha256": policy_meta.get("source_checkpoint_sha256", ""),
             "path": str(policy_path),
             "model_id": policy_id,
             "training_target": policy_target,

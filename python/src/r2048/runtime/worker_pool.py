@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -57,6 +58,8 @@ def _worker_argv(config: SelfplayConfig, checkpoint: str, device: str) -> list[s
         "-m",
         "r2048",
         "selfplay",
+        "--workers",
+        "1",  # 父进程已应用画像；子进程不能再次自动扩张为一组 worker。
         "--out",
         config.data_dir,
         "--batch-id",
@@ -99,6 +102,8 @@ def _worker_argv(config: SelfplayConfig, checkpoint: str, device: str) -> list[s
     ]
     if config.model_id:
         argv += ["--model-id", config.model_id]
+    if config.control_path:
+        argv += ["--control", config.control_path]
     argv += ["--checkpoint", checkpoint] if checkpoint else ["--random-init"]
     return argv
 
@@ -110,6 +115,27 @@ def _tail(path: Path, lines: int = 4) -> str:
     except OSError as error:
         return f"(读不到日志：{error})"
     return "\n".join(text[-lines:])
+
+
+def _telemetry(log_dir: Path, procs: list[subprocess.Popen]) -> list[dict]:
+    """读各 worker 的遥测文件。**不能假设"存在就一直能读"**。
+
+    worker 每 0.5 秒原子重写自己的遥测文件，而数据目录默认落在仓库的 `/mnt/e`（9p 挂载）上，
+    那里的 rename 从读取方看**不原子**：`exists()` 为真之后 `open` 仍会 ENOENT（实测：8 个
+    写入者连续重写，读取方 30 秒里撞到 2 次）。读不到就当这一轮没有遥测——监督进程因为
+    "少读了一份进度"而崩掉是本末倒置，而它崩掉的代价是留下一批没人管的 worker（见下方
+    异常路径）。同一结论在清单读取上早有先例（那里的注释在说同一件事）。
+    """
+    records = []
+    for index, proc in enumerate(procs):
+        try:
+            record = json.loads((log_dir / f"worker-{index}.json").read_text())
+        except (OSError, ValueError):
+            # 文件瞬时不存在（rename 窗口）或正被写出一半（换行/编码之外还有 json 层面）。
+            continue
+        if record.get("pid") == proc.pid:
+            records.append(record)
+    return records
 
 
 def run_selfplay_workers(
@@ -161,37 +187,55 @@ def run_selfplay_workers(
     logs: list[str] = []
     procs: list[subprocess.Popen] = []
     handles: list[object] = []
-    for index in range(workers):
-        log_path = log_dir / f"worker-{index}.log"
-        handle = log_path.open("wb")
-        logs.append(str(log_path))
-        handles.append(handle)
-        procs.append(
-            subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-        )
-
     stopping = False
 
-    def request_stop(_signum: int, _frame: object) -> None:
-        nonlocal stopping
-        if stopping:
-            return
-        stopping = True
+    def write_stop(reason: str) -> None:
+        """把一次停车写进控制文件。多写者下它是粘住的（ADR 0029 决策 7）：一条指令停整批。"""
         try:
             control_path.parent.mkdir(parents=True, exist_ok=True)
             control_path.write_text("stop")
             print(
-                f"收到中断：已写 {control_path}，等 {workers} 个 worker 走到局边界停车",
+                f"{reason}：已写 {control_path}，等 {workers} 个 worker 走到局边界停车",
                 file=sys.stderr,
                 flush=True,
             )
         except OSError as error:
             print(f"写控制文件失败（{control_path}）：{error}", file=sys.stderr, flush=True)
 
-    previous = {sig: signal.signal(sig, request_stop) for sig in (signal.SIGINT, signal.SIGTERM)}
+    def request_stop(_signum: int, _frame: object) -> None:
+        nonlocal stopping
+        if stopping:
+            return
+        stopping = True
+        write_stop("收到中断")
+
+    previous: dict[int, object] = {}
     manifest_path = data_dir / "manifest.json"
     last_seen = (-1, -1)
     try:
+        for index in range(workers):
+            log_path = log_dir / f"worker-{index}.log"
+            handle = log_path.open("wb")
+            logs.append(str(log_path))
+            handles.append(handle)
+            procs.append(
+                subprocess.Popen(
+                    argv,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    # 必须在导入 torch/BLAS 前约束线程池，不能只依赖运行阶段的 torch 设置。
+                    env={
+                        **os.environ,
+                        "OMP_NUM_THREADS": "1",
+                        "MKL_NUM_THREADS": "1",
+                        "OPENBLAS_NUM_THREADS": "1",
+                        "R2048_WORKER_PROGRESS": str(log_dir / f"worker-{index}.json"),
+                    },
+                )
+            )
+
+        previous = {sig: signal.signal(sig, request_stop) for sig in (signal.SIGINT, signal.SIGTERM)}
         while True:
             alive = [proc for proc in procs if proc.poll() is None]
             if not alive:
@@ -205,13 +249,16 @@ def run_selfplay_workers(
                 except (OSError, ValueError):
                     # 清单正被某个 worker 原子重写：读到的半截内容不该让监督失败。
                     pass
-            if (samples, episodes) != last_seen:
+            telemetry = _telemetry(log_dir, procs)
+            if telemetry or (samples, episodes) != last_seen:
                 last_seen = (samples, episodes)
                 total = config.samples if config.samples > 0 else None
                 line = (
                     f"多进程自对弈 {samples}/{total if total is not None else '不限量'} 条，"
                     f"{episodes} 局，{len(alive)}/{workers} 个 worker 在跑"
                 )
+                if telemetry:
+                    line += f"，{sum(item['simulations_per_second'] for item in telemetry):.0f} 次模拟/秒"
                 # 进度 payload 的组装只有 jobs.progress_payload 一处（速率/ETA 的算术、
                 # 以及"控制台要打印的那一行"都在它里面）——自己拼 dict 会漏掉 line，
                 # 调用方的 console_progress 直接 KeyError（实测踩到）。
@@ -222,13 +269,34 @@ def run_selfplay_workers(
                     "samples",
                     started,
                     line,
-                    extra={"episodes": episodes, "workers": workers, "alive": len(alive)},
+                    extra={
+                        "episodes": episodes,
+                        "workers": workers,
+                        "alive": len(alive),
+                        "simulations": sum(item["simulations"] for item in telemetry),
+                        "simulations_per_second": sum(item["simulations_per_second"] for item in telemetry),
+                        "forward_rows": sum(item["forward_rows"] for item in telemetry),
+                        "search_share": sum(item["phases"]["advance_share"] for item in telemetry)
+                        / max(1, len(telemetry)),
+                    },
                 )
                 if on_progress is not None:
                     on_progress(payload)
                 else:
                     console_progress(payload)
             time.sleep(POLL_SECONDS)
+    except BaseException as error:
+        # 监督进程自己出错时也必须停车：这条路径以前是空的，实测的后果是父进程报错退出、
+        # 16 个 worker 被 reparent 给 init 继续占着 GPU 写数据——几十分钟里没有任何进程在
+        # 报进度或核对产物。走与 Ctrl-C 同一条控制通道，并且**等它们收尾**：已提交的分片与
+        # 清单不受影响，之后可以按 ADR 0020 用 --continue 接着跑。异常照旧抛出，命令仍然以
+        # 非 0 退出——这次运行没有被监督到最后，这一点必须让调用方看见。
+        if not stopping:
+            stopping = True
+            write_stop("收到中断" if isinstance(error, KeyboardInterrupt) else "监督进程出错")
+        for proc in procs:
+            proc.wait()
+        raise
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)

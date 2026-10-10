@@ -799,6 +799,12 @@ def test_training_smoke_writes_checkpoint(batch_dir: Path, tmp_path: Path) -> No
     payload = torch.load(result.best_checkpoint, weights_only=False)
     metadata = payload["metadata"]
     assert metadata["training_target"] == "value"
+    assert metadata["data_lineage"]["complete"]
+    assert metadata["inherited_dataset_samples"] == 0
+    assert metadata["dataset_samples"] == metadata["current_dataset_samples"]
+    assert metadata["model_id"].startswith("run-")
+    last_meta = torch.load(result.last_checkpoint, weights_only=False)["metadata"]
+    assert last_meta["data_lineage"] == metadata["data_lineage"]
     assert metadata["rules_version"] == int(r2048_core.RULES_VERSION)
     assert metadata["batch_id"]
     assert metadata["input_encoding"]
@@ -1087,6 +1093,55 @@ def test_resume_matches_one_shot_bitwise(batch_dir: Path, tmp_path: Path) -> Non
     for index in (0, 2, 3):
         assert result.metrics[index].train_loss == once.metrics[index].train_loss
         assert result.metrics[index].val_value_mae == once.metrics[index].val_value_mae
+
+
+@pytest.mark.parametrize("validation", [False, True])
+def test_cooperative_stop_preserves_weights_rng_and_lineage(batch_dir, tmp_path, monkeypatch, validation):
+    from r2048.nn import training
+    from r2048.task_control import TaskStopped
+
+    torch.set_num_threads(1)
+    control = tmp_path / "control"
+    monkeypatch.setenv("R2048_TASK_CONTROL", str(control))
+    common = {
+        "mode": "value",
+        "architecture": "sh-s6c64",
+        "architecture_params": {"channels": 8, "blocks": 1, "head_width": 16, "groups": 2},
+        "epochs": 2,
+        "batch_size": 128,
+        "max_samples": 1024,
+        "seed": 61,
+        "device": "cpu",
+        "log_every": 1,
+        "val_fraction": 0.25,
+        "datasets": [DatasetSpec(str(batch_dir))],
+    }
+    once = run_training(TrainConfig(output=str(tmp_path / "once"), **common))
+    original = training._run_epoch
+
+    def interrupted(*args, **kwargs):
+        if validation and kwargs.get("label") == "验证":
+            control.write_text("stop")
+        return original(*args, **kwargs)
+
+    def progress(payload):
+        if not validation and payload["done"] == 1:
+            control.write_text("stop")
+
+    monkeypatch.setattr(training, "_run_epoch", interrupted)
+    with pytest.raises(TaskStopped):
+        run_training(TrainConfig(output=str(tmp_path / "continued"), on_progress=progress, **common))
+    last = torch.load(tmp_path / "continued/last.pt", weights_only=False)
+    assert "rng" in last and last["metadata"]["data_lineage"]["complete"]
+    assert bool(last["pending_epoch"]) == validation
+    control.unlink()
+    monkeypatch.setattr(training, "_run_epoch", original)
+    restored = run_training(TrainConfig(output=str(tmp_path / "continued"), resume=True, **common))
+    expected = torch.load(once.last_checkpoint, weights_only=False)
+    actual = torch.load(restored.last_checkpoint, weights_only=False)
+    assert expected["metadata"]["dataset_samples"] == actual["metadata"]["dataset_samples"]
+    for name in expected["model"]:
+        assert torch.equal(expected["model"][name], actual["model"][name]), name
 
 
 def test_resume_refuses_changed_data(batch_dir: Path, search_batch_dir: Path, tmp_path: Path) -> None:

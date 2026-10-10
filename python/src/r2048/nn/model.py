@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -67,7 +69,7 @@ def architecture_conflict(version_id: str, params: dict | None, metadata: dict) 
     """
     stored_version = str(metadata.get("architecture") or "")
     # 按 canonical 比较：历史产物记的是旧名字（`dual_tower_v1`），而配置里可能写正式别名
-    # （`dt-s3p3v3c64`）——同一份定义的两个名字，不是"改了结构"。只有指向不同定义才算冲突。
+    # （`smnet-b9c64dt`）——同一份定义的两个名字，不是"改了结构"。只有指向不同定义才算冲突。
     if version_id and canonical_id(version_id) != canonical_id(stored_version):
         return (
             f"architecture={version_id}（这份权重用的是 {stored_version}，即 {canonical_id(stored_version)}）"
@@ -123,6 +125,18 @@ def save_checkpoint(
     save_torch_atomic(path, payload)
 
 
+def read_checkpoint_payload(path: str | Path, device: torch.device | str = "cpu") -> dict:
+    """训练文件保留 PyTorch 容器；发布文件用 JSON 保存嵌套元数据，避免 pickle 依赖。"""
+    if Path(path).suffix == ".safetensor":
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            metadata = json.loads((handle.metadata() or {})["metadata"])
+        return {"model": load_file(str(path), device=str(device)), "metadata": metadata}
+    return torch.load(path, map_location=device, weights_only=False)
+
+
 def load_checkpoint(path: str, device: torch.device) -> tuple[nn.Module, dict[str, Any]]:
     """加载 checkpoint 并校验元数据。
 
@@ -132,7 +146,7 @@ def load_checkpoint(path: str, device: torch.device) -> tuple[nn.Module, dict[st
     """
     import r2048_core
 
-    payload = torch.load(path, map_location=device, weights_only=False)
+    payload = read_checkpoint_payload(path, device)
     if not isinstance(payload, dict) or "model" not in payload:
         raise ValueError(f"checkpoint 结构不符合预期: {path}")
     metadata = payload.get("metadata", {})

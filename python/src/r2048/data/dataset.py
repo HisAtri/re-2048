@@ -646,6 +646,7 @@ def source_summary(reader: BatchReader | MultiSourceReader) -> dict:
         "sources": [
             {
                 "key": source.key,
+                "batch_id": str(source.manifest.data["batch_id"]),
                 "name": source.name,
                 "path": source.path,
                 "weight": float(weight),

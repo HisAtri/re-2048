@@ -1,5 +1,8 @@
 # 构建与运行手册
 
+WebUI 对局与实验工作台：WSL 中运行 `make webui`，默认本地访问。
+跑谱、训练发布、评测评分及停止恢复说明见 [WebUI 使用说明](WEBUI.md)。
+
 ## 目录与约定
 
 | 位置 | 默认值 | 说明 |
@@ -197,6 +200,36 @@ make py ARGS="train --config train.yaml --data $R2048_OUTPUT_DIR/data/new --outp
 * 训练日志逐来源报出训练/验证局数；`train.json` 与 checkpoint 元数据逐来源记身份与权重；
   **验证集为空直接报错**（除非显式 `val_fraction=0`）。
 
+### 本地发布模型
+
+训练选出最佳 checkpoint，或用 `merge-halves` 合并本轮价值与策略半模型后，执行：
+
+```bash
+make py ARGS="publish --checkpoint <完整模型.pt>"
+# 指定发布批次标签与模型仓库根目录（省略 output 时默认 output/models）：
+make py ARGS="publish --checkpoint <完整模型.pt> --release-id 20261007001 --output ./output/models"
+```
+
+命令默认使用 UTC 当天日期和下一个三位流水号。发布目录与产物示例：
+
+```text
+output/models/smnet-b9c64dt-20261007001-s1000000/
+├── smnet-b9c64dt-20261007001-s1000000.safetensor
+└── manifest.json
+```
+
+清单包含正式名称、架构代号与参数、模型文件 SHA256、实际发布时间、发布批次号、
+累计数据集 ID 与去重规模、父模型 ID 与源 checkpoint SHA256。继承训练时按 `source_key`
+合并祖先与本轮来源，同一来源取最大前缀覆盖数，不乘训练轮数；重复训练同一批不增加规模。
+清单 v2 同时保存 `current_dataset_samples`、`inherited_dataset_samples` 和 `dataset_samples`，
+前两项可能重叠，发布名的 `sN` 使用累计并集规模。历史来源没有 batch_id 时展示稳定 key。
+
+发布必须是 `dual` / `joint` 完整模型，实际尺寸须与正式代号的默认规格一致。转换不降精度，
+重载与逐张量比对成功后才提交权重和清单，已有发布目录不覆盖。历史模型可从明确的半模型、
+父模型路径与匹配配置身份的训练报告补齐谱系；无法验证时阻止发布。训练仍保存 `.pt`，正式发布固定用 `.safetensor`（标准 safetensors
+格式，扩展名按项目约定使用单数）。发布模型可直接用于 eval、probe、selfplay、session、WebUI，
+也可作为下一轮训练的 `--init-checkpoint`。详见 [ADR 0048](adr/0048-automatic-identities-and-data-lineage.md)。
+
 ### 换模型结构
 
 模型定义一版一个模块（`python/src/r2048/nn/models/`），注册表把**版本 ID → 定义**一一映射；
@@ -204,7 +237,7 @@ ID 只是索引，**架构超参一律从 checkpoint metadata 的 `architecture_
 
 ```yaml
 train:
-  architecture: dt-s3p3v3c64         # 正式别名：用哪个定义（旧名 dual_tower_v1 仍可解析）
+  architecture: smnet-b9c64dt        # 正式别名：用哪个定义（历史代号仍可解析）
   architecture_params:               # 超参：名字只用于查表，改宽度/深度就是改这里
     channels: 96
     shared_blocks: 2
@@ -260,33 +293,46 @@ make py ARGS="train --config train.yaml --output $R2048_OUTPUT_DIR/runs/value-w1
 
 ### 一次迭代
 
-跑谱 / 训练 / 评测 / 评分各自仍是独立命令，`iterate` 只是把它们按顺序串起来，
-每一步做完在迭代目录留一个标记（见 ADR 0023）：
+跑谱 / 训练 / 发布 / 评测 / 评分各自仍是独立命令，`iterate` 按顺序串起来，
+每一步执行前预留身份，完成后留步骤标记（见 ADR 0048）：
 
 ```bash
 # 首轮：没有上一轮模型 → 用纯 MCTS 当教师产出数据
-make py ARGS="iterate --name c1 --config train.yaml --samples 1000000 --data-seed 20261014 \
+make py ARGS="iterate --config train.yaml --samples 1000000 --data-seed 20261014 \
   --simulations 64 --device cuda --eval-games 400 --eval-seed 20262053"
 
 # 之后各轮：用上一轮的完整模型 NN 自对弈
-make py ARGS="iterate --name c3 --init-checkpoint $R2048_OUTPUT_DIR/runs/c2-policy/model.pt \
+make py ARGS="iterate --init-checkpoint <上轮发布模型.safetensor> \
   --config train.yaml --samples 1000000 --data-seed 20261016 --data-weight 1.0 \
-  --simulations 64 --device cuda --eval-games 400 --eval-seed 20262053 --anchor search=c2-nnmcts64"
+  --simulations 64 --device cuda --eval-games 400 --eval-seed 20262053"
+
+# 指定目录恢复身份、配方和未完成步骤；不需要重填参数：
+make py ARGS="iterate --resume <迭代目录>"
+# 重评只使评测和评分失效，正式发布保持原身份：
+make py ARGS="iterate --resume <迭代目录> --steps evaluate,rate --force"
 ```
 
-四步各做什么：
+五步各做什么：
 
 | 步骤 | 做什么 | 产物 |
 |---|---|---|
 | `selfplay` | 有 `--init-checkpoint` 就 NN 自对弈，否则纯 MCTS 当教师 | `<输出根>/data/<批次号>/` |
-| `train` | 价值 run → 策略 run（冻结价值）→ 合并成这一轮的完整模型 | `<迭代目录>/runs/{value,policy-head,policy}/` |
+| `train` | 价值 run → 策略 run（冻结价值）→ 合并完整模型与累计谱系 | `<迭代目录>/runs/<尝试 ID>/{value,policy-head,policy}/` |
+| `publish` | 自动分配正式发布名，转换并校验权重，写清单 | `<输出根>/models/<正式模型名>/` |
 | `evaluate` | 三条 NN 臂 + 基线臂，全部用同一套协议与 `--eval-seed` | `<迭代目录>/eval/*.jsonl` |
 | `rate` | 追加进评分池、按需刷新锚点、写出评分 | `<迭代目录>/rating.json` |
 
 几条要点：
 
-* **可中断重来**：重跑时跳过已完成的步骤；`--steps evaluate,rate --force` 只重做指定的几步
+* **可中断重来**：用 `--resume` 跳过已完成的步骤；`--steps evaluate,rate --force` 重做指定步骤
   （只跑后面的步骤时，前面几步的产物路径从标记里读）。
+* **身份无需手填**：任务自动命名 `iter-UTC日期流水号`，数据命名 `<策略>-s<模拟数>-UTC日期流水号`。
+  首次分配后持久化，跨语言并发使用文件锁；`--name` 与显式 `--batch-id` 保留兼容。
+* **谱系继承**：父模型用过 A 的 100 万条，本轮新增 B 的 100 万条，发布名为 `s2000000`；
+  重复使用 A 仍为 `s1000000`。仅跑谱教师不贡献继承量。独立训练可记录历史缺口继续，
+  默认迭代在训练前检查谱系，正式发布拒绝不完整来源。
+* **重做不覆盖历史**：force 使本步骤与下游请求和标记失效，分配新的训练尝试/发布身份；
+  旧发布保留。已发布而步骤标记丢失时核对源模型与文件摘要后补回结果。
 * **训练数据集 = YAML 的 `datasets` + 这一轮新产出的数据**（按 `--data-weight` 加权混合）。
   首轮 YAML 里可以不写任何来源。
 * **基线臂每次都重评**（默认 `random` 与 `mcts64`）：它们是评分池锚点的数据来源。
@@ -339,6 +385,31 @@ make py ARGS="iterate --name c3 --init-checkpoint $R2048_OUTPUT_DIR/runs/c2-poli
 * 自对弈/评测侧的批大小才是吞吐关键：`lanes` 与 `in_flight_per_lane` 扫描结果见下。
 
 ### 自对弈流水线：GPU 为什么只用了一半（实测，RTX 5090）
+
+#### 本机性能画像
+
+先停止计算任务，再在 WSL 测量当前模型与真实标注配置：
+
+```bash
+python -m r2048 benchmark probe --checkpoint <正式模型.safetensor> \
+  --simulations 64 --lanes 64 --in-flight 8 --tree-nodes 2 --tree-label-plays 8 \
+  --workers 1,2,4,8,16 --seconds 20
+python -m r2048 benchmark show --checkpoint <正式模型.safetensor> \
+  --simulations 64 --tree-label-plays 8
+```
+
+画像自动写入 `$R2048_OUTPUT_DIR/benchmarks/machines.json`。CLI selfplay、iterate 与 WebUI
+读取同一本机/架构/阶段/标注配置画像，显式参数优先；`--performance-profile off` 关闭。
+WebUI 默认自动模式，提交摘要显示实际选择及来源，恢复旧任务保留冻结值。
+benchmark 不会由正式跑谱隐式执行；无匹配画像时提示并使用原默认值。
+
+纯 MCTS 省略 checkpoint，使用 `--samples 5000` 测生成吞吐；评测用
+`--stage evaluate --batches 512,1024,4096` 测推理批上限；训练用
+`--stage train --config configs/double-tower.yaml --data <数据批> --batches 1024,2048,4096`。
+训练模式可用 `--mode value|policy|dual` 与 `--freeze-value` 指定；训练配方中显式的批大小
+仍优先于画像，WebUI 自动选项会将该字段交给画像解析。精度仍为 FP32（ADR 0025）。
+
+#### 自对弈相位与历史基准
 
 自对弈时 `nvidia-smi` 只报 35% 利用率——但那是**低报**：它按约 1 Hz 粒度判断"有没有核函数在跑"，
 在 2–3 ms 的小核函数之间会漏采样。用 CUDA event 量到的真值是 **58.7%**，
@@ -398,6 +469,14 @@ make py ARGS="selfplay --checkpoint ... --simulations 256 --lanes 64 --in-flight
 ```
 
 **多进程实测**（每进程 64 lanes / in_flight 16 / 256 模拟）：
+
+此表是引入独立树内续弈标注之前的基准，不能用来预期当前默认 `tree_nodes=2`、
+`tree_label_plays=8`、`tree_label_rollout=greedy` 的利用率。独立标注在 CPU 上完整续弈到
+终局，成本见 [ADR 0043](adr/0043-tree-node-independent-labels.md)。历史 CLI 对照
+`labelA-s256-20261009-135026-p1049198` 开启该标注后，`advance_share=82.1%`、
+`gpu_busy_rate=8.7%`（单 worker CUDA event 时间占比）；旧四进程基准 `n4-omp1p0`
+对应读数为 `15.3%`、`52.6%`。这些是各 worker 的相位读数，不是整张卡的总利用率。
+诊断时先对齐模型、模拟数、在途数、进程数及标注配置，再比较吞吐和利用率。
 
 | 配置 | 总 CPU | GPU 利用率 | 功耗 |
 |---|---:|---:|---:|

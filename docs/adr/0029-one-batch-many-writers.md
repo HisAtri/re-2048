@@ -123,3 +123,31 @@ join worker——父进程只做监督（起进程、报批级进度、把 Ctrl-
 顺带修掉两处与"stdout 只放结果"（ADR 0008）不一致的地方：监督进程与单进程自对弈的进度行
 都改到 stderr（C++ 子命令本来就全走 stderr），另外达标/收尾时补上换行，避免日志把进度行与
 汇总粘在一起。
+
+## 后续订正（2026-10-10）：监督进程的失败路径与遥测读取
+
+**问题**：一次 `--workers 16` 的命令在启动约两分钟后监督进程报错退出，**16 个 worker 继续跑了
+下去**（reparent 给 init），GPU 一直满着，直到它们把这批自己跑完。两个缺陷叠在一起：
+
+* **遥测读取没有容错**：监督进程每 2 秒读一遍各 worker 的 `worker-N.json`（worker 每 0.5 秒
+  原子重写它），写法是 `exists()` 之后 `read_text()`——而 `/mnt/e` 的 9p 挂载上 rename 从读取方
+  看**不原子**：`exists()` 为真之后 `open` 仍会 ENOENT（实测复现：8 个写入者连续重写，读取方
+  30 秒撞到 2 次）。崩出来的信息是 `FileNotFoundError: .../worker-3.json`。同一段循环里读清单
+  的地方早有这条结论（"清单正被某个 worker 原子重写"），遥测这一处漏了。
+* **异常退出路径是空的**：Ctrl-C 会被转成一次 `stop` 广播（`request_stop`），但监督进程自己抛
+  异常时没有人写这个文件。父进程一死，worker 就只剩"跑到目标"这一个终点。
+
+**改法**：遥测读取收进 `_telemetry()`，读不到（`OSError` / `ValueError`）当作这一轮没有遥测——
+少读一行进度不该让监督挂掉。监督循环外面包一层 `except BaseException`：写一次 `stop`、
+**等 worker 走到局边界收尾**，再把异常原样抛出（命令仍以非 0 退出——这次运行没有被监督到最后，
+必须让调用方看见）。异常路径与 Ctrl-C 共用 `write_stop()`，控制文件的粘住语义（决策 7）让一条
+指令停整批；因为它不删，续跑前要先删掉它（自对弈入口会提示这一点）。
+
+**验证**：CPU 上真跑 2 worker（`--simulations 8 --lanes 2`），在监督进程的作业状态文件上人为
+制造故障（`status.json.tmp` 位置放一个目录）→ 日志出现"监督进程出错：已写 <批>/control，
+等 2 个 worker 走到局边界停车"，进程全部退出且**无残留**，批次 `state: stopped` 且
+`verify --no-replay` 通过（4 个分片 / 2,796 条），退出码非 0。正常路径回归：2 worker 跑满目标
+收尾 `complete`（3,707 条 / 7 局），产物声明的格式闸门照常通过。遥测读取的锤击：8 个写入者
+连续重写 30 秒，`_telemetry` 读 314 轮、其中 116 轮次读不到被跳过、**0 异常**（旧写法在这
+116 次上都有崩掉监督进程的机会）。`python/tests/test_selfplay.py` 4 项、
+`test_experiment_tasks.py` 与 `test_iteration_publication.py` 9 项通过。

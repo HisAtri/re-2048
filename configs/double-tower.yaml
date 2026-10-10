@@ -7,9 +7,9 @@
 # 把历史批次列进 datasets 即可——那会把"数据量"一并变成变量，对照要另设。
 #
 # 架构写在 train 小节里（它是 TrainConfig 的字段）：名字只用于查表，体量由参数决定——
-# dt-s3p3v3c64 = 共享 3 块 + 策略塔 3 块 + 价值塔 3 块 + 64 通道（ADR 0026）。
+# smnet-b9c64dt = 共 9 个残差块、64 通道、双塔（共享 3 + 每塔 3，ADR 0047）。
 train:
-  architecture: dt-s3p3v3c64
+  architecture: smnet-b9c64dt
   architecture_params:
     channels: 64
     shared_blocks: 3

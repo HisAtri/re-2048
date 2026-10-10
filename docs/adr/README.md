@@ -12,7 +12,7 @@ ADR 解释为什么整体是这个形状。
 | [0004](0004-rules-and-action-order.md) | 规则语义与动作顺序契约 | 已采纳 |
 | [0005](0005-board-representation-and-tables.md) | 棋盘表示与查表移动生成 | 已采纳 |
 | [0006](0006-search-formulation.md) | 搜索形式化：UCT-rollout 与 NN 引导搜索 | 已采纳 |
-| [0007](0007-data-format-and-provenance.md) | 训练数据格式与来源校验 | 已采纳 |
+| [0007](0007-data-format-and-provenance.md) | 训练数据格式与来源校验 | 已采纳（重放只对 C++ 教师成立，见文件内 2026-10-10 订正） |
 | [0008](0008-output-layout-and-naming.md) | 输出目录布局与默认命名 | 已采纳 |
 | [0009](0009-dataset-and-split.md) | 训练数据的读取与划分口径 | 已采纳 |
 | [0010](0010-training-recipes-and-gates.md) | 训练配方与门槛 | 已采纳 |
@@ -34,7 +34,7 @@ ADR 解释为什么整体是这个形状。
 | [0026](0026-model-naming-and-tiers.md) | 模型命名分层与版本层级（测试版 / 正式版） | 已采纳 |
 | [0027](0027-inference-pipeline-utilisation.md) | 推理管线的性能诊断与引擎优化方向 | 已采纳 |
 | [0028](0028-multi-threaded-search.md) | 多线程搜索（K 个引擎共享写入侧 + 合并推理线程） | 已采纳（决策 2 的前提已被 0031 的实测否掉：K>1 时内容不可复现） |
-| [0029](0029-one-batch-many-writers.md) | 一个数据批、多个写者（跨进程并发跑谱） | 已采纳 |
+| [0029](0029-one-batch-many-writers.md) | 一个数据批、多个写者（跨进程并发跑谱） | 已采纳（监督失败路径与遥测容错见文件内 2026-10-10 订正） |
 | [0030](0030-value-label-ordering-collapse.md) | MCTS 退化：价值标签的同根排序塌缩；改续弈策略被证实（退化不复现，深度不是杠杆） | 已采纳（三版处方被实测否掉，第四版被证实） |
 | [0031](0031-why-parallel-selfplay-is-not-reproducible.md) | 并行跑谱不可复现的原因：挂起不回填（不是缓存） | 已采纳 |
 | [0032](0032-advantage-weighted-policy-improvement.md) | 策略改进算子（Â 加权一步改进）首轮实测：不改善、强推变差；归一化尺度在弱信号处反而推得更狠 | 已采纳（负结果；默认仍是 visits） |
@@ -52,6 +52,11 @@ ADR 解释为什么整体是这个形状。
 | [0044](0044-tree-label-ab-and-training-gates.md) | 独立树内标签的训练闸门、单变量 A/B 与默认配方验收 | 已采纳（rollout + top_visits） |
 | [0045](0045-webui-workspace-design.md) | Gradio 工作台设计系统、响应式布局与编辑复盘流程 | 已采纳 |
 | [0046](0046-project-output-root.md) | 数据集与模型默认归档在项目 output/ | 已采纳 |
+| [0047](0047-local-model-publication.md) | 双塔正式代号与本地 safetensor 模型发布清单 | 已采纳 |
+| [0048](0048-automatic-identities-and-data-lineage.md) | 自动身份分配、迭代发布与累计数据谱系 | 已采纳 |
+| [0049](0049-gradio-experiment-queue.md) | Gradio 实验工作台、持久队列、合作式停止与对局资源占用 | 已采纳 |
+| [0050](0050-experiment-workbench-layout.md) | 实验页面独立参数、全宽操作区与任务视图 | 已采纳 |
+| [0051](0051-machine-performance-profiles.md) | CLI、迭代与 WebUI 统一加载本机实测性能画像 | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

@@ -20,6 +20,7 @@ struct EvaluateConfig {
     // 进度以 JSON 行写到 stderr（见 cpp/core/logging.h 的 Progress::set_json）：
     // 上层编排（r2048.jobs.run_cpp）靠它拿到结构化进度，而不是解析人类可读文本。
     bool progress_json = false;
+    std::string control_path;
 };
 
 struct GameOutcome {

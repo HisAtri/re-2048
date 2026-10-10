@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "core/control.h"
 #include "core/fileio.h"
 #include "core/json.h"
 #include "core/logging.h"
@@ -16,20 +17,29 @@ namespace r2048 {
 
 EvaluateResult run_evaluate(const EvaluateConfig& config) {
     if (config.games == 0) throw std::runtime_error("对局数必须大于 0");
-    const uint32_t workers = config.workers > 0
-                                 ? config.workers
-                                 : std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t workers =
+        config.workers > 0 ? config.workers : std::max(1u, std::thread::hardware_concurrency());
     const double start = monotonic_seconds();
 
     std::vector<GameOutcome> outcomes(config.games);
     std::atomic<uint64_t> next_game{0};
     std::atomic<uint64_t> finished{0};
+    std::atomic<uint32_t> alive{workers};
     std::exception_ptr worker_error;
+    std::mutex error_mutex;
 
     auto worker_body = [&]() {
+        struct Finished {
+            std::atomic<uint32_t>& count;
+            ~Finished() { count.fetch_sub(1); }
+        } guard{alive};
+        Control control;
+        control.set_path(config.control_path);
+        control.set_sticky(true);
         std::unique_ptr<MoveSelector> selector =
             make_selector(config.policy, config.seed, config.simulations, config.temperature_moves);
         while (true) {
+            if (control.poll() != ControlCommand::kNone) break;
             const uint64_t index = next_game.fetch_add(1);
             if (index >= config.games) break;
             try {
@@ -42,6 +52,7 @@ EvaluateResult run_evaluate(const EvaluateConfig& config) {
                 record.steps = outcome.steps;
                 outcomes[index] = record;
             } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex);
                 worker_error = std::current_exception();
                 next_game.store(config.games);
                 break;
@@ -58,13 +69,11 @@ EvaluateResult run_evaluate(const EvaluateConfig& config) {
     progress.set_total(static_cast<int64_t>(config.games));
     if (config.progress_json) progress.set_json("evaluate", "games");
     uint64_t last_seen = 0;
-    while (last_seen < config.games) {
+    while (last_seen < config.games && alive.load() > 0) {
         const uint64_t now = finished.load();
         if (now != last_seen) {
             last_seen = now;
             progress.update(static_cast<int64_t>(now));
-        } else if (worker_error != nullptr) {
-            break;
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
@@ -75,6 +84,8 @@ EvaluateResult run_evaluate(const EvaluateConfig& config) {
 
     EvaluateResult result;
     result.games = std::move(outcomes);
+    // 停止只在局边界生效；未发出的局不应变成零分记录，更不能进入评分池。
+    std::erase_if(result.games, [](const GameOutcome& game) { return game.steps == 0; });
     result.seconds = monotonic_seconds() - start;
 
     std::vector<uint64_t> scores;
@@ -100,7 +111,7 @@ EvaluateResult run_evaluate(const EvaluateConfig& config) {
         result.tile_counts[exponent] = count;
     }
 
-    if (!config.jsonl_path.empty()) {
+    if (!config.jsonl_path.empty() && result.games.size() == config.games) {
         // 纯 C++ 轨道的协议变量只有这几项，其余全部写 null（“该策略没有这个变量”）。
         // 依据：本路径是整数运算，workers 实测逐字节一致（只是性能参数），没有浮点、
         // 没有批推理缓存，所以 lanes / in_flight / max_batch / cache_entries / device
@@ -125,8 +136,7 @@ EvaluateResult run_evaluate(const EvaluateConfig& config) {
             record.set("rules_version", Json::integer(kRulesVersion));
             record.set("protocol_version", Json::integer(kProtocolVersion));
             record.set("simulations", search ? Json::integer(config.simulations) : Json());
-            record.set("temperature_moves",
-                       search ? Json::integer(config.temperature_moves) : Json());
+            record.set("temperature_moves", search ? Json::integer(config.temperature_moves) : Json());
             record.set("c_puct", Json());
             record.set("temperature", Json());
             record.set("inference_precision", Json());

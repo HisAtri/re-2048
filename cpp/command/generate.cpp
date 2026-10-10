@@ -58,9 +58,8 @@ int run_generate(int argc, const char* const* argv) {
         return 0;
     }
     args.expect_only({"policy", "samples", "seed", "simulations", "temperature-moves", "tree-nodes",
-                      "rollout-policy",
-                      "shard-samples", "workers", "out", "batch-id", "model-id", "continue", "control",
-                      "progress-json", "quiet", "help"});
+                      "rollout-policy", "shard-samples", "workers", "out", "batch-id", "model-id", "continue",
+                      "control", "progress-json", "quiet", "help"});
 
     GenerateConfig config;
     config.policy = args.str("policy", "");
@@ -84,7 +83,17 @@ int run_generate(int argc, const char* const* argv) {
     config.greedy_rollout = rollout_policy == "greedy";
     config.shard_samples = args.u64("shard-samples", 100000);
     config.workers = static_cast<uint32_t>(args.i32("workers", 0));
-    config.batch_id = args.str("batch-id", make_batch_id(config.policy, config.simulations));
+    // 默认参数表达式会立即求值，因此不能在 args.str 的 fallback 里分配身份。
+    // 续跑从 manifest 取原身份；显式批次号和 worker 不应消耗新编号。
+    if (args.has("batch-id")) {
+        config.batch_id = args.str("batch-id", "");
+    } else if (args.flag("continue")) {
+        const std::string existing = args.str("out", "");
+        if (existing.empty()) throw std::runtime_error("--continue 必须指定 --out");
+        config.batch_id = read_manifest(existing).meta.batch_id;
+    } else {
+        config.batch_id = make_batch_id(config.policy, config.simulations);
+    }
     config.model_id = args.str("model-id", "");
     config.data_dir = args.str("out", default_data_dir(config.batch_id));
     config.control_path = args.str("control", "");
@@ -108,23 +117,22 @@ int run_generate(int argc, const char* const* argv) {
     }
 
     if (!args.flag("quiet")) {
-        log_status("计划：策略 %s%s，样本 %s，种子 %llu，worker %u，输出 %s%s", config.policy.c_str(),
-                   config.policy == "mcts" ? ("（模拟 " + std::to_string(config.simulations) + "）").c_str() : "",
-                   config.samples_target == 0 ? "不限量" : std::to_string(config.samples_target).c_str(),
-                   static_cast<unsigned long long>(config.seed), config.workers == 0 ?
-                       std::max(1u, std::thread::hardware_concurrency()) : config.workers,
-                   config.data_dir.c_str(), config.resume ? "（续跑）" : "");
+        log_status(
+            "计划：策略 %s%s，样本 %s，种子 %llu，worker %u，输出 %s%s", config.policy.c_str(),
+            config.policy == "mcts" ? ("（模拟 " + std::to_string(config.simulations) + "）").c_str() : "",
+            config.samples_target == 0 ? "不限量" : std::to_string(config.samples_target).c_str(),
+            static_cast<unsigned long long>(config.seed),
+            config.workers == 0 ? std::max(1u, std::thread::hardware_concurrency()) : config.workers,
+            config.data_dir.c_str(), config.resume ? "（续跑）" : "");
     }
     // 纯 C++ 命令自己接管 SIGINT/SIGTERM：Ctrl-C 不该丢尾部数据。
     Control::install_signal_handlers();
 
     const GenerateResult result = run_generate(config);
-    const double per_second =
-        result.seconds > 0 ? static_cast<double>(result.samples) / result.seconds : 0.0;
+    const double per_second = result.seconds > 0 ? static_cast<double>(result.samples) / result.seconds : 0.0;
     log_status("完成：状态 %s，样本 %llu，局数 %u，耗时 %.2f 秒（%.0f 样本/秒）",
-               batch_state_name(result.state).c_str(),
-               static_cast<unsigned long long>(result.samples), result.episodes, result.seconds,
-               per_second);
+               batch_state_name(result.state).c_str(), static_cast<unsigned long long>(result.samples),
+               result.episodes, result.seconds, per_second);
     // stdout 只放可被脚本消费的结果：manifest 路径。
     std::printf("%s\n", result.manifest_path.c_str());
     return 0;

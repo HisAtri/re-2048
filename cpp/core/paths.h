@@ -15,7 +15,7 @@ std::string default_data_dir(const std::string& batch_id);
 // 评测输出目录：<输出根>/eval
 std::string default_eval_dir();
 
-// 默认批次号：<策略>[-s<模拟次数>]-<日期>-<时刻>，便于在目录名上直接读出这批数据的来源。
+// 默认批次号：<策略>-s<模拟次数>-<UTC 日期+三位流水号>；与 Python 共用文件锁发号器。
 std::string make_batch_id(const std::string& policy, uint32_t simulations);
 
 }  // namespace r2048

@@ -1,7 +1,7 @@
-"""一次迭代 = 跑谱 → 训练 → 评测 → 评分。
+"""一次迭代 = 跑谱 → 训练 → 发布 → 评测 → 评分。
 
-**薄驱动**：四步各自都是对既有入口的一次调用（`run_selfplay` / `run_training` /
-`run_evaluation` / `rating.ingest_jsonl`），不引入任何新机制。这样任何一步都能用原来的
+**薄驱动**：五步各自调用独立入口（跑谱、训练合并、发布、评测与评分），
+任务身份与请求在执行前落盘，保证中断恢复复用同一产物。这样任何一步都能用原来的
 CLI 单独重跑——这一点是刻意的：迭代失败时不该只有"重跑整个迭代"一个选项。
 
 **幂等**：每步做完在迭代目录写 `steps/<步>.json`（记录这一步产出了什么）。重跑时跳过
@@ -17,40 +17,41 @@ CLI 单独重跑——这一点是刻意的：迭代失败时不该只有"重跑
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from r2048 import paths
 from r2048.config import (
     DATASETS_SECTION,
-    TRAIN_SECTION,
     load_config,
     parse_datasets,
-    train_section_payload,
 )
-from r2048.fileio import write_json_atomic
+from r2048.fileio import read_json, write_json_atomic
+from r2048.identity import allocate_id, file_lock
+from r2048.identity import batch_id as allocate_batch_id
 from r2048.jobs import JobDir, run_cpp
-from r2048.nn.training import DatasetSpec, TrainConfig, run_training
+from r2048.nn.lineage import file_sha256
+from r2048.nn.training import DatasetSpec
 from r2048.runtime.selfplay import SelfplayConfig, run_selfplay
-from r2048.workflows import rating as rating_module
-from r2048.workflows.evaluate import EvalConfig, run_evaluation
-from r2048.workflows.merge import merge_halves
+from r2048.task_control import check_stop
+from r2048.workflows.publish import publish_model
 
 # 步骤的规范顺序。`--steps` 只能从中挑选，不能改顺序：后一步的输入是前一步的产物。
-STEPS = ("selfplay", "train", "evaluate", "rate")
+STEPS = ("selfplay", "train", "publish", "evaluate", "rate")
 # 默认基线臂：评分池的锚点就是这两个（ADR 0018 之后用新格式重跑过的那两条）。
 DEFAULT_BASELINES = ("random", "mcts64")
 
 
 @dataclass
 class IterateConfig:
-    name: str
     config_path: str  # 训练 YAML（ADR 0021）：datasets + train
-    output: str  # 迭代目录（默认 <输出根>/iters/<name>）
-    steps: tuple[str, ...] = STEPS
+    name: str = ""
+    output: str = ""  # 迭代目录（默认 <输出根>/iters/<name>）
+    resume: str = ""
+    steps: tuple[str, ...] | None = None
     force: bool = False
     # 上一轮的完整模型：跑谱用它当对手（NN 自对弈），训练用它当起点。
     # 不给则用纯 MCTS 当教师（首轮引导，见 ADR 0013 里的 c1）。
@@ -61,12 +62,12 @@ class IterateConfig:
     # 协议参数：跑谱、NN 评测与基线评测**共用同一套**（统一注入并记录在 iteration.json 里）。
     # 分开配会让"这条曲线是在什么条件下得到的"重新变成注释里的口头约定。
     simulations: int = 64
-    lanes: int = 64
-    in_flight: int = 8
+    lanes: int | None = None
+    in_flight: int | None = None
     search_threads: int = 1
     # 跑谱的并行度：>1 时起 N 个进程写同一批（每个 worker 单线程，数据可复现，ADR 0031）。
     # 样本目标是整批的，所以进程数可以按机器随便改，不需要分摊配额（ADR 0029 的订正）。
-    data_workers: int = 4
+    data_workers: int | None = None
     # 纯 C++ 教师的 rollout 续弈策略（uniform / greedy）。默认 greedy：它决定候选价值
     # 标签的同根区分度，而模型强度跟着区分度走（ADR 0030 的实测）。它进数据批的来源记录，
     # 所以改了它就是换了教师。
@@ -80,7 +81,11 @@ class IterateConfig:
     tree_label_rollout: str = "greedy"
     c_puct: float = 1.5
     device: str = "cuda"
+    max_batch: int | None = None
+    performance_profile: str = "auto"
+    performance: dict = field(default_factory=dict)
     eval_games: int = 400
+    eval_simulations: int = 0  # 独立评测预算；0 沿用跑谱预算，兼容既有 CLI 配置。
     eval_seed: int = 0
     baselines: tuple[str, ...] = DEFAULT_BASELINES
     anchors: dict[str, str] = field(default_factory=dict)
@@ -108,6 +113,53 @@ class IterateResult:
 
 
 def run_iteration(config: IterateConfig) -> IterateResult:
+    if config.resume:
+        directory = Path(config.resume).resolve()
+        stored = read_json(directory / "iteration.json")
+        for key in ("name", "config_path", "output", "init_checkpoint"):
+            requested = getattr(config, key)
+            before = stored.get(key)
+            if key != "name" and requested and before:
+                requested, before = str(Path(requested).resolve()), str(Path(before).resolve())
+            if requested and requested != before:
+                raise ValueError(f"续跑的 {key} 与原任务不一致")
+        # 续跑只允许改变选择的步骤与 force；训练和搜索参数从首次快照恢复。
+        steps, force = config.steps or tuple(stored.get("steps", STEPS)), config.force
+        for key in vars(config):
+            if key in stored and key not in ("steps", "force", "resume", "on_progress"):
+                setattr(config, key, stored[key])
+        config.steps, config.force = steps, force
+        config.output = str(directory)
+    elif not config.name:
+        if config.output and (Path(config.output) / "iteration.json").exists():
+            raise ValueError("任务目录已经存在，请使用 --resume")
+        config.name = f"iter-{allocate_id('iteration')}"
+    if not config.resume:
+        from r2048.performance import resolve
+
+        effective, config.performance = resolve(
+            "selfplay",
+            {**config.payload(), "workers": config.data_workers},
+            config.init_checkpoint,
+            mode=config.performance_profile,
+        )
+        config.data_workers = effective["workers"]
+        for key in ("lanes", "in_flight", "max_batch"):
+            setattr(config, key, effective[key])
+    if not config.config_path:
+        raise ValueError("创建迭代任务必须提供 --config；续跑使用 --resume")
+    config.steps = config.steps or STEPS
+    config.config_path = str(Path(config.config_path).resolve())
+    if config.init_checkpoint:
+        config.init_checkpoint = str(Path(config.init_checkpoint).resolve())
+    config.output = str(
+        (Path(config.output) if config.output else config.iterations_root / config.name).resolve()
+    )
+    with file_lock(Path(config.output) / ".execution.lock", blocking=False):
+        return _run_iteration(config)
+
+
+def _run_iteration(config: IterateConfig) -> IterateResult:
     unknown = [step for step in config.steps if step not in STEPS]
     if unknown:
         raise ValueError(f"未知步骤 {unknown}，可选 {list(STEPS)}")
@@ -118,21 +170,55 @@ def run_iteration(config: IterateConfig) -> IterateResult:
     directory = Path(config.output) if config.output else config.iterations_root / config.name
     started = time.monotonic()
     written = _load_steps(directory)
+    snapshot_path = directory / "iteration.json"
+    if snapshot_path.exists():
+        snapshot = read_json(snapshot_path)
+        for key in ("config_path", "init_checkpoint", "output"):
+            if snapshot.get(key):
+                snapshot[key] = str(Path(snapshot[key]).resolve())
+        current = json.loads(json.dumps(config.payload()))
+        differing = [
+            key
+            for key, value in snapshot.items()
+            if key not in ("steps", "force", "resume") and key in current and current[key] != value
+        ]
+        if differing:
+            raise ValueError(f"既有迭代任务的参数发生变化：{differing}；新实验请创建新任务")
     result = IterateResult(name=config.name, directory=str(directory))
 
     with JobDir(config.name, "iterate", params=config.payload(), path=directory) as job:
         config.on_progress = job.callback()
-        write_json_atomic(directory / "iteration.json", config.payload())
+        if not snapshot_path.exists():
+            write_json_atomic(snapshot_path, config.payload())
         for step in STEPS:
             if step not in config.steps:
                 continue
             if step in written and not config.force:
                 print(f"跳过 {step}（已完成，用 --force 重做）")
                 continue
+            if config.force:
+                # 在新产物生成之前使下游失效；中断后也不会复用依赖旧上游的评测或发布。
+                for downstream in STEPS[STEPS.index(step) :]:
+                    written.pop(downstream, None)
+                    (directory / "steps" / f"{downstream}.json").unlink(missing_ok=True)
+                    (directory / "requests" / f"{downstream}.json").unlink(missing_ok=True)
+            required = {
+                "train": ("selfplay",),
+                "publish": ("train",),
+                "evaluate": ("train", "publish"),
+                "rate": ("evaluate",),
+            }.get(step, ())
+            missing = [name for name in required if name not in written]
+            if missing:
+                raise ValueError(f"{step} 缺少前置步骤：{missing}")
             print(f"[{step}] 开始")
+            check_stop()
             produced = _STEP_FUNCS[step](config, written, job)
+            if step == "selfplay" and produced["state"] != "complete":
+                raise InterruptedError(f"数据批处于 {produced['state']}，保留原身份；使用 --resume 继续")
             written[step] = produced
             write_json_atomic(directory / "steps" / f"{step}.json", produced)
+            check_stop()
             print(f"[{step}] 完成：{_summarize(step, produced)}")
         result.steps = {step: produced for step, produced in written.items() if step in config.steps}
         rating_json = written.get("rate", {}).get("rating_json", "")
@@ -153,17 +239,62 @@ def _step_selfplay(config: IterateConfig, written: dict, job: JobDir) -> dict:
     """产出这一轮的数据批：有上一轮模型就 NN 自对弈，没有就纯 MCTS 当教师。"""
     import torch
 
-    from r2048.nn.model import load_checkpoint
+    from r2048.nn.model import load_checkpoint, read_checkpoint_payload
 
-    batch_id = f"{config.name}-s{config.simulations}-{time.strftime('%Y%m%d-%H%M%S')}"
+    if any(
+        value is None for value in (config.data_workers, config.lanes, config.in_flight, config.max_batch)
+    ):
+        from r2048.performance import resolve
+
+        effective, config.performance = resolve(
+            "selfplay",
+            {**config.payload(), "workers": config.data_workers},
+            config.init_checkpoint,
+            mode=config.performance_profile,
+        )
+        config.data_workers = effective["workers"]
+        for key in ("lanes", "in_flight", "max_batch"):
+            setattr(config, key, effective[key])
+    directory = Path(config.output)
+    request_path = directory / "requests" / "selfplay.json"
+    if request_path.exists():
+        batch_id = read_json(request_path)["batch_id"]
+    else:
+        batch_id = allocate_batch_id("nn" if config.init_checkpoint else "mcts", config.simulations)
+        write_json_atomic(request_path, {"batch_id": batch_id})
     data_dir = paths.data_dir(batch_id)
+    continuing = (data_dir / "manifest.json").exists()
+    if continuing:
+        summary = read_json(data_dir / "manifest.json")
+        if summary["batch_id"] != batch_id:
+            raise ValueError("数据 manifest 与任务预留批次身份不一致")
+        if summary.get("state") == "complete":
+            # 增量 manifest 已提交但步骤标记未提交：补回结果，不能向完整批次追加数据。
+            return {
+                "batch_id": batch_id,
+                "data_dir": str(data_dir),
+                "manifest": str(data_dir / "manifest.json"),
+                "teacher": f"nn:{summary['model_id']}"
+                if config.init_checkpoint
+                else f"cpp-mcts{config.simulations}",
+                "samples": int(summary["samples"]),
+                "episodes": int(summary["episodes"]),
+                "state": "complete",
+                "seed": config.data_seed,
+            }
     if config.init_checkpoint:
         device = torch.device(config.device)
-        model, metadata = load_checkpoint(config.init_checkpoint, device)
+        if config.data_workers > 1:
+            metadata = read_checkpoint_payload(config.init_checkpoint)["metadata"]
+            model = None
+        else:
+            model, metadata = load_checkpoint(config.init_checkpoint, device)
         model_id = str(metadata.get("model_id", "")) or Path(config.init_checkpoint).parent.name
         selfplay_config = SelfplayConfig(
             data_dir=str(data_dir),
             batch_id=batch_id,
+            resume=continuing,
+            control_path=os.environ.get("R2048_TASK_CONTROL", ""),
             samples=config.samples,
             seed=config.data_seed,
             model_id=model_id,
@@ -175,6 +306,7 @@ def _step_selfplay(config: IterateConfig, written: dict, job: JobDir) -> dict:
             lanes=config.lanes,
             in_flight_per_lane=config.in_flight,
             search_threads=config.search_threads,
+            max_batch=config.max_batch,
             c_puct=config.c_puct,
             # 接上进度回调：相位汇总（谁在等谁、GPU 忙占比）要落到作业日志里，
             # 而不是只打在终端上——跑完一轮还想回看时，终端已经滚掉了。
@@ -231,11 +363,16 @@ def _step_selfplay(config: IterateConfig, written: dict, job: JobDir) -> dict:
             "simulations": config.simulations,
             "rollout_policy": config.rollout_policy,
             "samples": config.samples,
+            "workers": config.data_workers,
             "seed": config.data_seed,
             "out": str(data_dir),
+            "batch_id": batch_id,
+            "continue": continuing,
+            "control": os.environ.get("R2048_TASK_CONTROL", ""),
             "quiet": True,
         },
         job=job,
+        progress=True,
     )
     # 批次路径从 stdout 末行取（ADR 0008：stdout 只放可被脚本消费的结果）——
     # `generate` 的末行是 manifest.json 的路径，所以批次目录是它的父目录。
@@ -259,74 +396,58 @@ def _step_selfplay(config: IterateConfig, written: dict, job: JobDir) -> dict:
 
 
 def _step_train(config: IterateConfig, written: dict, job: JobDir) -> dict:
-    """价值 run → 策略 run（冻结价值）→ 合并成这一轮的完整模型。
+    from r2048.workflows.dual_training import train_dual
 
-    这套配方是 ADR 0010/0013 的结论：价值头与策略头分开训（共享主干一起优化会把价值头
-    训坏），策略头在冻结价值上训。合并见 `workflows/merge.py`——两个 run 各自只在一个头上
-    是新的，评测必须用"这一轮的价值 + 这一轮的策略"。
-    """
-    batch = written["selfplay"]
-    directory = Path(config.output) if config.output else config.iterations_root / config.name
     file_config = load_config(config.config_path)
-    train_params: dict[str, Any] = train_section_payload(
-        config.config_path, file_config.get(TRAIN_SECTION, {})
-    )
-    # YAML 里的 datasets 是"已有的池子"（多来源，ADR 0021），这一轮新产出的数据按权重
-    # 追加进去。YAML 里可以一个来源都不写——首轮就是这么用的：只有这一轮的数据。
     datasets = (parse_datasets(file_config[DATASETS_SECTION]) if DATASETS_SECTION in file_config else []) + [
-        DatasetSpec(path=batch["data_dir"], weight=config.data_weight)
+        DatasetSpec(path=written["selfplay"]["data_dir"], weight=config.data_weight)
     ]
-    train_params["datasets"] = datasets
-    if config.on_progress is not None:
-        train_params["on_progress"] = config.on_progress
-    seed = int(train_params.get("seed", 0))
-
-    value_run = Path(directory) / "runs" / "value"
-    value_config = TrainConfig(
-        output=str(value_run),
-        init_checkpoint=config.init_checkpoint,
-        mode="value",
-        seed=seed,
-        **{
-            key: value
-            for key, value in train_params.items()
-            if key not in {"output", "mode", "seed", "init_checkpoint", "freeze_value"}
-        },
+    return train_dual(
+        Path(config.output),
+        config.name,
+        config.config_path,
+        datasets,
+        config.init_checkpoint,
+        config.on_progress,
     )
-    value = run_training(value_config)
 
-    # 策略 run 的起点：有上一轮模型就从它的策略路径继续，否则用**刚训好的价值模型**
-    # （首轮没有别的东西可用；它的策略头是随机初始化的，正好就是"要训的那部分"）。
-    policy_head_run = Path(directory) / "runs" / "policy-head"
-    policy_config = TrainConfig(
-        output=str(policy_head_run),
-        init_checkpoint=config.init_checkpoint or value.best_checkpoint,
-        mode="policy",
-        freeze_value=True,
-        # 两个 run 用相邻的种子：它们必须是不同的采样/增强序列，而把两个种子都塞进 CLI
-        # 只会让 YAML 里的 seed 失去意义。
-        seed=seed + 1,
-        **{
-            key: value
-            for key, value in train_params.items()
-            if key not in {"output", "mode", "seed", "freeze_value", "init_checkpoint"}
-        },
-    )
-    policy = run_training(policy_config)
 
-    merged = merge_halves(
-        value.best_checkpoint,
-        policy.best_checkpoint,
-        Path(directory) / "runs" / "policy" / "model.pt",
-        note=f"{config.name}：价值来自 value run（{seed}），策略来自 policy-head run（{seed + 1}）",
-    )
+def _step_publish(config: IterateConfig, written: dict, job: JobDir) -> dict:
+    checkpoint = written["train"]["model"]
+    request_path = Path(config.output) / "requests" / "publish.json"
+    root = paths.output_root() / "models"
+    digest = file_sha256(checkpoint)
+    if request_path.exists():
+        request = read_json(request_path)
+        if request["source_checkpoint_sha256"] != digest:
+            raise ValueError("待发布 checkpoint 已变化，请重做 publish 及下游步骤")
+    else:
+        request = {"release_id": allocate_id("release", root), "source_checkpoint_sha256": digest}
+        write_json_atomic(request_path, request)
+    # 目录提交成功、步骤标记未提交就中断时，按预留身份与源摘要恢复，不能重新发号。
+    matches = list(root.glob(f"*-{request['release_id']}-s*/manifest.json"))
+    if matches:
+        if len(matches) != 1:
+            raise ValueError("预留发布身份对应多个清单")
+        manifest_path = matches[0]
+        manifest = read_json(manifest_path)
+        model_path = manifest_path.parent / manifest["model_file"]
+        if (
+            manifest.get("source_checkpoint_sha256") != digest
+            or file_sha256(model_path) != manifest["model_sha256"]
+        ):
+            raise ValueError("已提交发布与预留源模型或文件摘要不一致")
+    else:
+        result = publish_model(checkpoint, request["release_id"], root, reserved=True)
+        model_path, manifest_path = result.model_path, result.manifest_path
+        manifest = read_json(manifest_path)
     return {
-        "value_checkpoint": value.best_checkpoint,
-        "policy_head_checkpoint": policy.best_checkpoint,
-        "model": merged.path,
-        "model_id": merged.model_id,
-        "seed": seed,
-        "data": [spec.path for spec in datasets],
+        "model": str(model_path),
+        "manifest": str(manifest_path),
+        "release_id": manifest["release_id"],
+        "model_id": manifest["model_id"],
+        "model_sha256": manifest["model_sha256"],
+        "manifest_sha256": file_sha256(manifest_path),
     }
 
 
@@ -334,56 +455,31 @@ def _step_evaluate(config: IterateConfig, written: dict, job: JobDir) -> dict:
     """评测三条 track + 基线臂，全部用同一套协议参数（`--eval-seed` 对齐开局）。"""
     directory = Path(config.output) if config.output else config.iterations_root / config.name
     train = written["train"]
-    arms = _nn_arms(config, train)
-    jsonls: dict[str, str] = {}
-    eval_dir = directory / "eval"
-    eval_dir.mkdir(parents=True, exist_ok=True)
-    for label, checkpoint, track in arms:
-        # 逐局记录落在迭代目录里（不放全局 eval/）：一次迭代的产物应当自包含，
-        # 否则第二次迭代会覆盖第一次的基线记录，而"事后回看那次迭代评了什么"就没了。
-        jsonl = eval_dir / f"{label}.jsonl"
-        result = run_evaluation(
-            EvalConfig(
-                games=config.eval_games,
-                seed=config.eval_seed,
-                checkpoint=checkpoint,
-                track=track,
-                simulations=config.simulations,
-                lanes=config.lanes,
-                in_flight=config.in_flight,
-                search_threads=config.search_threads,
-                c_puct=config.c_puct,
-                device=config.device,
-                label=label,
-                jsonl=str(jsonl),
-                on_progress=config.on_progress,
-            )
-        )
-        jsonls[label] = result.jsonl
-    for label, params in baseline_arms(config):
-        jsonl = eval_dir / f"{label}.jsonl"
-        run_cpp(
-            "evaluate",
-            {
-                **params,
-                "games": config.eval_games,
-                "seed": config.eval_seed,
-                "label": label,
-                "jsonl": str(jsonl),
-                "quiet": True,
-            },
-            job=job,
-        )
-        jsonls[label] = str(jsonl)
+    if "publish" not in written:
+        raise ValueError("完整模型评测需要先完成 publish 步骤")
+    train = {**train, "model": written["publish"]["model"]}
+    from r2048.workflows.assessment import evaluate_group
 
-    return {
-        "arms": [label for label, _, _ in arms] + [label for label, _ in baseline_arms(config)],
-        "protocol": _protocol(config),
-        "jsonl": jsonls,
+    request = directory / "requests" / "evaluate.json"
+    if request.exists():
+        attempt = read_json(request)["attempt"]
+    else:
+        attempt = f"eval-{allocate_id('eval')}"
+        write_json_atomic(request, {"attempt": attempt})
+    params = {
         "games": config.eval_games,
         "seed": config.eval_seed,
-        "directory": str(directory),
+        "simulations": config.eval_simulations or config.simulations,
+        "lanes": config.lanes,
+        "in_flight": config.in_flight,
+        "search_threads": config.search_threads,
+        "c_puct": config.c_puct,
+        "device": config.device,
     }
+    result = evaluate_group(
+        directory / "eval" / attempt, _nn_arms(config, train), baseline_arms(config), params, job
+    )
+    return {**result, "protocol": _protocol(config), "directory": str(directory)}
 
 
 def _nn_arms(config: IterateConfig, train: dict) -> list[tuple[str, str, str]]:
@@ -391,7 +487,7 @@ def _nn_arms(config: IterateConfig, train: dict) -> list[tuple[str, str, str]]:
     return [
         (f"{config.name}-value", train["value_checkpoint"], "nn_value"),
         (f"{config.name}-policy", train["model"], "nn_policy"),
-        (f"{config.name}-nnmcts{config.simulations}", train["model"], "nn_mcts"),
+        (f"{config.name}-nnmcts{config.eval_simulations or config.simulations}", train["model"], "nn_mcts"),
     ]
 
 
@@ -416,7 +512,7 @@ def baseline_arms(config: IterateConfig) -> list[tuple[str, dict]]:
 def _protocol(config: IterateConfig) -> dict:
     """统一注入的评测协议：记下来，否则"这条曲线是在什么条件下得到的"只能靠翻命令行。"""
     return {
-        "simulations": config.simulations,
+        "simulations": config.eval_simulations or config.simulations,
         "lanes": config.lanes,
         "in_flight_per_lane": config.in_flight,
         "search_threads": config.search_threads,
@@ -430,48 +526,22 @@ def _protocol(config: IterateConfig) -> dict:
 
 def _step_rate(config: IterateConfig, written: dict, job: JobDir) -> dict:
     """把这一步的评测追加进评分池，必要时刷新锚点，并把评分写进迭代目录。"""
-    directory = Path(config.output) if config.output else config.iterations_root / config.name
-    pool = paths.output_root() / "rating" / "pool.jsonl"
-    anchors_path = paths.output_root() / "rating" / "anchors.json"
-    jsonls = sorted(written["evaluate"]["jsonl"].values())
-    added = rating_module.ingest_jsonl(pool, jsonls)
-    rows = rating_module.load_pool(pool)
-    if config.anchors:
-        rating_module.save_anchors(anchors_path, rows, config.anchors)
-    anchors = rating_module.load_anchors(anchors_path)
-    ratings = rating_module.compute_ratings(rows, anchors)
-    report = {
-        "name": config.name,
-        "protocol": written["evaluate"]["protocol"],
-        "ingested": added,
-        "pool": str(pool),
-        "anchors": config.anchors,
-        "tracks": {
-            track: [
-                {
-                    "protocol_hash": block["protocol_hash"],
-                    "anchor": block["anchor"]["model_id"],
-                    "models": block["models"],
-                }
-                for block in blocks
-            ]
-            for track, blocks in ratings.items()
-        },
-    }
-    rating_json = directory / "rating.json"
-    write_json_atomic(rating_json, report)
-    return {
-        "pool": str(pool),
-        "anchors": str(anchors_path) if config.anchors else "",
-        "ingested": added,
-        "rating_json": str(rating_json),
-        "pool_rows": len(rows),
-    }
+    from r2048.workflows.assessment import ingest_and_rate
+
+    labels = written["evaluate"]["jsonl"]
+    initialize = {}
+    for label in labels:
+        if label == "random" or label.endswith("-random"):
+            initialize["pure"] = label
+        if label.split("-")[-1] == f"mcts{config.eval_simulations or config.simulations}":
+            initialize["search"] = label
+    return ingest_and_rate(Path(config.output), sorted(labels.values()), config.anchors, initialize)
 
 
 _STEP_FUNCS = {
     "selfplay": _step_selfplay,
     "train": _step_train,
+    "publish": _step_publish,
     "evaluate": _step_evaluate,
     "rate": _step_rate,
 }
@@ -492,7 +562,7 @@ def _load_steps(directory: Path) -> dict[str, dict]:
 def _summarize(step: str, produced: dict) -> str:
     if step == "selfplay":
         return f"{produced['teacher']} 产出 {produced['samples']} 条 / {produced['episodes']} 局 → {produced['data_dir']}"
-    if step == "train":
+    if step in ("train", "publish"):
         return f"完整模型 {produced['model']}"
     if step == "evaluate":
         return f"{len(produced['arms'])} 条臂 × {produced['games']} 局"

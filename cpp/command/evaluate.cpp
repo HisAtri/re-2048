@@ -25,13 +25,16 @@ void print_usage() {
         "  --seed         随机种子（不给则按当前时间生成并打印）\n"
         "  --simulations  mcts 每次决策的模拟次数（默认 64）\n"
         "  --workers      并行 worker 数（默认取硬件并发数）\n"
+        "  --control      停止控制文件（局边界退出）\n"
         "  --jsonl        逐局结果写入的文件（默认 $R2048_OUTPUT_DIR/eval/<策略>-<时间>.jsonl）\n"
         "  --label        逐局记录里的标签（默认用策略名）\n"
         "  --progress-json 进度以 JSON 行写到 stderr（给上层编排读，不给人看）\n"
         "  --quiet        不打印计划行\n");
 }
 
-uint64_t default_seed() { return static_cast<uint64_t>(std::time(nullptr)) ^ 0x517cc1b727220a95ull; }
+uint64_t default_seed() {
+    return static_cast<uint64_t>(std::time(nullptr)) ^ 0x517cc1b727220a95ull;
+}
 
 std::string default_jsonl(const std::string& policy, uint32_t simulations) {
     std::time_t now = std::time(nullptr);
@@ -56,7 +59,7 @@ int run_evaluate(int argc, const char* const* argv) {
         return 0;
     }
     args.expect_only({"policy", "games", "seed", "simulations", "workers", "jsonl", "label", "quiet",
-                      "temperature-moves", "progress-json", "help"});
+                      "temperature-moves", "progress-json", "control", "help"});
 
     EvaluateConfig config;
     config.policy = args.str("policy", "");
@@ -77,12 +80,14 @@ int run_evaluate(int argc, const char* const* argv) {
     config.label = args.str("label", config.policy);
     config.jsonl_path = args.str("jsonl", default_jsonl(config.policy, config.simulations));
     config.progress_json = args.flag("progress-json");
+    config.control_path = args.str("control", "");
 
     if (!args.flag("quiet")) {
-        log_status("计划：策略 %s%s，局数 %llu，种子 %llu，输出 %s", config.policy.c_str(),
-                   config.policy == "mcts" ? ("（模拟 " + std::to_string(config.simulations) + "）").c_str() : "",
-                   static_cast<unsigned long long>(config.games),
-                   static_cast<unsigned long long>(config.seed), config.jsonl_path.c_str());
+        log_status(
+            "计划：策略 %s%s，局数 %llu，种子 %llu，输出 %s", config.policy.c_str(),
+            config.policy == "mcts" ? ("（模拟 " + std::to_string(config.simulations) + "）").c_str() : "",
+            static_cast<unsigned long long>(config.games), static_cast<unsigned long long>(config.seed),
+            config.jsonl_path.c_str());
     }
 
     const EvaluateResult result = run_evaluate(config);

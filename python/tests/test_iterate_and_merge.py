@@ -182,7 +182,7 @@ def test_iterate_rejects_bad_plans(tmp_path: Path) -> None:
     # 迭代里的跑谱必须有目标：不限量是给人守着终端的形态，不是流水线的形态。
     with pytest.raises(ValueError, match="--samples"):
         run_iteration(IterateConfig(steps=("selfplay",), samples=0, **base))
-    assert STEPS == ("selfplay", "train", "evaluate", "rate")
+    assert STEPS == ("selfplay", "train", "publish", "evaluate", "rate")
 
 
 def test_iterate_baseline_specs(tmp_path: Path) -> None:

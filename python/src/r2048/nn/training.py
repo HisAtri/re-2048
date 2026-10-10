@@ -42,17 +42,21 @@ from r2048.data.dataset import (
     source_summary,
 )
 from r2048.data.shards import CANDIDATE_TARGET_DEFINITION
-from r2048.fileio import save_torch_atomic
+from r2048.fileio import read_json, save_torch_atomic, write_json_atomic
+from r2048.identity import allocate_id, file_lock
 from r2048.jobs import finish_console, progress_payload
 from r2048.nn.augment import augment_joint, augment_policy, augment_value
 from r2048.nn.encode import BOARD_CELLS, encode_boards
+from r2048.nn.lineage import lineage_fields, make_lineage, resolve_lineage, sources_from_training
 from r2048.nn.model import (
     DUAL_TOWER_ARCHITECTURE,
     SHARED_ARCHITECTURE,
     architecture_conflict,
     create_model,
     freeze_value_path,
+    read_checkpoint_payload,
 )
+from r2048.task_control import check_stop, stop_requested
 
 VALUE_MODES = ("value",)
 POLICY_MODES = ("policy",)
@@ -97,6 +101,7 @@ class DatasetSpec:
 
 @dataclass
 class TrainConfig:
+    performance: dict = field(default_factory=dict)  # 实际参数的画像来源随 checkpoint 与训练报告保存。
     datasets: list[DatasetSpec] = field(default_factory=list)
     output: str = ""
     mode: str = "value"
@@ -296,7 +301,7 @@ def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
 SAVE_INTERVAL_SECONDS = 600.0
 # 续跑时"这一份 checkpoint 是什么时候写的"以外的字段：它们不是训练语义，
 # 变化不该触发警报（`resume` 就是用户在按的那个开关，保存间隔与停止在哪一步无关）。
-RESUME_VOLATILE_FIELDS = ("resume", "save_every_steps")
+RESUME_VOLATILE_FIELDS = ("resume", "save_every_steps", "performance")
 
 
 def rng_state(rng: torch.Generator, device: torch.device) -> dict:
@@ -952,6 +957,8 @@ def _run_epoch(
             # 落盘检查在统计之后、进度回调之前：回调可能抛异常（测试里的"杀掉"就是这样），
             # 那时 checkpoint 必须已经反映刚刚完成的这一步。
             on_step(epoch, step + 1, float(loss.detach()))
+        if not training:
+            check_stop()
         if training and config.log_every and step % config.log_every == 0:
             elapsed = time.monotonic() - started
             seen = (step + 1) * config.batch_size
@@ -1007,6 +1014,28 @@ def _validate_tree_label_sources(config: TrainConfig, reader: MultiSourceReader)
         )
 
 
+def prepare_training_run(config: TrainConfig) -> dict:
+    allocated = ""
+    if not config.output:
+        from r2048 import paths
+
+        allocated = f"run-{allocate_id('run')}"
+        config.output = str(paths.run_dir(allocated))
+    run_dir = Path(config.output)
+    with file_lock(run_dir / ".identity.lock"):
+        identity_path = run_dir / "run_identity.json"
+        if identity_path.exists():
+            identity = read_json(identity_path)
+            if identity["mode"] != config.mode:
+                raise ValueError("训练目录的阶段身份不一致，请使用新的 output")
+            if (run_dir / "last.pt").exists() and not config.resume:
+                raise ValueError("训练目录已有 checkpoint，请使用 resume 或新的 output")
+        else:
+            identity = {"run_id": allocated or f"run-{allocate_id('run')}", "mode": config.mode}
+            write_json_atomic(identity_path, identity)
+    return identity
+
+
 def run_training(config: TrainConfig) -> TrainResult:
     if config.mode not in ALL_MODES:
         raise ValueError(f"未知训练模式: {config.mode}")
@@ -1029,6 +1058,7 @@ def run_training(config: TrainConfig) -> TrainResult:
         raise ValueError(
             "冻结价值路径时必须给出 --init-checkpoint：在一个随机初始化的价值头上只训策略头没有意义"
         )
+    run_identity = prepare_training_run(config)
     torch.manual_seed(config.seed)
     np.random.seed(config.seed & 0xFFFFFFFF)
 
@@ -1088,9 +1118,19 @@ def run_training(config: TrainConfig) -> TrainResult:
     single_build_id = only_manifest.build_id if only_manifest else ""
 
     source_metadata: dict = {}
+    parent_lineages = []
+    parent_models = []
     if config.init_checkpoint:
-        source = torch.load(config.init_checkpoint, map_location="cpu", weights_only=False)
+        source = read_checkpoint_payload(config.init_checkpoint)
         source_metadata = dict(source.get("metadata", {}))
+        parent_lineages.append(resolve_lineage(config.init_checkpoint))
+        parent_models.append(
+            {
+                "model_id": source_metadata["model_id"],
+                "sha256": file_digest(config.init_checkpoint),
+                "path": str(Path(config.init_checkpoint).resolve()),
+            }
+        )
         # 从 checkpoint 初始化时，结构由这份权重自己决定：请求里如果写了**不同的**架构或超参，
         # 它们会被静默忽略（"我明明改了宽度"是最难查的一类困惑），所以直接拒绝。
         # 与 checkpoint 完全一致的写法是允许的——同一条训练线的 YAML 会被反复带上。
@@ -1141,6 +1181,14 @@ def run_training(config: TrainConfig) -> TrainResult:
 
     run_dir = Path(config.output)
     run_dir.mkdir(parents=True, exist_ok=True)
+    training_model_id = f"{run_identity['run_id']}-{config.mode}"
+    lineage = make_lineage(sources_from_training(data_summary["sources"]), parent_lineages, parent_models)
+    provenance = lineage_fields(lineage)
+    if config.init_checkpoint:
+        provenance.update(
+            source_checkpoint_path=str(Path(config.init_checkpoint).resolve()),
+            source_checkpoint_sha256=parent_models[0]["sha256"],
+        )
     # 每轮的批数：drop_last=False 时最后不足一批也算一步，所以直接用流长度（与调度器的
     # `steps_per_epoch` 相差至多一步，那是既有口径，不在 P3b 里改）。
     batches_per_epoch = len(train_stream)
@@ -1198,7 +1246,7 @@ def run_training(config: TrainConfig) -> TrainResult:
             start_epoch += 1
             step_in_epoch = 0
             print(f"续训：这份 checkpoint 没有随机数状态，从第 {start_epoch + 1} 轮轮首继续")
-        if step_in_epoch >= batches_per_epoch:
+        if step_in_epoch >= batches_per_epoch and not state.get("pending_epoch"):
             start_epoch += 1
             step_in_epoch = 0
         best_metric = state.get("best_metric")
@@ -1245,6 +1293,7 @@ def run_training(config: TrainConfig) -> TrainResult:
     # 主指标的方向取决于“这一轮用没用候选监督”，只有进入循环才知道（`best_metric` 与
     # `best_metric_kind` 已在续跑块里恢复，不能在这里清零——那等于每次续跑都重启最佳的选择）。
     last_save = time.monotonic()
+    pending_epoch = state.get("pending_epoch") if config.resume and (run_dir / "last.pt").exists() else None
 
     def save_last(epoch: int, done: int) -> None:
         """写可续跑的 `last.pt`（原子替换）：轮内的位置 + 随机数状态 + 当前最佳值。
@@ -1260,8 +1309,17 @@ def run_training(config: TrainConfig) -> TrainResult:
                 "checkpoint_version": 2,
                 "epoch": epoch,
                 "step_in_epoch": done,
+                "pending_epoch": pending_epoch,
                 "global_step": epoch * batches_per_epoch + done,
                 "model": _unwrap(model).state_dict(),
+                "metadata": {
+                    **_unwrap(model).metadata(
+                        training_model_id, parent=str(source_metadata.get("model_id", ""))
+                    ),
+                    **provenance,
+                    "training_target": config.mode,
+                    "sources": data_summary["sources"],
+                },
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "history": [asdict(item) for item in history],
@@ -1276,6 +1334,9 @@ def run_training(config: TrainConfig) -> TrainResult:
         last_save = time.monotonic()
 
     def on_step(epoch: int, done: int, _loss: float) -> None:
+        if stop_requested() and done < batches_per_epoch:
+            save_last(epoch, done)
+            check_stop()
         by_steps = config.save_every_steps and done % config.save_every_steps == 0
         if by_steps or time.monotonic() - last_save >= SAVE_INTERVAL_SECONDS:
             save_last(epoch, done)
@@ -1283,21 +1344,27 @@ def run_training(config: TrainConfig) -> TrainResult:
     for epoch in range(start_epoch, config.epochs):
         # 只有续跑后的第一轮需要跳过：之后每一轮都从轮首开始。
         skip = step_in_epoch if epoch == start_epoch else 0
-        train_loss, train_metrics, train_seconds = _run_epoch(
-            model,
-            train_stream,
-            optimizer,
-            scheduler,
-            config,
-            device,
-            amp_dtype,
-            score_scale,
-            rng,
-            epoch,
-            label="训练",
-            skip=skip,
-            on_step=on_step,
-        )
+        if pending_epoch is None:
+            train_loss, train_metrics, train_seconds = _run_epoch(
+                model,
+                train_stream,
+                optimizer,
+                scheduler,
+                config,
+                device,
+                amp_dtype,
+                score_scale,
+                rng,
+                epoch,
+                label="训练",
+                skip=skip,
+                on_step=on_step,
+            )
+            pending_epoch = (train_loss, train_metrics, train_seconds)
+            save_last(epoch, batches_per_epoch)
+        else:
+            train_loss, train_metrics, train_seconds = pending_epoch
+        check_stop()
         nan = float("nan")
         val_loss, val_mae, val_ce, val_agreement, val_records = nan, nan, nan, nan, 0
         candidate_mae, pair_agreement, best_hit, regret = nan, nan, nan, nan
@@ -1403,7 +1470,7 @@ def run_training(config: TrainConfig) -> TrainResult:
             best_metric = primary
             best_checkpoint = str(run_dir / "model.pt")
             meta = _unwrap(model).metadata(
-                model_id=model_id_for(config, entry.value_target),
+                model_id=training_model_id,
                 parent=str(source_metadata.get("model_id", "")),
             )
             meta.update(
@@ -1445,14 +1512,15 @@ def run_training(config: TrainConfig) -> TrainResult:
                     },
                 }
             )
-            if config.init_checkpoint:
-                meta["source_checkpoint_sha256"] = file_digest(config.init_checkpoint)
+            meta.update(provenance)
+            meta["training_recipe"] = model_id_for(config, entry.value_target)
             save_torch_atomic(
                 best_checkpoint, {"checkpoint_version": 1, "model": model_state, "metadata": meta}
             )
 
         # 轮末的 last.pt 写在最佳值更新之后：它是"续跑从这里接着跑"的锚点，
         # 里头的 best_metric 必须是这一轮挑选之后的值（否则续跑会把最佳选择的进度退回去）。
+        pending_epoch = None
         save_last(epoch, batches_per_epoch)
 
     train_json = str(run_dir / "train.json")
@@ -1465,6 +1533,8 @@ def run_training(config: TrainConfig) -> TrainResult:
                 "frozen_parameters": len(frozen),
                 "trainable_parameters": sum(p.numel() for p in trainable),
                 "data": data_summary,
+                "run_id": run_identity["run_id"],
+                **provenance,
                 # 逐来源的 manifest 摘要：manifest 是"这批数据有没有被改过"的唯一凭据，
                 # 多来源时它必须逐来源记，否则事后无法判断到底是哪一批变了。
                 "data_manifest_sha256": {

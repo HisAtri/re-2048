@@ -262,11 +262,26 @@ class AppState:
         # 最近一次从会话收到的 state。分析帧里没有盘面，渲染时必须有个可回落的来源，
         # 否则"分析中"的几帧会把棋盘画成另一个局面。
         self.last_state: dict | None = None
+        self.compute_busy = False
+        from r2048.webui.tasks import TaskManager
+
+        self.tasks = TaskManager(acquire=self.reserve_compute, release=self.release_compute)
+
+    def reserve_compute(self):
+        self.auto_stop = True
+        with self.lock:
+            self.compute_busy = True
+
+    def release_compute(self):
+        with self.lock:
+            self.compute_busy = False
 
     def attach(self, checkpoint: str, device: str, strategy: str, simulations: int, time_ms: int) -> None:
+        if self.compute_busy:
+            raise SessionError("实验任务正在计算，完成后可连接模型")
         if self.client is not None and checkpoint == self.checkpoint and device == self.device:
             return  # 同一个模型不重建会话：重建会丢掉当前盘面与棋谱
-        self.close()
+        self._close_client()
         self.client = SessionClient(
             session_argv(
                 checkpoint=checkpoint,
@@ -281,16 +296,24 @@ class AppState:
         self.last_state = None
 
     def close(self) -> None:
+        self.tasks.close()
+        self._close_client()
+
+    def _close_client(self) -> None:
         if self.client is not None:
             self.client.close()
             self.client = None
 
     def call(self, command: str, timeout: float = 300.0) -> list[dict]:
+        if self.compute_busy and command.split()[0] in ("analyze", "genmove"):
+            raise SessionError("实验任务正在计算，分析与自动落子暂时停用")
         if self.client is None:
             raise SessionError("还没有连接模型：先选一个 checkpoint 并点「连接模型」")
         return self.client.request(command, timeout=timeout)
 
     def stream(self, command: str, timeout: float = 300.0):
+        if self.compute_busy:
+            raise SessionError("实验任务正在计算，分析暂时停用")
         if self.client is None:
             raise SessionError("还没有连接模型：先选一个 checkpoint 并点「连接模型」")
         return self.client.stream(command, timeout=timeout)
@@ -372,201 +395,234 @@ def build_app(state: AppState | None = None):
         }
     )
     js = Path(__file__).with_name("workspace.js").read_text(encoding="utf-8")
-    with gr.Blocks(title="re-2048 · 对局工作台", theme=theme, css=css, js=js) as demo:
+    with gr.Blocks(title="re-2048 · 对局与实验工作台", theme=theme, css=css, js=js) as demo:
         ui_html(
             '<header class="r2048-brand"><div class="r2048-logo">2048</div><div>'
-            "<h1>对局工作台</h1><p>re-2048 / 探索局面，理解每一步决策</p></div></header>"
+            "<h1>对局与实验工作台</h1><p>re-2048 / 探索局面，管理训练与评测</p></div></header>"
         )
-        models = inventory.list_models()
-        with gr.Column(elem_id="r2048-session"):
-            ui_html(
-                heading(
-                    "SESSION",
-                    "模型与会话",
-                    "选择模型和运行设备，连接后开始对局。更换模型或设备后请重新连接。",
-                )
-            )
-            with gr.Row(elem_id="r2048-connection-row"):
-                model_box = gr.Dropdown(
-                    choices=[entry.label() for entry in models],
-                    value=inventory.default_model(models) or None,
-                    label="模型",
-                    scale=6,
-                    min_width=240,
-                    elem_classes=["r2048-session-field"],
-                )
-                device_box = gr.Dropdown(
-                    choices=[("CPU", "cpu"), ("CUDA · GPU", "cuda")],
-                    value="cpu",
-                    label="运行设备",
-                    scale=1,
-                    min_width=130,
-                    elem_classes=["r2048-session-field"],
-                )
-                with gr.Column(scale=2, min_width=300, elem_id="r2048-connection-actions"):
-                    connect = gr.Button("连接 / 重新连接", variant="primary")
-                    refresh_models = gr.Button("刷新模型列表")
-            ui_html(
-                '<div class="r2048-settings-help">模型支持输入关键词筛选，名称包含训练目录与目标。'
-                "更换模型或设备会重建会话，请先保存需要保留的棋谱。</div>"
-            )
-            with gr.Column(elem_id="r2048-settings"):
-                ui_html('<div class="r2048-settings-title">搜索与执行设置</div>')
-                with gr.Row(elem_id="r2048-settings-grid"):
-                    strategy_box = gr.Dropdown(
-                        choices=list(STRATEGY_LABELS),
-                        value="搜索（NN-MCTS）",
-                        label="决策策略",
-                        scale=2,
-                        min_width=200,
-                        elem_classes=["r2048-session-field"],
-                    )
-                    sims_box = gr.Number(
-                        value=256,
-                        precision=0,
-                        minimum=0,
-                        label="模拟预算",
-                        min_width=130,
-                        elem_classes=["r2048-session-field"],
-                    )
-                    time_box = gr.Number(
-                        value=0,
-                        precision=0,
-                        minimum=0,
-                        label="搜索限时 / ms",
-                        min_width=130,
-                        elem_classes=["r2048-session-field"],
-                    )
-                    interval_box = gr.Number(
-                        value=2000,
-                        precision=0,
-                        minimum=100,
-                        label="自动落子间隔 / ms",
-                        min_width=150,
-                        elem_classes=["r2048-session-field"],
-                    )
-                ui_html(
-                    '<div class="r2048-settings-help">模拟预算与搜索限时设为 0 表示不限；'
-                    "落子间隔控制最快速度，最小 100 ms。参数在下一次分析或落子时生效。</div>"
-                )
-                include_resume = gr.Checkbox(value=False, label="显示续跑 checkpoint（last.pt）")
-
-        with gr.Tabs(elem_id="r2048-tabs") as tabs:
-            with gr.Tab("对局与分析", id="play"):
-                status_html = ui_html(status_view(None))
-                note_html = ui_html(elem_id="r2048-feedback")
-                with gr.Row(elem_id="r2048-workspace"):
-                    with gr.Column(scale=5, min_width=300, elem_id="r2048-play"):
-                        ui_html(
-                            heading(
-                                "BOARD", "当前局面", "绿色边框标记最近生成的数字块。坐标从左上角 a1 开始。"
-                            )
-                        )
-                        with gr.Row():
-                            newgame_btn = gr.Button("新开一局", min_width=110)
-                            auto_start = gr.Button("▶ 自动执行", variant="primary", min_width=110)
-                            auto_stop = gr.Button("■ 停止", variant="stop", visible=False, min_width=110)
-                        board_html = ui_html(board_view(np.zeros(16, dtype=np.uint8)), elem_id="r2048-board")
-                        with gr.Row(elem_id="r2048-board-tools"):
-                            ui_html(
-                                '<div class="r2048-control-hint"><strong>手动落子</strong>方向按钮或键盘 ↑ ↓ ← →</div>'
-                            )
-                            with gr.Column(scale=0, min_width=158, elem_id="r2048-dpad"):
-                                dpad_up = gr.Button("↑ 上", min_width=46, elem_id="r2048-up")
-                                with gr.Row():
-                                    dpad_left = gr.Button("← 左", min_width=46, elem_id="r2048-left")
-                                    dpad_right = gr.Button("右 →", min_width=46, elem_id="r2048-right")
-                                dpad_down = gr.Button("↓ 下", min_width=46, elem_id="r2048-down")
-                        direction_buttons = [dpad_up, dpad_right, dpad_down, dpad_left]
-                        with gr.Row(elem_id="r2048-actions"):
-                            undo_btn = gr.Button("撤销一步", min_width=110)
-                            clear_btn = gr.Button("清空局面", min_width=110)
-                    with gr.Column(scale=7, min_width=300, elem_id="r2048-insight"):
-                        ui_html(
-                            heading(
-                                "INSIGHT", "决策分析", "查看引擎选招及方向评分，策略头先验仅表示模型倾向。"
-                            )
-                        )
-                        analyze_btn = gr.Button("分析当前局面", variant="primary")
-                        analysis_html = ui_html(analysis_view(None))
-                        with gr.Accordion("如何阅读指标", open=False):
-                            gr.Markdown(
-                                "**访问数**：搜索分配给该方向的次数。**Q**：含立即得分的搜索均值。"
-                                "**r + A(u)**：立即得分与一步估值之和。**策略头先验**：模型的方向倾向。"
-                                "引擎选招以标记为准；交互分析的批组成与离线评测不同。"
-                            )
-                        with gr.Row(elem_id="r2048-save"):
-                            record_name = gr.Textbox(value="game", label="棋谱名称", scale=3, min_width=160)
-                            save_btn = gr.Button("保存棋谱", scale=1, min_width=100)
-
-            with gr.Tab("局面编辑", id="editor"), gr.Row(elem_id="r2048-editor-layout"):
-                with gr.Column(scale=6, min_width=300, elem_id="r2048-editor-controls"):
-                    ui_html(
-                        heading("COMPOSE", "摆一个局面", "按坐标选择数字，右侧同步预览。空格表示无数字块。")
-                    )
-                    tile_boxes: list = []
-                    face_choices = [("空", records.EMPTY_TOKEN)] + [
-                        (str(1 << exponent), str(1 << exponent))
-                        for exponent in range(1, records.MAX_EXPONENT + 1)
-                    ]
-                    with gr.Column(elem_id="r2048-editor-grid"):
-                        for row in range(4):
-                            with gr.Row():
-                                for column in range(4):
-                                    tile_boxes.append(
-                                        gr.Dropdown(
-                                            choices=face_choices,
-                                            value=records.EMPTY_TOKEN,
-                                            label=f"{chr(ord('a') + column)}{row + 1}",
-                                            scale=1,
-                                            min_width=0,
-                                            filterable=False,
-                                        )
-                                    )
-                    with gr.Row():
-                        editor_new = gr.Button("清空编辑器")
-                        editor_to_game = gr.Button("发送到对局", variant="primary")
-                    editor_note = ui_html(
-                        '<div class="r2048-note">数字上限 131072。发送后可在对局页分析或继续走棋。</div>'
-                    )
-                with gr.Column(scale=5, min_width=300, elem_id="r2048-editor-preview"):
-                    ui_html(heading("PREVIEW", "局面预览", "检查数字与位置，确认后发送到对局工作台。"))
-                    editor_board = ui_html(board_view(state.editor), elem_id="r2048-editor-board")
-
-            with gr.Tab("棋谱复盘", id="replay"), gr.Row(elem_id="r2048-replay-layout"):
-                with gr.Column(scale=5, min_width=300, elem_id="r2048-replay-controls"):
+        with gr.Tabs() as workspace_tabs:
+            with gr.Tab("对局工作区", id="playworkspace"):
+                models = inventory.list_models()
+                with gr.Column(elem_id="r2048-session"):
                     ui_html(
                         heading(
-                            "REPLAY",
-                            "回看每一步",
-                            "载入已保存的棋谱，拖动进度查看局面，或从某个局面继续对局。",
+                            "SESSION",
+                            "模型与会话",
+                            "选择模型和运行设备，连接后开始对局。更换模型或设备后请重新连接。",
                         )
                     )
-                    record_entries = inventory.list_records()
-                    record_box = gr.Dropdown(
-                        choices=[entry.label() for entry in record_entries],
-                        label="棋谱",
-                        value=None,
-                        info="在对局页保存棋谱后刷新列表",
+                    with gr.Row(elem_id="r2048-connection-row"):
+                        model_box = gr.Dropdown(
+                            choices=[entry.label() for entry in models],
+                            value=inventory.default_model(models) or None,
+                            label="模型",
+                            scale=6,
+                            min_width=240,
+                            elem_classes=["r2048-session-field"],
+                        )
+                        device_box = gr.Dropdown(
+                            choices=[("CPU", "cpu"), ("CUDA · GPU", "cuda")],
+                            value="cpu",
+                            label="运行设备",
+                            scale=1,
+                            min_width=130,
+                            elem_classes=["r2048-session-field"],
+                        )
+                        with gr.Column(scale=2, min_width=300, elem_id="r2048-connection-actions"):
+                            connect = gr.Button("连接 / 重新连接", variant="primary")
+                            refresh_models = gr.Button("刷新模型列表")
+                    ui_html(
+                        '<div class="r2048-settings-help">模型支持输入关键词筛选，名称包含训练目录与目标。'
+                        "更换模型或设备会重建会话，请先保存需要保留的棋谱。</div>"
                     )
-                    with gr.Row():
-                        replay_load = gr.Button("载入棋谱", variant="primary")
-                        refresh_records = gr.Button("刷新列表")
-                    replay_slider = gr.Slider(
-                        minimum=0, maximum=1, value=0, step=1, label="记录位置", interactive=False
-                    )
-                    with gr.Row():
-                        replay_prev = gr.Button("← 上一条")
-                        replay_next = gr.Button("下一条 →")
-                    replay_note = ui_html(
-                        '<div class="r2048-note">尚未载入棋谱。记录位置包含开局与数字生成；实际步数会单独显示。</div>'
-                    )
-                    export_btn = gr.Button("从此局面继续对局")
-                with gr.Column(scale=6, min_width=300, elem_id="r2048-replay-board"):
-                    ui_html(heading("POSITION", "回放局面", "按棋谱还原数字块，保留每一步的真实位置。"))
-                    replay_html = ui_html(
-                        board_view(np.zeros(16, dtype=np.uint8)), elem_id="r2048-replay-view"
-                    )
+                    with gr.Column(elem_id="r2048-settings"):
+                        ui_html('<div class="r2048-settings-title">搜索与执行设置</div>')
+                        with gr.Row(elem_id="r2048-settings-grid"):
+                            strategy_box = gr.Dropdown(
+                                choices=list(STRATEGY_LABELS),
+                                value="搜索（NN-MCTS）",
+                                label="决策策略",
+                                scale=2,
+                                min_width=200,
+                                elem_classes=["r2048-session-field"],
+                            )
+                            sims_box = gr.Number(
+                                value=256,
+                                precision=0,
+                                minimum=0,
+                                label="模拟预算",
+                                min_width=130,
+                                elem_classes=["r2048-session-field"],
+                            )
+                            time_box = gr.Number(
+                                value=0,
+                                precision=0,
+                                minimum=0,
+                                label="搜索限时 / ms",
+                                min_width=130,
+                                elem_classes=["r2048-session-field"],
+                            )
+                            interval_box = gr.Number(
+                                value=2000,
+                                precision=0,
+                                minimum=100,
+                                label="自动落子间隔 / ms",
+                                min_width=150,
+                                elem_classes=["r2048-session-field"],
+                            )
+                        ui_html(
+                            '<div class="r2048-settings-help">模拟预算与搜索限时设为 0 表示不限；'
+                            "落子间隔控制最快速度，最小 100 ms。参数在下一次分析或落子时生效。</div>"
+                        )
+                        include_resume = gr.Checkbox(value=False, label="显示续跑 checkpoint（last.pt）")
+
+                with gr.Tabs(elem_id="r2048-tabs") as tabs:
+                    with gr.Tab("对局与分析", id="play"):
+                        status_html = ui_html(status_view(None))
+                        note_html = ui_html(elem_id="r2048-feedback")
+                        with gr.Row(elem_id="r2048-workspace"):
+                            with gr.Column(scale=5, min_width=300, elem_id="r2048-play"):
+                                ui_html(
+                                    heading(
+                                        "BOARD",
+                                        "当前局面",
+                                        "绿色边框标记最近生成的数字块。坐标从左上角 a1 开始。",
+                                    )
+                                )
+                                with gr.Row():
+                                    newgame_btn = gr.Button("新开一局", min_width=110)
+                                    auto_start = gr.Button("▶ 自动执行", variant="primary", min_width=110)
+                                    auto_stop = gr.Button(
+                                        "■ 停止", variant="stop", visible=False, min_width=110
+                                    )
+                                board_html = ui_html(
+                                    board_view(np.zeros(16, dtype=np.uint8)), elem_id="r2048-board"
+                                )
+                                with gr.Row(elem_id="r2048-board-tools"):
+                                    ui_html(
+                                        '<div class="r2048-control-hint"><strong>手动落子</strong>方向按钮或键盘 ↑ ↓ ← →</div>'
+                                    )
+                                    with gr.Column(scale=0, min_width=158, elem_id="r2048-dpad"):
+                                        dpad_up = gr.Button("↑ 上", min_width=46, elem_id="r2048-up")
+                                        with gr.Row():
+                                            dpad_left = gr.Button("← 左", min_width=46, elem_id="r2048-left")
+                                            dpad_right = gr.Button(
+                                                "右 →", min_width=46, elem_id="r2048-right"
+                                            )
+                                        dpad_down = gr.Button("↓ 下", min_width=46, elem_id="r2048-down")
+                                direction_buttons = [dpad_up, dpad_right, dpad_down, dpad_left]
+                                with gr.Row(elem_id="r2048-actions"):
+                                    undo_btn = gr.Button("撤销一步", min_width=110)
+                                    clear_btn = gr.Button("清空局面", min_width=110)
+                            with gr.Column(scale=7, min_width=300, elem_id="r2048-insight"):
+                                ui_html(
+                                    heading(
+                                        "INSIGHT",
+                                        "决策分析",
+                                        "查看引擎选招及方向评分，策略头先验仅表示模型倾向。",
+                                    )
+                                )
+                                analyze_btn = gr.Button("分析当前局面", variant="primary")
+                                analysis_html = ui_html(analysis_view(None))
+                                with gr.Accordion("如何阅读指标", open=False):
+                                    gr.Markdown(
+                                        "**访问数**：搜索分配给该方向的次数。**Q**：含立即得分的搜索均值。"
+                                        "**r + A(u)**：立即得分与一步估值之和。**策略头先验**：模型的方向倾向。"
+                                        "引擎选招以标记为准；交互分析的批组成与离线评测不同。"
+                                    )
+                                with gr.Row(elem_id="r2048-save"):
+                                    record_name = gr.Textbox(
+                                        value="game", label="棋谱名称", scale=3, min_width=160
+                                    )
+                                    save_btn = gr.Button("保存棋谱", scale=1, min_width=100)
+
+                    with gr.Tab("局面编辑", id="editor"), gr.Row(elem_id="r2048-editor-layout"):
+                        with gr.Column(scale=6, min_width=300, elem_id="r2048-editor-controls"):
+                            ui_html(
+                                heading(
+                                    "COMPOSE",
+                                    "摆一个局面",
+                                    "按坐标选择数字，右侧同步预览。空格表示无数字块。",
+                                )
+                            )
+                            tile_boxes: list = []
+                            face_choices = [("空", records.EMPTY_TOKEN)] + [
+                                (str(1 << exponent), str(1 << exponent))
+                                for exponent in range(1, records.MAX_EXPONENT + 1)
+                            ]
+                            with gr.Column(elem_id="r2048-editor-grid"):
+                                for row in range(4):
+                                    with gr.Row():
+                                        for column in range(4):
+                                            tile_boxes.append(
+                                                gr.Dropdown(
+                                                    choices=face_choices,
+                                                    value=records.EMPTY_TOKEN,
+                                                    label=f"{chr(ord('a') + column)}{row + 1}",
+                                                    scale=1,
+                                                    min_width=0,
+                                                    filterable=False,
+                                                )
+                                            )
+                            with gr.Row():
+                                editor_new = gr.Button("清空编辑器")
+                                editor_to_game = gr.Button("发送到对局", variant="primary")
+                            editor_note = ui_html(
+                                '<div class="r2048-note">数字上限 131072。发送后可在对局页分析或继续走棋。</div>'
+                            )
+                        with gr.Column(scale=5, min_width=300, elem_id="r2048-editor-preview"):
+                            ui_html(
+                                heading("PREVIEW", "局面预览", "检查数字与位置，确认后发送到对局工作台。")
+                            )
+                            editor_board = ui_html(board_view(state.editor), elem_id="r2048-editor-board")
+
+                    with gr.Tab("棋谱复盘", id="replay"), gr.Row(elem_id="r2048-replay-layout"):
+                        with gr.Column(scale=5, min_width=300, elem_id="r2048-replay-controls"):
+                            ui_html(
+                                heading(
+                                    "REPLAY",
+                                    "回看每一步",
+                                    "载入已保存的棋谱，拖动进度查看局面，或从某个局面继续对局。",
+                                )
+                            )
+                            record_entries = inventory.list_records()
+                            record_box = gr.Dropdown(
+                                choices=[entry.label() for entry in record_entries],
+                                label="棋谱",
+                                value=None,
+                                info="在对局页保存棋谱后刷新列表",
+                            )
+                            with gr.Row():
+                                replay_load = gr.Button("载入棋谱", variant="primary")
+                                refresh_records = gr.Button("刷新列表")
+                            replay_slider = gr.Slider(
+                                minimum=0, maximum=1, value=0, step=1, label="记录位置", interactive=False
+                            )
+                            with gr.Row():
+                                replay_prev = gr.Button("← 上一条")
+                                replay_next = gr.Button("下一条 →")
+                            replay_note = ui_html(
+                                '<div class="r2048-note">尚未载入棋谱。记录位置包含开局与数字生成；实际步数会单独显示。</div>'
+                            )
+                            export_btn = gr.Button("从此局面继续对局")
+                        with gr.Column(scale=6, min_width=300, elem_id="r2048-replay-board"):
+                            ui_html(
+                                heading("POSITION", "回放局面", "按棋谱还原数字块，保留每一步的真实位置。")
+                            )
+                            replay_html = ui_html(
+                                board_view(np.zeros(16, dtype=np.uint8)), elem_id="r2048-replay-view"
+                            )
+
+            with gr.Tab("实验工作台", id="experimentworkspace"):
+                from r2048.webui.experiments import bind_experiments
+
+                refresh_experiments, experiment_outputs = bind_experiments(
+                    state,
+                    model_box,
+                    workspace_tabs,
+                    [connect, analyze_btn, auto_start, device_box],
+                )
+        demo.load(refresh_experiments, outputs=experiment_outputs)
 
         ui_html(
             '<footer class="r2048-footer"><span>re-2048 · 对局 / 分析 / 复盘</span>'
@@ -629,7 +685,7 @@ def build_app(state: AppState | None = None):
                 f'<div class="r2048-note" role="status">{html.escape(note)}</div>' if note else "",
                 gr.update(visible=not running),
                 gr.update(visible=running),
-                *[gr.update(interactive=not running) for _ in manual],
+                *[gr.update(interactive=not running and not state.compute_busy) for _ in manual],
             )
 
         def fail(error: Exception):

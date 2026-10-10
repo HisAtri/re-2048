@@ -31,6 +31,7 @@ from r2048.jobs import finish_console, progress_payload
 from r2048.nn.model import load_checkpoint
 from r2048.protocol import build_protocol, protocol_hash
 from r2048.runtime.inference import BatchedEvaluator
+from r2048.task_control import check_stop, stop_requested
 
 TRACKS = {
     "nn_value": r2048_core.DECISION_VALUE_GREEDY,
@@ -207,6 +208,8 @@ def run_evaluation(config: EvalConfig) -> EvalResult:
     started = time.monotonic()
     last_report = started
     while True:
+        if stop_requested():
+            engine.request_stop()
         advance = engine.advance(config.max_batch)
         count = int(advance["request_ids"].size)
         if count:
@@ -243,6 +246,7 @@ def run_evaluation(config: EvalConfig) -> EvalResult:
         if advance["done"]:
             break
     seconds = time.monotonic() - started
+    check_stop()
     if config.progress_every > 0 and config.on_progress is None:
         finish_console()
 

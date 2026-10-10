@@ -80,7 +80,9 @@ def round_spec(name: str) -> dict:
     directory = EXP / name if (EXP / name).is_dir() else EXP / f"g1-{name}"
     if not directory.is_dir():
         raise SystemExit(f"找不到轮目录：{EXP / name} 或 {EXP / f'g1-{name}'}")
-    model = json.loads((directory / "steps" / "train.json").read_text())["model"]
+    published = directory / "steps" / "publish.json"
+    model_step = published if published.exists() else directory / "steps" / "train.json"
+    model = json.loads(model_step.read_text())["model"]
     batch = Path(json.loads((directory / "steps" / "selfplay.json").read_text())["data_dir"])
     return {
         "name": name,

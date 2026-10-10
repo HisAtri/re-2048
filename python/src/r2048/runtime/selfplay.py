@@ -20,6 +20,7 @@ KeyboardInterrupt，由 run_selfplay 捕获后调 `request_stop()`——两条�
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -29,6 +30,7 @@ from pathlib import Path
 import r2048_core
 import torch
 
+from r2048.fileio import write_json_atomic
 from r2048.jobs import finish_console, progress_payload
 from r2048.runtime.inference import BatchedEvaluator
 
@@ -287,6 +289,18 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
                 now = time.monotonic()
                 if now - last_report >= config.progress_every:
                     last_report = now
+                    stats = engine.stats()
+                    if telemetry_path := os.environ.get("R2048_WORKER_PROGRESS"):
+                        write_json_atomic(
+                            telemetry_path,
+                            {
+                                "pid": os.getpid(),
+                                "simulations": int(stats["simulations"]),
+                                "simulations_per_second": stats["simulations"] / max(1e-9, now - started),
+                                "forward_rows": evaluator.rows,
+                                "phases": phase_summary(phases, evaluator, now - started),
+                            },
+                        )
                     written = int(advance["samples_written"])
                     rate = written / max(1e-9, now - started)
                     rows_per_forward = evaluator.rows / max(1, evaluator.batches)
@@ -302,6 +316,8 @@ def run_selfplay(config: SelfplayConfig, model: torch.nn.Module, device: torch.d
                             "forward_batches": evaluator.batches,
                             "forward_rows": evaluator.rows,
                             "episodes": int(advance["episodes_written"]),
+                            "simulations": int(stats["simulations"]),
+                            "simulations_per_second": stats["simulations"] / max(1e-9, now - started),
                             "phases": phase_summary(phases, evaluator, now - started),
                         },
                     )

@@ -3,6 +3,9 @@
 - 状态：已采纳
 - 日期：2026-10-07
 
+> 自动命名、显式续跑及 `publish` 步骤由 [ADR 0048](0048-automatic-identities-and-data-lineage.md)
+> 更新。当前默认顺序为 selfplay → train → publish → evaluate → rate，下文保留历史背景。
+
 ## 背景
 
 迭代从第二轮起就不是"跑一条命令"：跑谱产出新数据、价值头与策略头分开训练、把两半合并、

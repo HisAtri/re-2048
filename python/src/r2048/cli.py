@@ -38,7 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--data", default="", help="数据批目录（含 manifest.json）；与 --config 的 datasets 二选一"
     )
-    train.add_argument("--output", required=True, help="运行目录（写 checkpoint 与 train.json）")
+    train.add_argument("--output", default="", help="运行目录；省略时自动创建 output/runs/run-日期流水号")
     train.add_argument("--mode", default=argparse.SUPPRESS, choices=["value", "policy", "joint", "dual"])
     train.add_argument("--init-checkpoint", default=argparse.SUPPRESS, help="从已有 checkpoint 初始化")
     train.add_argument("--architecture", default=argparse.SUPPRESS, help="覆盖结构（默认按模式选）")
@@ -146,12 +146,12 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--games", type=int, required=True)
     evaluate.add_argument("--seed", type=int, default=0, help="与 C++ 评测用同一个 seed 才能按局配对")
     evaluate.add_argument("--simulations", type=int, default=64, help="仅 nn_mcts 使用")
-    evaluate.add_argument("--lanes", type=int, default=32)
-    evaluate.add_argument("--in-flight", type=int, default=4)
+    evaluate.add_argument("--lanes", type=int, default=None)
+    evaluate.add_argument("--in-flight", type=int, default=None)
     evaluate.add_argument("--c-puct", type=float, default=1.5)
     evaluate.add_argument("--cache-entries", type=int, default=1 << 17)
     evaluate.add_argument("--search-threads", type=int, default=1, help="推进 lane 的线程数")
-    evaluate.add_argument("--max-batch", type=int, default=8192)
+    evaluate.add_argument("--max-batch", type=int, default=None)
     evaluate.add_argument("--device", default="cuda")
     evaluate.add_argument("--label", default="")
     evaluate.add_argument("--jsonl", default="", help="逐局记录输出路径")
@@ -206,8 +206,8 @@ def _build_parser() -> argparse.ArgumentParser:
     selfplay.add_argument("--checkpoint", default="", help="模型 checkpoint；不给则用随机初始化模型")
     selfplay.add_argument("--random-init", action="store_true", help="显式使用随机初始化模型（仅链路自检）")
     selfplay.add_argument("--simulations", type=int, default=64)
-    selfplay.add_argument("--lanes", type=int, default=64)
-    selfplay.add_argument("--in-flight", type=int, default=8, help="每个 lane 在途模拟数（批大小旋钮）")
+    selfplay.add_argument("--lanes", type=int, default=None)
+    selfplay.add_argument("--in-flight", type=int, default=None, help="每个 lane 在途模拟数（批大小旋钮）")
     selfplay.add_argument("--c-puct", type=float, default=1.5)
     selfplay.add_argument("--temperature", type=float, default=1.0)
     selfplay.add_argument("--temperature-moves", type=int, default=30)
@@ -247,7 +247,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="树内标注用的续弈策略（默认 greedy，见 ADR 0030 §6.1）",
     )
     selfplay.add_argument("--shard-samples", type=int, default=100000)
-    selfplay.add_argument("--max-batch", type=int, default=16384)
+    selfplay.add_argument("--max-batch", type=int, default=None)
     selfplay.add_argument("--device", default="cuda", help="cuda / cpu（默认 cuda）")
     selfplay.add_argument("--model-id", default="", help="写入数据来源记录的模型标识")
     selfplay.add_argument(
@@ -264,7 +264,7 @@ def _build_parser() -> argparse.ArgumentParser:
     selfplay.add_argument(
         "--workers",
         type=int,
-        default=1,
+        default=None,
         help=(
             "起 N 个进程写同一批数据（默认 1 = 本进程自己跑）。N>1 时本进程只做监督："
             "起 N 个 --join worker、报批级进度、把 Ctrl-C 变成一次 stop 广播。"
@@ -288,22 +288,28 @@ def _build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--output", required=True, help="合并后的 checkpoint 路径")
     merge.add_argument("--note", default="", help="写进元数据的说明（为什么这样合）")
 
+    publish = sub.add_parser("publish", help="本地发布：转换 safetensor 并生成模型 manifest")
+    publish.add_argument("--checkpoint", required=True, help="训练选出的或合并后的 checkpoint")
+    publish.add_argument("--release-id", default="", help="发布日期 YYYYMMDD + 三位流水号；默认当天自动编号")
+    publish.add_argument("--output", default="", help="发布仓库根目录，默认 output/models")
+
     iterate = sub.add_parser(
         "iterate",
-        help="一次迭代：跑谱 → 训练 → 评测 → 评分",
+        help="一次迭代：跑谱 → 训练 → 发布 → 评测 → 评分",
         description=(
-            "薄驱动：四步各自都是对既有入口的一次调用，每步做完在迭代目录留一个标记，"
+            "薄驱动：五步调用各自的独立入口，执行前预留身份，完成后在迭代目录留步骤标记，"
             "重跑时跳过已完成的步骤。--steps 只跑其中几步，--force 重做已完成的步骤。"
             "训练数据集 = --config 里 datasets 声明的池子 + 这一轮新产出的数据（按 --data-weight）。"
         ),
     )
-    iterate.add_argument("--name", required=True, help="迭代名（例如 c3）：产物路径与评测标签都由它派生")
-    iterate.add_argument("--config", required=True, help="训练配置文件（YAML：datasets + train）")
+    iterate.add_argument("--name", default="", help="显式迭代名；省略时自动分配 iter-日期流水号")
+    iterate.add_argument("--config", default="", help="训练配置文件（续跑可从任务记录恢复）")
+    iterate.add_argument("--resume", default="", help="恢复指定迭代目录的身份、配置与步骤")
     iterate.add_argument("--output", default="", help="迭代目录（默认 $R2048_OUTPUT_DIR/iters/<name>）")
     iterate.add_argument(
         "--steps",
         default="",
-        help="要跑的步骤，逗号分隔（默认全部四个：selfplay,train,evaluate,rate）",
+        help="要跑的步骤，逗号分隔（默认 selfplay,train,publish,evaluate,rate；续跑恢复原步骤选择）",
     )
     iterate.add_argument("--force", action="store_true", help="重做已经完成的步骤")
     iterate.add_argument(
@@ -315,13 +321,14 @@ def _build_parser() -> argparse.ArgumentParser:
     iterate.add_argument("--data-seed", type=int, default=0, help="跑谱的种子")
     iterate.add_argument("--data-weight", type=float, default=1.0, help="新数据在训练池里的权重")
     iterate.add_argument("--simulations", type=int, default=64, help="跑谱/评测共用的模拟数")
-    iterate.add_argument("--lanes", type=int, default=64)
-    iterate.add_argument("--in-flight", type=int, default=8)
+    iterate.add_argument("--lanes", type=int, default=None)
+    iterate.add_argument("--in-flight", type=int, default=None)
+    iterate.add_argument("--max-batch", type=int, default=None)
     iterate.add_argument("--search-threads", type=int, default=1, help="推进 lane 的线程数（协议参数）")
     iterate.add_argument(
         "--data-workers",
         type=int,
-        default=4,
+        default=None,
         help="跑谱并行度：起 N 个进程写同一批（每 worker 单线程，数据可复现；样本目标按整批算）",
     )
     iterate.add_argument(
@@ -389,6 +396,41 @@ def _build_parser() -> argparse.ArgumentParser:
     webui.add_argument("--host", default="127.0.0.1", help="监听地址（默认只绑本机）")
     webui.add_argument("--port", type=int, default=7860)
     webui.add_argument("--share", action="store_true", help="生成公网链接（默认不对外暴露）")
+    for entry in (selfplay, evaluate, iterate, train):
+        entry.add_argument(
+            "--performance-profile",
+            choices=("auto", "off"),
+            default="auto",
+            help="未显式指定的性能参数读取匹配本机的实测画像；off 使用默认值",
+        )
+    benchmark = sub.add_parser("benchmark", help="测量或查看本机性能画像")
+    benchmark.add_argument("action", choices=("probe", "show"))
+    benchmark.add_argument("--stage", choices=("selfplay", "evaluate", "train"), default="selfplay")
+    benchmark.add_argument("--checkpoint", default="", help="NN 模型；跑谱 benchmark 留空测纯 MCTS")
+    benchmark.add_argument("--device", default="cuda")
+    benchmark.add_argument("--workers", default="1,2,4,8,16")
+    benchmark.add_argument(
+        "--seconds", type=float, default=20, help="NN 跑谱及评测每组测量秒数；训练按一轮执行"
+    )
+    benchmark.add_argument("--samples", type=int, default=5000, help="纯 MCTS 基准每组的样本数")
+    benchmark.add_argument("--rollout-policy", choices=("greedy", "uniform"), default="greedy")
+    benchmark.add_argument("--batches", default="512,1024,4096", help="评测或训练的候选批大小")
+    benchmark.add_argument("--track", choices=("nn_mcts", "nn_policy", "nn_value"), default="nn_mcts")
+    benchmark.add_argument("--config", default="configs/double-tower.yaml")
+    benchmark.add_argument("--data", default="")
+    benchmark.add_argument("--mode", choices=("value", "policy", "dual"), default="value")
+    benchmark.add_argument("--freeze-value", action="store_true")
+    benchmark.add_argument("--simulations", type=int, default=64)
+    benchmark.add_argument("--lanes", type=int, default=64)
+    benchmark.add_argument("--in-flight", type=int, default=8)
+    benchmark.add_argument("--max-batch", type=int, default=16384)
+    benchmark.add_argument("--tree-nodes", type=int, default=2)
+    benchmark.add_argument("--tree-label-plays", type=int, default=8)
+    benchmark.add_argument(
+        "--tree-label-policy", choices=("top_visits", "depth_stratified"), default="top_visits"
+    )
+    benchmark.add_argument("--tree-label-rollout", choices=("greedy", "uniform"), default="greedy")
+
     return parser
 
 
@@ -435,7 +477,10 @@ def _command_train(args: argparse.Namespace) -> int:
     config = build_train_config(args)
     # 训练的运行目录本来就是 --output，作业状态与日志直接落在同一个目录里：
     # 事后排查“这次训练是怎么跑的”时，job.json/status.json 与 train.json 在同一处。
-    with JobDir(Path(args.output).name, "train", params=config_payload(config), path=args.output) as job:
+    from r2048.nn.training import prepare_training_run
+
+    prepare_training_run(config)
+    with JobDir(Path(config.output).name, "train", params=config_payload(config), path=config.output) as job:
         config.on_progress = job.callback()
         result = run_training(config)
         job.finish(best_checkpoint=result.best_checkpoint, train_json=result.train_json)
@@ -449,9 +494,35 @@ def _command_train(args: argparse.Namespace) -> int:
 def _command_eval(args: argparse.Namespace) -> int:
     import time
 
+    import torch
+
     from r2048.jobs import JobDir
+    from r2048.performance import resolve
     from r2048.workflows.evaluate import EvalConfig, run_evaluation
 
+    if str(args.device).startswith("cuda") and not torch.cuda.is_available():
+        print("请求了 cuda 但当前不可用，回退到 cpu", file=sys.stderr)
+        args.device = "cpu"
+
+    settings, performance = resolve(
+        "evaluate",
+        {
+            "device": args.device,
+            "track": args.track,
+            "simulations": args.simulations,
+            "lanes": args.lanes,
+            "in_flight": args.in_flight,
+            "max_batch": args.max_batch,
+            "search_threads": args.search_threads,
+            "c_puct": args.c_puct,
+            "cache_entries": args.cache_entries,
+        },
+        args.checkpoint,
+        mode=args.performance_profile,
+    )
+    for key in ("lanes", "in_flight", "max_batch"):
+        setattr(args, key, settings[key])
+    print(json.dumps(performance, ensure_ascii=False), file=sys.stderr)
     config = EvalConfig(
         games=args.games,
         seed=args.seed,
@@ -470,7 +541,9 @@ def _command_eval(args: argparse.Namespace) -> int:
     )
     label = config.label or config.track
     job_id = f"eval-{label}-{time.strftime('%Y%m%d-%H%M%S')}"
-    with JobDir(job_id, "eval", params={**config.__dict__, "job_id": job_id}) as job:
+    with JobDir(
+        job_id, "eval", params={**config.__dict__, "job_id": job_id, "performance": performance}
+    ) as job:
         config.on_progress = job.callback()
         result = run_evaluation(config)
         job.finish(
@@ -655,7 +728,7 @@ def _command_selfplay(args: argparse.Namespace) -> int:
     import torch
 
     from r2048.jobs import JobDir
-    from r2048.nn.model import create_model, load_checkpoint
+    from r2048.nn.model import create_model, load_checkpoint, read_checkpoint_payload
     from r2048.runtime.selfplay import SelfplayConfig, run_selfplay
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -665,20 +738,92 @@ def _command_selfplay(args: argparse.Namespace) -> int:
 
     seed = args.seed if args.seed else int(time.time())
     if args.checkpoint:
-        model, metadata = load_checkpoint(args.checkpoint, device)
+        metadata = read_checkpoint_payload(args.checkpoint)["metadata"]
+        model = None
         model_id = args.model_id or str(metadata.get("model_id", ""))
     else:
         # 随机初始化的权重也必须由种子决定：否则同一条命令跑两次得到两份不同的数据，
         # 而"没有 checkpoint 也能复现整条链路"正是这个选项存在的理由。
         torch.manual_seed(seed)
-        model = create_model().to(device).eval()
+        model = create_model().eval()
         model_id = args.model_id or "random-init"
         if not args.random_init:
             print("未提供 --checkpoint：使用随机初始化模型（只用于链路自检）", file=sys.stderr)
 
-    batch_id = args.batch_id or f"nn-s{args.simulations}-{time.strftime('%Y%m%d-%H%M%S')}"
+    from r2048.identity import batch_id as allocate_batch_id
+
+    if args.batch_id:
+        batch_id = args.batch_id
+    elif args.continue_ or args.join:
+        if not args.out:
+            raise ValueError("续跑或加入数据批必须提供 --out")
+        batch_id = json.loads((Path(args.out) / "manifest.json").read_text())["batch_id"]
+    else:
+        batch_id = allocate_batch_id("nn", args.simulations)
     out_dir = Path(args.out) if args.out else paths.data_dir(batch_id)
 
+    from r2048.fileio import read_json, write_json_atomic
+    from r2048.performance import resolve
+
+    record_path = out_dir / "performance.json"
+    if args.join and args.workers is None:
+        args.workers = 1
+    if args.search_threads > 1 and args.workers is None:
+        args.workers = 1
+    performance = None
+    restored_keys = []
+    if args.continue_ and record_path.exists():
+        previous = read_json(record_path)
+        for key, value in previous["effective"].items():
+            if getattr(args, key) is None:
+                setattr(args, key, value)
+                restored_keys.append(key)
+        performance = previous["resolution"]
+    elif args.continue_:
+        previous = read_json(out_dir / "manifest.json").get("params", {})
+        for key, stored_key in (
+            ("lanes", "lanes"),
+            ("in_flight", "in_flight_per_lane"),
+            ("max_batch", "max_batch"),
+        ):
+            if getattr(args, key) is None and stored_key in previous:
+                setattr(args, key, int(previous[stored_key]))
+    settings, resolution = resolve(
+        "selfplay",
+        {
+            "device": args.device,
+            "simulations": args.simulations,
+            "tree_nodes": args.tree_nodes,
+            "tree_label_plays": args.tree_label_plays,
+            "tree_label_policy": args.tree_label_policy,
+            "tree_label_rollout": args.tree_label_rollout,
+            "search_threads": args.search_threads,
+            "c_puct": args.c_puct,
+            "cache_entries": args.cache_entries,
+            "temperature": args.temperature,
+            "temperature_moves": args.temperature_moves,
+            **{key: getattr(args, key) for key in ("workers", "lanes", "in_flight", "max_batch")},
+        },
+        args.checkpoint,
+        mode=args.performance_profile,
+        default_values={"workers": 1},
+    )
+    for key in ("workers", "lanes", "in_flight", "max_batch"):
+        setattr(args, key, settings[key])
+    if performance is not None:
+        for key in resolution["sources"]:
+            if key not in restored_keys:
+                performance["sources"][key] = resolution["sources"][key]
+        performance["reason"] = "续跑保留原参数，显式覆盖优先"
+    if not args.join:
+        write_json_atomic(
+            record_path,
+            {
+                "resolution": performance or resolution,
+                "effective": {key: settings[key] for key in ("workers", "lanes", "in_flight", "max_batch")},
+            },
+        )
+    print(json.dumps(performance or resolution, ensure_ascii=False), file=sys.stderr)
     config = SelfplayConfig(
         data_dir=str(out_dir),
         batch_id=batch_id,
@@ -741,6 +886,8 @@ def _command_selfplay(args: argparse.Namespace) -> int:
         print(workers_result.manifest_path)
         return 0
 
+    # 多 worker 的父进程只监督，不再占用一份 GPU 模型与缓存。
+    model = load_checkpoint(args.checkpoint, device)[0] if args.checkpoint else model.to(device)
     with JobDir(job_id, "selfplay", params=config.__dict__) as job:
         config.on_progress = job.callback()
         result = run_selfplay(config, model, device)
@@ -786,9 +933,9 @@ def _command_merge_halves(args: argparse.Namespace) -> int:
 
 
 def _command_iterate(args: argparse.Namespace) -> int:
-    from r2048.iterate import DEFAULT_BASELINES, STEPS, IterateConfig, run_iteration
+    from r2048.iterate import DEFAULT_BASELINES, IterateConfig, run_iteration
 
-    steps = tuple(part.strip() for part in args.steps.split(",") if part.strip()) or STEPS
+    steps = tuple(part.strip() for part in args.steps.split(",") if part.strip()) or None
     anchors: dict[str, str] = {}
     for entry in args.anchor:
         track, _, model_id = entry.partition("=")
@@ -799,6 +946,7 @@ def _command_iterate(args: argparse.Namespace) -> int:
         name=args.name,
         config_path=args.config,
         output=args.output,
+        resume=args.resume,
         steps=steps,
         force=args.force,
         init_checkpoint=args.init_checkpoint,
@@ -810,6 +958,8 @@ def _command_iterate(args: argparse.Namespace) -> int:
         in_flight=args.in_flight,
         search_threads=args.search_threads,
         data_workers=args.data_workers,
+        max_batch=args.max_batch,
+        performance_profile=args.performance_profile,
         rollout_policy=args.rollout_policy,
         tree_nodes=args.tree_nodes,
         tree_label_plays=args.tree_label_plays,
@@ -827,7 +977,7 @@ def _command_iterate(args: argparse.Namespace) -> int:
         print(f"{step}: {produced}")
     print(f"评分 {result.rating_json}")
     # stdout 只放可被脚本消费的结果：这一次迭代产出的完整模型路径（没有训练步骤时为空）。
-    print(result.steps.get("train", {}).get("model", ""))
+    print(result.steps.get("publish", {}).get("model", result.steps.get("train", {}).get("model", "")))
     return 0
 
 
@@ -870,6 +1020,7 @@ def _command_webui(args: argparse.Namespace) -> int:
         ) from error
 
     demo, state = build_app()
+    state.tasks.start()
     try:
         demo.launch(
             server_name=args.host,
@@ -882,8 +1033,75 @@ def _command_webui(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_benchmark(args):
+    from r2048.benchmark import probe_evaluate, probe_generate, probe_selfplay, probe_train
+    from r2048.performance import resolve
+
+    settings = {
+        key: getattr(args, key)
+        for key in (
+            "device",
+            "simulations",
+            "lanes",
+            "in_flight",
+            "max_batch",
+            "tree_nodes",
+            "tree_label_plays",
+            "tree_label_policy",
+            "tree_label_rollout",
+            "rollout_policy",
+        )
+    }
+    recipe = None
+    if not args.checkpoint:
+        if args.stage != "selfplay":
+            raise ValueError("评测和训练 benchmark 必须指定 --checkpoint")
+        settings["device"] = "cpu"
+    if args.stage == "evaluate":
+        settings["track"] = args.track
+    elif args.stage == "train":
+        from r2048.config import load_config
+
+        recipe = load_config(args.config).get("train", {})
+        settings = {"device": args.device, "mode": args.mode, "freeze_value": args.freeze_value}
+    if args.action == "show":
+        for key in ("lanes", "in_flight", "max_batch", "workers"):
+            settings[key] = None
+        effective, info = resolve(args.stage, settings, args.checkpoint, recipe=recipe)
+        print(json.dumps({"effective": effective, "resolution": info}, ensure_ascii=False, indent=2))
+    elif args.stage == "selfplay" and not args.checkpoint:
+        print(probe_generate(settings, [int(value) for value in args.workers.split(",")], args.samples))
+    elif args.stage == "selfplay":
+        print(
+            probe_selfplay(
+                args.checkpoint, settings, [int(value) for value in args.workers.split(",")], args.seconds
+            )
+        )
+    elif args.stage == "evaluate":
+        print(
+            probe_evaluate(
+                args.checkpoint, settings, [int(value) for value in args.batches.split(",")], args.seconds
+            )
+        )
+    else:
+        if not args.data:
+            raise ValueError("训练 benchmark 必须指定 --data 数据批")
+        print(
+            probe_train(
+                args.checkpoint,
+                settings,
+                [int(value) for value in args.batches.split(",")],
+                args.data,
+                recipe,
+            )
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.command == "benchmark":
+        return _command_benchmark(args)
     if args.command == "version":
         return _command_version()
     if args.command == "env":
@@ -904,6 +1122,11 @@ def main(argv: list[str] | None = None) -> int:
         return _command_merge_halves(args)
     if args.command == "iterate":
         return _command_iterate(args)
+    if args.command == "publish":
+        from r2048.workflows.publish import publish_model
+
+        print(publish_model(args.checkpoint, args.release_id, args.output).manifest_path)
+        return 0
     if args.command == "session":
         return _command_session(args)
     if args.command == "webui":

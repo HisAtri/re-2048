@@ -140,11 +140,11 @@ def test_names_are_only_lookup_keys(tmp_path: Path) -> None:
         assert canonical_id(alias) == canonical
         assert resolve(alias) is resolve(canonical), "同一份定义的所有名字必须指向同一个类"
     assert "20261006001" in known_names(), "测试版日期号必须能被解析（研判期的产物记着它）"
-    assert set(supported_ids()) == {"sh-s6c64", "dt-s3p3v3c64"}
+    assert set(supported_ids()) == {"sh-s6c64", "smnet-b9c64dt"}
 
     # 新产物写 canonical；旧名字只是能读，不会被写回去。
     model = build(known_names()["dual_tower_v1"], {"channels": 32})
-    assert model.metadata("m")["architecture"] == "dt-s3p3v3c64"
+    assert model.metadata("m")["architecture"] == "smnet-b9c64dt"
 
 
 def test_weights_dtype_is_recorded_and_other_values_refused(tmp_path: Path) -> None:

@@ -18,6 +18,10 @@ make run ARGS="verify --data /tmp/random_v1"
 
 完整说明见 [docs/BUILD.md](docs/BUILD.md)。
 
+Gradio 对局与实验工作台：在 WSL 运行 `make webui`，打开 `http://127.0.0.1:7860`。
+支持跑谱、独立双头训练发布、评测评分及完整迭代，后台任务可停止、恢复。
+使用方法见 [docs/WEBUI.md](docs/WEBUI.md)。
+
 ## 工程结构
 
 ```
@@ -99,6 +103,7 @@ docs/adr/   架构决策记录
 `eval_seed` 只留在池子的去重键里。代价是协议收口之前的记录无法补齐，
 旧评分池整批放弃、锚点按新格式重跑。
 
-**尚未实现**：跑谱的不限局数与暂停/继续（当前是“跑满目标样本即退出”，不能中途停）、
-训练断点续跑的完整语义（当前只保存/恢复优化器与轮次）、模型注册与发布、
-机器画像、GUI。
+迭代默认自动命名任务和数据批，并在合并后发布 `.safetensor` 与 `manifest.json`，随后使用
+正式模型身份评测、评分。继承训练的数据规模按祖先和本轮来源去重累计；使用
+`iterate --resume <迭代目录>` 恢复任务。工作流与兼容规则见
+[ADR 0048](docs/adr/0048-automatic-identities-and-data-lineage.md) 和 [构建指南](docs/BUILD.md)。

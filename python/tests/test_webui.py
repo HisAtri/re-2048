@@ -356,6 +356,114 @@ def test_build_app_constructs_the_blocks() -> None:
         state.close()
 
 
+def test_experiment_forms_own_their_inputs_and_tasks_have_a_separate_page() -> None:
+    pytest.importorskip("gradio")
+    from r2048.webui.app import build_app
+
+    demo, state = build_app()
+    try:
+        config = demo.get_config_file()
+        blocks = {item["id"]: item for item in config["components"]}
+        owners = {}
+
+        def visit(node, page=None):
+            block = blocks.get(node["id"], {})
+            if block.get("type") == "tabitem":
+                page = block["props"]["label"]
+            owners[node["id"]] = page
+            for child in node.get("children", []):
+                visit(child, page)
+
+        visit(config["layout"])
+        for button, page in (
+            ("检查跑谱配置", "跑谱"),
+            ("检查训练配置", "双头训练"),
+            ("检查评测配置", "评测与评分"),
+            ("检查完整迭代配置", "完整迭代"),
+        ):
+            identity = next(key for key, block in blocks.items() if block["props"].get("value") == button)
+            callback = next(item for item in demo.fns.values() if (identity, "click") in item.targets)
+            assert all(owners[component._id] == page for component in callback.inputs)
+            if page == "跑谱":
+                prepared, description, _, update, *_ = callback.fn(
+                    *(component.value for component in callback.inputs)
+                )
+                assert prepared["request"]["config"]["selfplay"]["samples"] == 1000000
+                assert "recipe" not in prepared["request"]["config"]
+                assert "训练轮数" not in description and update["interactive"]
+        for block in blocks.values():
+            label = block["props"].get("label")
+            if label in ("训练配方", "训练设备", "每个头训练轮数"):
+                assert owners[block["id"]] in ("双头训练", "完整迭代")
+            if label in ("任务队列", "选择任务查看进度与结果"):
+                assert owners[block["id"]] == "任务"
+            if label in ("从哪个模型继续训练（留空从头训练）", "父模型（留空从头训练并用纯 MCTS 跑谱）"):
+                assert block["props"].get("value") is None
+        experiment_tabs = next(
+            block
+            for block in demo.blocks.values()
+            if [getattr(child, "label", None) for child in getattr(block, "children", [])]
+            == ["跑谱", "双头训练", "评测与评分", "完整迭代", "任务"]
+        )
+        assert experiment_tabs.parent.__class__.__name__ != "Row"
+    finally:
+        state.close()
+
+
+def test_experiment_detail_explains_real_progress_and_cumulative_samples() -> None:
+    from r2048.webui.experiment_views import task_summary
+
+    text = task_summary(
+        {
+            "task_id": "job-example",
+            "state": "running",
+            "request": {"kind": "train"},
+            "progress": {
+                "stage": "train",
+                "done": 3,
+                "total": 10,
+                "unit": "steps",
+                "rate": 1.5,
+                "extra": {"epoch": 2, "epochs": 8, "samples_per_second": 200},
+            },
+            "model_identity": {
+                "dataset_samples": 2000000,
+                "current_dataset_samples": 1000000,
+                "inherited_dataset_samples": 1500000,
+                "data_lineage": {"complete": True},
+            },
+        }
+    )
+    assert "运行中" in text and "3 / 10 批" in text and "2 / 8" in text
+    assert "累计去重数据规模 | 2,000,000" in text
+
+
+def test_rating_view_converts_margin_to_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("gradio")
+    from r2048.webui import experiments
+
+    monkeypatch.setattr(
+        experiments,
+        "rating_report",
+        lambda: {
+            "anchors": {"tracks": {"search": {}, "pure": {}}},
+            "tracks": {
+                "search": [
+                    {
+                        "protocol_hash": "1234567890",
+                        "protocol": {"track": "nn_mcts", "simulations": 64},
+                        "models": {"model": {"rating": 1000, "ci95": 50, "n": 400, "mean_score": 10000}},
+                    }
+                ]
+            },
+        },
+    )
+    rows, _ = experiments.ratings_table()
+    assert rows[0][0] == "搜索评测"
+    assert "每步 64 次" in rows[0][1]
+    assert rows[0][4] == "950.0 ～ 1050.0"
+
+
 # ---- 界面接线（Gradio 组件层）-----------------------------------------------------
 #
 # 这一组防的是"构造时不报、一点就崩"的那类问题。Gradio 的坑很集中：

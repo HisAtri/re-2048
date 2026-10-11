@@ -882,6 +882,13 @@ def _run_epoch(
                 if config.value_ranking_weight > 0 and batch.tree_count.max() > 0
                 else None
             )
+            if augment and want_value:
+                # 候选与树内行此前绕过了主轨迹增强。逐行变换只改变棋盘朝向，保留槽位顺序，
+                # 因此标量标签、权重和排序配对仍对齐；主轨迹已增强，不要重复消耗随机数。
+                if use_candidates:
+                    base_rows = augment_value(base_rows, rng)
+                if tree_rows is not None:
+                    tree_rows = augment_value(tree_rows, rng)
             value_rows = torch.cat([base_rows, tree_rows], dim=0) if tree_rows is not None else base_rows
             base_count = base_rows.shape[0]
 

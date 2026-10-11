@@ -773,6 +773,92 @@ def test_random_augment_keeps_board_and_mask_consistent() -> None:
             assert sorted(transformed[index].tolist()) == sorted(boards[index].tolist())
 
 
+@pytest.mark.parametrize("mode", ["value", "joint", "dual"])
+@pytest.mark.parametrize("value_target", ["candidate", "trajectory"])
+@pytest.mark.parametrize("nodes", [0, 2])
+@pytest.mark.parametrize("training,augment", [(True, True), (True, False), (False, True)])
+def test_epoch_augments_all_value_inputs(monkeypatch, mode, value_target, nodes, training, augment) -> None:
+    """检查真正送入前向的每一行，防止候选/树内监督再次绕过增强或错配标签。"""
+    from r2048.nn import training as trainer
+
+    count = 2
+
+    def boards(rows: int) -> torch.Tensor:
+        result = torch.arange(16, dtype=torch.uint8).repeat(rows, 1)
+        result[:, 0] = torch.arange(16, 16 + rows, dtype=torch.uint8)
+        return result
+
+    tree = _tree_zeros(count, nodes)
+    tree["tree_afterstate"] = boards(count * nodes * 4).reshape(count, nodes, 4, 16)
+    tree["tree_count"].fill_(nodes)
+    tree["tree_legal"].fill_(1)
+    tree["tree_visits"].fill_(1)
+    tree["tree_value"] = torch.arange(count * nodes * 4).float().reshape(count, nodes, 4)
+    tree["tree_rollout_value"] = tree["tree_value"].clone()
+    batch = Batch(
+        decision=boards(count),
+        afterstate=boards(count),
+        action=torch.zeros(count, dtype=torch.long),
+        legal_mask=torch.ones(count, 4),
+        visits=torch.ones(count, 4),
+        policy_target=torch.full((count, 4), 0.25),
+        value_target=torch.arange(count).float(),
+        move_score=torch.zeros(count),
+        episode=torch.arange(count),
+        candidate_afterstate=boards(count * 4).reshape(count, 4, 16),
+        candidate_value=torch.arange(count * 4).float().reshape(count, 4),
+        candidate_reward=torch.zeros(count, 4),
+        candidate_visits=torch.ones(count, 4),
+        candidate_weight=torch.ones(count, 4),
+        **tree,
+    )
+    original = {name: tensor.clone() for name, tensor in batch.__dict__.items()}
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01) if training else None
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1) if training else None
+    inputs = []
+
+    def forward(model, rows, amp_dtype, channels_last):
+        inputs.append(rows.clone())
+        # 保留真实损失与反向路径，只替换网络以直接观察未经编码的前向棋盘。
+        values = model(rows.float().mean(dim=1, keepdim=True)).squeeze(1)
+        return values, values[:, None].expand(-1, 4)
+
+    class Stream(list):
+        def set_epoch(self, epoch):
+            pass
+
+    monkeypatch.setattr(trainer, "_forward", forward)
+    config = TrainConfig(
+        mode=mode, value_target=value_target, augment=augment, value_ranking_weight=1, log_every=0
+    )
+    loss, _, _ = trainer._run_epoch(
+        model, Stream([batch]), optimizer, scheduler, config, torch.device("cpu"), None,
+        1024.0, torch.Generator().manual_seed(17), 0, "test",
+    )
+    assert np.isfinite(loss)
+    assert len(inputs) == 1, "所有监督行仍应合并为一次前向"
+    value_inputs = inputs[0][count:] if mode in ("joint", "dual") else inputs[0]
+    base = batch.candidate_afterstate.reshape(-1, 16) if value_target == "candidate" else batch.afterstate
+    expected = torch.cat([base, batch.tree_afterstate.reshape(-1, 16)])
+    if training and augment:
+        # 每行独立检查 D4 轨道，并保留行下标：仅检查块值集合会漏掉标签槽位错配。
+        for before, after in zip(expected, value_inputs, strict=True):
+            shaped = before.reshape(4, 4)
+            orbit = [
+                torch.rot90(shaped, turns).flip(-1) if reflection else torch.rot90(shaped, turns)
+                for turns in range(4) for reflection in range(2)
+            ]
+            assert any(torch.equal(after, transformed.reshape(16)) for transformed in orbit)
+        assert not torch.equal(value_inputs[:len(base)], base), "基础价值输入必须实际增强"
+        if nodes:
+            assert not torch.equal(value_inputs[len(base):], expected[len(base):]), "树内输入必须实际增强"
+    else:
+        assert torch.equal(value_inputs, expected), "验证集或关闭增强时必须保留原棋盘"
+    for name, tensor in original.items():
+        assert torch.equal(getattr(batch, name), tensor), f"增强不能修改原批次的 {name}"
+
+
 def test_training_smoke_writes_checkpoint(batch_dir: Path, tmp_path: Path) -> None:
     """价值模式跑一轮：损失有限、指标改善方向正确、checkpoint 元数据齐全。"""
     run_dir = tmp_path / "run"

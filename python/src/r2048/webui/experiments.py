@@ -16,7 +16,7 @@ from r2048.webui import inventory
 from r2048.webui.experiment_views import KINDS, STATES, protocol_label, request_summary, task_summary
 from r2048.webui.tasks import TERMINAL
 from r2048.webui.worker import validate_request
-from r2048.workflows.assessment import rating_report
+from r2048.workflows.assessment import assessment_profiles, load_assessment_profile, rating_report
 
 
 def recipes() -> dict[str, Path]:
@@ -43,7 +43,7 @@ def ratings_table():
                         stats["mean_score"],
                     ]
                 )
-    missing = [line for line in ("search", "pure") if line not in report["anchors"].get("tracks", {})]
+    missing = [line for line in ("search",) if line not in report["anchors"].get("tracks", {})]
     if missing:
         from r2048.workflows.rating import load_pool
 
@@ -138,7 +138,7 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
             lr = gr.Number(0.0003, label="学习率")
         with gr.Accordion("高级训练设置", open=False):
             validation = gr.Number(0.05, label="验证集比例")
-            split = gr.Number(0, precision=0, label="训练与验证划分的随机种子")
+            split = gr.Number(-1, precision=0, label="训练与验证划分的随机种子（-1 自动随机）")
         automatic = gr.Checkbox(True, label="自动使用本机实测的训练批大小")
         automatic.change(
             lambda enabled: gr.update(interactive=not enabled),
@@ -154,7 +154,7 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
             sims = gr.Number(64, precision=0, label="每步搜索次数")
             workers = gr.Number(4, precision=0, label="同时运行的跑谱进程数", interactive=False)
         with gr.Accordion("高级跑谱设置", open=False):
-            seed = gr.Number(20261010, precision=0, label="随机种子")
+            seed = gr.Number(-1, precision=0, label="随机种子（-1 自动随机）")
             with gr.Row():
                 lanes = gr.Number(64, precision=0, label="每个进程同时进行的对局数", interactive=False)
                 flight = gr.Number(8, precision=0, label="每局同时等待的推理请求数", interactive=False)
@@ -180,24 +180,24 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
         }
 
     def evaluation_form(parallel=True):
+        profile = gr.Dropdown(list(assessment_profiles()), value="P1000S64", label="测评配置")
         with gr.Row():
-            games = gr.Number(400, precision=0, label="评测局数")
-            sims = gr.Number(64, precision=0, label="评测每步搜索次数")
-        result = {13: games, 14: sims}
+            games = gr.Number(1000, precision=0, label="评测局数", interactive=False)
+            sims = gr.Number(64, precision=0, label="评测每步搜索次数", interactive=False)
+        result = {13: games, 14: sims, 21: profile}
         with gr.Accordion("高级评测设置", open=False):
-            result[15] = gr.Number(20262053, precision=0, label="评测随机种子")
+            result[15] = gr.Number(-1, precision=0, label="评测随机种子（-1 自动随机）", interactive=False)
             if parallel:
                 result[9] = gr.Number(64, precision=0, label="同时进行的对局数", interactive=False)
                 result[10] = gr.Number(8, precision=0, label="每局同时等待的推理请求数", interactive=False)
-        if parallel:
-            automatic = gr.Checkbox(True, label="自动使用本机评测性能画像（实际值见配置摘要）")
-            automatic.change(
-                lambda enabled: [gr.update(interactive=not enabled) for _ in range(2)],
-                inputs=[automatic],
-                outputs=[result[9], result[10]],
-                queue=False,
-            )
-            result[20] = automatic
+        profile.change(
+            lambda identity: [
+                load_assessment_profile(identity)[key] for key in ("games", "simulations", "seed")
+            ],
+            inputs=[profile],
+            outputs=[games, sims, result[15]],
+            queue=False,
+        )
         return result
 
     # 操作页独占宽度；任务管理是另一个页面，避免长期占用表单的一半空间。
@@ -239,15 +239,16 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
             strategy = gr.Dropdown(
                 [
                     ("模型辅助搜索（NN-MCTS）", "nn_mcts"),
-                    ("策略头直接落子", "nn_policy"),
-                    ("价值头选招", "nn_value"),
                 ],
                 value="nn_mcts",
                 label="模型如何选招",
+                interactive=False,
             )
             evaluation_controls = evaluation_form()
-            evaluation_controls[1] = gr.Dropdown(device_choices, value="cuda", label="模型推理设备")
-            gr.Markdown("搜索评测对比相同搜索次数的纯 MCTS；直接选招评测对比随机落子。")
+            evaluation_controls[1] = gr.Dropdown(
+                device_choices, value="cuda", label="模型推理设备", interactive=False
+            )
+            gr.Markdown("P1000S64：NN-MCTS 对比纯 MCTS-64；基线首次完成后跨任务复用。")
             eval_preview = gr.Button("检查评测配置")
             with gr.Accordion("导入已有评测结果", open=False):
                 files = gr.CheckboxGroup(list(evaluations), label="选择已完成的评测记录")
@@ -263,7 +264,7 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
                 with gr.Accordion("设置评分基准", open=False):
                     gr.Markdown("选择评分池中的模型作为基准。更换后，该类型的评分会重新计算。")
                     anchor_track = gr.Dropdown(
-                        [("搜索评测", "search"), ("直接选招", "pure")], value="search", label="评分类型"
+                        [("搜索评测", "search")], value="search", label="评分类型"
                     )
                     anchor_identity = gr.Dropdown([], label="基准模型")
                     anchor_refresh = gr.Button("载入可选模型")
@@ -335,20 +336,21 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
         0.0003,
         1000000,
         64,
-        20261010,
+        -1,
         4,
         64,
         8,
         2,
         8,
-        400,
+        1000,
         64,
-        20262053,
+        -1,
         0.05,
-        0,
+        -1,
         True,
         True,
         True,
+        "P1000S64",
     ]
 
     def prepare(
@@ -379,14 +381,15 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
                 in_flight,
                 nodes,
                 plays,
-                n_games,
-                budget,
-                assessment_seed,
+                _n_games,
+                _budget,
+                _assessment_seed,
                 validation_fraction,
                 partition_seed,
                 automatic_generation,
                 automatic_training,
-                automatic_evaluation,
+                _automatic_evaluation,
+                assessment_profile,
             ) = values
             current_models, current_batches, current_iterations, current_files = catalogs()
             recipe = {}
@@ -412,14 +415,7 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
                 "tree_label_plays": int(plays),
                 "device": gpu,
             }
-            evaluation = {
-                "games": int(n_games),
-                "seed": int(assessment_seed),
-                "simulations": int(budget),
-                "lanes": int(n_lanes),
-                "in_flight": int(in_flight),
-                "device": gpu,
-            }
+            evaluation = load_assessment_profile(assessment_profile)
             config = {}
             if kind in ("selfplay", "iterate"):
                 config = {"checkpoint": model}
@@ -429,10 +425,11 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
                     config["recipe"] = recipe
                     config["iteration"] = {
                         **generation,
-                        "eval_games": int(n_games),
-                        "eval_simulations": int(budget),
-                        "eval_seed": int(assessment_seed),
-                        "baselines": ["random", f"mcts{int(budget)}"],
+                        "eval_games": evaluation["games"],
+                        "eval_simulations": evaluation["simulations"],
+                        "eval_seed": evaluation["seed"],
+                        "assessment_profile": assessment_profile,
+                        "baselines": [f"mcts{evaluation['simulations']}"],
                     }
             elif kind == "train":
                 specs = []
@@ -452,7 +449,12 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
                     )
                 config = {"datasets": specs, "checkpoint": model, "recipe": recipe}
             elif kind == "assessment":
-                config = {"checkpoint": model, "track": track, "evaluation": evaluation}
+                config = {
+                    "checkpoint": model,
+                    "track": track,
+                    "evaluation": evaluation,
+                    "assessment_profile": assessment_profile,
+                }
             elif kind == "rating":
                 if not record_files:
                     raise ValueError("请选择完整评测记录")
@@ -533,21 +535,6 @@ def bind_experiments(state, play_model, workspace_tabs, compute_controls):
                 settings.pop("workers")
                 if kind == "iterate":
                     settings["device"] = original_device
-                performance.append(info)
-            if kind == "assessment":
-                settings = config["evaluation"]
-                if automatic_evaluation:
-                    settings["lanes"] = settings["in_flight"] = settings["max_batch"] = None
-                settings["track"] = track
-                effective, info = resolve(
-                    "evaluate",
-                    settings,
-                    model,
-                    mode="auto" if automatic_evaluation else "off",
-                    default_values={"lanes": 64, "in_flight": 8},
-                )
-                settings.pop("track")
-                settings.update({key: effective[key] for key in ("lanes", "in_flight", "max_batch")})
                 performance.append(info)
             if kind in ("train", "iterate"):
                 training = recipe["train"]

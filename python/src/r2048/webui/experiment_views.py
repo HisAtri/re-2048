@@ -130,6 +130,7 @@ def request_summary(request):
         )
     evaluation = config.get("evaluation")
     if evaluation:
+        rows.append(("测评配置", config.get("assessment_profile", "自定义")))
         rows.append(
             (
                 "选招方式",

@@ -1,0 +1,15 @@
+# 测评口径一经发布不改写；新口径使用新的配置 ID。
+track: nn_mcts
+baseline:
+  policy: mcts
+evaluation:
+  games: 1000
+  simulations: 64
+  seed: -1
+  lanes: 64
+  in_flight: 8
+  max_batch: 8192
+  search_threads: 1
+  c_puct: 1.5
+  cache_entries: 131072
+  device: cuda

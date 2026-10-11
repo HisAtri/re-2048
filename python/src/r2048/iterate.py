@@ -87,6 +87,7 @@ class IterateConfig:
     eval_games: int = 400
     eval_simulations: int = 0  # 独立评测预算；0 沿用跑谱预算，兼容既有 CLI 配置。
     eval_seed: int = 0
+    assessment_profile: str = ""
     baselines: tuple[str, ...] = DEFAULT_BASELINES
     anchors: dict[str, str] = field(default_factory=dict)
     on_progress: Callable[[dict], None] | None = None
@@ -477,9 +478,23 @@ def _step_evaluate(config: IterateConfig, written: dict, job: JobDir) -> dict:
         "device": config.device,
     }
     result = evaluate_group(
-        directory / "eval" / attempt, _nn_arms(config, train), baseline_arms(config), params, job
+        directory / "eval" / attempt,
+        [arm for arm in _nn_arms(config, train) if not config.assessment_profile or arm[2] == "nn_mcts"],
+        baseline_arms(config),
+        params,
+        job,
+        profile=config.assessment_profile,
     )
-    return {**result, "protocol": _protocol(config), "directory": str(directory)}
+    protocol = _protocol(config)
+    if config.assessment_profile:
+        from r2048.workflows.assessment import load_assessment_profile
+
+        protocol = {
+            **load_assessment_profile(config.assessment_profile),
+            "seed": result["seed"],
+            "assessment_profile": config.assessment_profile,
+        }
+    return {**result, "protocol": protocol, "directory": str(directory)}
 
 
 def _nn_arms(config: IterateConfig, train: dict) -> list[tuple[str, str, str]]:
@@ -529,11 +544,16 @@ def _step_rate(config: IterateConfig, written: dict, job: JobDir) -> dict:
     from r2048.workflows.assessment import ingest_and_rate
 
     labels = written["evaluate"]["jsonl"]
+    simulations = (
+        written["evaluate"]
+        .get("protocol", {})
+        .get("simulations", config.eval_simulations or config.simulations)
+    )
     initialize = {}
     for label in labels:
         if label == "random" or label.endswith("-random"):
             initialize["pure"] = label
-        if label.split("-")[-1] == f"mcts{config.eval_simulations or config.simulations}":
+        if label.split("-")[-1] == f"mcts{simulations}":
             initialize["search"] = label
     return ingest_and_rate(Path(config.output), sorted(labels.values()), config.anchors, initialize)
 

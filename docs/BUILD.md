@@ -405,7 +405,7 @@ benchmark 不会由正式跑谱隐式执行；无匹配画像时提示并使用�
 
 纯 MCTS 省略 checkpoint，使用 `--samples 5000` 测生成吞吐；评测用
 `--stage evaluate --batches 512,1024,4096` 测推理批上限；训练用
-`--stage train --config configs/double-tower.yaml --data <数据批> --batches 1024,2048,4096`。
+`--stage train --config configs/smnet-b9c64dt.yaml --data <数据批> --batches 1024,2048,4096`。
 训练模式可用 `--mode value|policy|dual` 与 `--freeze-value` 指定；训练配方中显式的批大小
 仍优先于画像，WebUI 自动选项会将该字段交给画像解析。精度仍为 FP32（ADR 0025）。
 

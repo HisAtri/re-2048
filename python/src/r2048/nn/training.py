@@ -160,13 +160,13 @@ class TrainConfig:
     # 挑到同一个 epoch（空实验），那说明的是这个错误在该配置下的影响面还没显现，而不是它
     # 没有影响。尺子先修对，再谈影响面。
     value_selection: str = "q_best_hit"
-    split_seed: int = 0
+    split_seed: int = -1
     # 每轮采样多少条（0 = 各来源训练池之和）。只在多来源或显式想缩短轮长时才有意义。
     samples_per_epoch: int = 0
     augment: bool = True
     max_samples: int = 0
     device: str = "cuda"
-    seed: int = 0
+    seed: int = -1
     amp: str = "off"  # off | bf16
     channels_last: bool = True
     compile: bool = False
@@ -1059,6 +1059,16 @@ def run_training(config: TrainConfig) -> TrainResult:
             "冻结价值路径时必须给出 --init-checkpoint：在一个随机初始化的价值头上只训策略头没有意义"
         )
     run_identity = prepare_training_run(config)
+    from r2048.randomness import persist_seeds
+
+    seeds = {"seed": config.seed, "split_seed": config.split_seed}
+    if config.resume and (Path(config.output) / "last.pt").exists():
+        restored = read_checkpoint_payload(str(Path(config.output) / "last.pt"))["config"]
+        for name, seed in seeds.items():
+            if seed == -1:
+                seeds[name] = restored[name]
+    seeds = persist_seeds(Path(config.output) / "seeds.json", seeds, ("seed", "split_seed"))
+    config.seed, config.split_seed = seeds["seed"], seeds["split_seed"]
     torch.manual_seed(config.seed)
     np.random.seed(config.seed & 0xFFFFFFFF)
 

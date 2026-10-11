@@ -46,7 +46,8 @@ def _tree_zeros(count: int, nodes: int = 0) -> dict:
 
 def training_config(data: str | Path, output: str | Path, **overrides) -> TrainConfig:
     """测试里的 TrainConfig 构造：数据来源写成 DatasetSpec，避免每个断言点都重复一遍。"""
-    payload = {"datasets": [DatasetSpec(path=str(data))], "output": str(output)}
+    # 小样本回归固定随机序列，避免默认自动随机让验证集偶然为空。
+    payload = {"datasets": [DatasetSpec(path=str(data))], "output": str(output), "seed": 0, "split_seed": 0}
     payload.update(overrides)
     return TrainConfig(**payload)
 
@@ -993,6 +994,7 @@ def test_weight_zero_source_leaves_the_curve_identical(
         "val_fraction": 0.2,
         "device": "cpu",
         "seed": 3,
+        "split_seed": 0,
         "max_samples": 512,
         "log_every": 0,
     }
@@ -1056,6 +1058,7 @@ def test_resume_matches_one_shot_bitwise(batch_dir: Path, tmp_path: Path) -> Non
         "val_fraction": 0.2,
         "device": "cpu",
         "seed": 5,
+        "split_seed": 0,
         "max_samples": 2048,
         "log_every": 1,
     }
@@ -1111,6 +1114,7 @@ def test_cooperative_stop_preserves_weights_rng_and_lineage(batch_dir, tmp_path,
         "batch_size": 128,
         "max_samples": 1024,
         "seed": 61,
+        "split_seed": 0,
         "device": "cpu",
         "log_every": 1,
         "val_fraction": 0.25,
@@ -1144,6 +1148,31 @@ def test_cooperative_stop_preserves_weights_rng_and_lineage(batch_dir, tmp_path,
         assert torch.equal(expected["model"][name], actual["model"][name]), name
 
 
+def test_automatic_training_seeds_survive_resume(batch_dir: Path, tmp_path: Path) -> None:
+    from r2048.fileio import read_json
+
+    torch.set_num_threads(1)
+    common = {
+        "architecture": "sh-s6c64",
+        "architecture_params": {"channels": 8, "blocks": 1, "head_width": 16, "groups": 2},
+        "device": "cpu",
+        "batch_size": 128,
+        "max_samples": 512,
+        "val_fraction": 0,
+        "seed": -1,
+        "split_seed": -1,
+        "log_every": 0,
+    }
+    first = run_training(training_config(batch_dir, tmp_path / "auto", epochs=1, **common))
+    seeds = read_json(tmp_path / "auto/seeds.json")
+    resumed = run_training(training_config(batch_dir, tmp_path / "auto", epochs=2, resume=True, **common))
+    assert read_json(tmp_path / "auto/seeds.json") == seeds
+    saved = torch.load(resumed.last_checkpoint, weights_only=False)["config"]
+    assert saved["seed"] == seeds["seed"] >= 0
+    assert saved["split_seed"] == seeds["split_seed"] >= 0
+    assert len(first.metrics) == 1 and len(resumed.metrics) == 2
+
+
 def test_resume_refuses_changed_data(batch_dir: Path, search_batch_dir: Path, tmp_path: Path) -> None:
     """数据身份变了就必须拒绝续跑：换数据接着训是静默错误（划分与标签都变了，损失照样降）。"""
     common = {
@@ -1153,6 +1182,7 @@ def test_resume_refuses_changed_data(batch_dir: Path, search_batch_dir: Path, tm
         "lr": 1e-3,
         "device": "cpu",
         "seed": 7,
+        "split_seed": 0,
         "max_samples": 512,
         # 两个批次都取 0.5：mcts 那批只有 12 局，0.2 有约 7% 的概率一局都进不了验证集
         # （那会被"验证集为空"的闸门拦下，让这条测试变成在测概率）。
@@ -1185,6 +1215,7 @@ def test_resume_warns_about_config_change(batch_dir: Path, tmp_path: Path, capsy
         "val_fraction": 0.2,
         "device": "cpu",
         "seed": 9,
+        "split_seed": 0,
         "max_samples": 512,
         "log_every": 0,
     }
@@ -1219,6 +1250,7 @@ def test_resume_keeps_best_selection(batch_dir: Path, tmp_path: Path) -> None:
         "val_fraction": 0.2,
         "device": "cpu",
         "seed": 11,
+        "split_seed": 0,
         "max_samples": 2048,
         "log_every": 0,
     }

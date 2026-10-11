@@ -1,20 +1,48 @@
 """评测组与评分提交共用入口；只有完整评测进入评分池。"""
 
+import hashlib
 import json
 import os
 from pathlib import Path
+
+import yaml
 
 from r2048 import paths
 from r2048.fileio import write_json_atomic, write_text_atomic
 from r2048.identity import file_lock
 from r2048.jobs import run_cpp
+from r2048.randomness import persist_seeds
 from r2048.task_control import check_stop
 from r2048.workflows import rating
 from r2048.workflows.evaluate import EvalConfig, run_evaluation
 
 
-def evaluate_group(directory: Path, arms: list, baselines: list, params: dict, job=None) -> dict:
+def assessment_profiles() -> dict[str, Path]:
+    root = Path(__file__).resolve().parents[4] / "configs" / "assessment"
+    return {path.stem: path for path in sorted(root.glob("*.yaml"))}
+
+
+def load_assessment_definition(identity: str) -> dict:
+    profiles = assessment_profiles()
+    if identity not in profiles:
+        raise ValueError(f"未知测评配置：{identity}")
+    return yaml.safe_load(profiles[identity].read_text())
+
+
+def load_assessment_profile(identity: str) -> dict:
+    return load_assessment_definition(identity)["evaluation"]
+
+
+def evaluate_group(directory: Path, arms: list, baselines: list, params: dict, job=None, profile="") -> dict:
     directory.mkdir(parents=True, exist_ok=True)
+    if profile:
+        definition = load_assessment_definition(profile)
+        params = definition["evaluation"]
+        if any(track != definition["track"] for _, _, track in arms):
+            raise ValueError(f"{profile} 只支持 {definition['track']} 测评")
+        baseline = definition["baseline"]
+        baselines = [(f"mcts{params['simulations']}", {**baseline, "simulations": params["simulations"]})]
+    params = persist_seeds(directory / "seeds.json", dict(params), ("seed",))
     files = {}
     for label, checkpoint, track in arms:
         check_stop()
@@ -41,6 +69,25 @@ def evaluate_group(directory: Path, arms: list, baselines: list, params: dict, j
         files[label] = str(output)
     for label, config in baselines:
         check_stop()
+        if profile:
+            # 基线只依赖规则与纯 C++ 搜索配置；模型和抽样种子不能制造新的基线身份。
+            import r2048_core
+
+            spec = {
+                "profile": profile,
+                "evaluation": load_assessment_profile(profile),
+                "baseline": config,
+                "rules_version": int(r2048_core.RULES_VERSION),
+                "protocol_version": int(r2048_core.PROTOCOL_VERSION),
+            }
+            digest = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]
+            label = f"{profile}-{digest}-{label}"
+            shared = paths.output_root() / "rating" / "baselines" / label
+            with file_lock(shared / ".build.lock"):
+                baseline_params = persist_seeds(shared / "seeds.json", dict(params, seed=-1), ("seed",))
+                result = evaluate_group(shared, [], [(label, config)], baseline_params, job)
+            files[label] = result["jsonl"][label]
+            continue
         output = directory / f"{label}.jsonl"
         marker = directory / f"{label}.complete.json"
         if not marker.exists():
@@ -64,7 +111,10 @@ def evaluate_group(directory: Path, arms: list, baselines: list, params: dict, j
             write_json_atomic(marker, {"jsonl": str(output)})
         files[label] = str(output)
     check_stop()
-    return {"arms": list(files), "jsonl": files, "games": params["games"], "seed": params["seed"]}
+    result = {"arms": list(files), "jsonl": files, "games": params["games"], "seed": params["seed"]}
+    if profile:
+        result["assessment_profile"] = profile
+    return result
 
 
 def rating_report() -> dict:

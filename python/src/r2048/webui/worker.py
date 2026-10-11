@@ -25,6 +25,11 @@ def validate_request(request: dict, root: Path):
     if request.get("kind") not in KINDS:
         raise ValueError("不支持的实验操作")
     config = request["config"]
+    profile = config.get("assessment_profile") or config.get("iteration", {}).get("assessment_profile")
+    if profile:
+        from r2048.workflows.assessment import load_assessment_profile
+
+        load_assessment_profile(profile)
     for settings in (
         config,
         config.get("selfplay", {}),
@@ -127,6 +132,17 @@ def run_request(directory: Path, request: dict) -> dict:
     config = request["config"]
     work = directory / "work"
     work.mkdir(parents=True, exist_ok=True)
+    from r2048.randomness import persist_seeds
+
+    for section, names in (("selfplay", ("data_seed",)), ("iteration", ("data_seed", "eval_seed"))):
+        if section in config:
+            settings = config[section]
+            if settings.get("assessment_profile"):
+                # 固定测评在 evaluate 阶段才抽样，不能提前占用一个未实际使用的种子。
+                names = ("data_seed",)
+            for name in names:
+                settings.setdefault(name, -1)
+            persist_seeds(work / f"{section}-seeds.json", settings, names)
     recipe = work / "recipe.yaml"
     if "recipe" in config and not recipe.exists():
         recipe.write_text(yaml.safe_dump(config["recipe"], allow_unicode=True), encoding="utf-8")
@@ -198,20 +214,18 @@ def run_request(directory: Path, request: dict) -> dict:
                 IterateConfig(config_path=str(recipe), output=str(work)), {"train": trained}, job
             )
         elif kind == "assessment":
-            params = dict(config["evaluation"])
             track = config.get("track", "nn_mcts")
-            baseline = f"mcts{params['simulations']}" if track == "nn_mcts" else "random"
-            baseline_label = f"{directory.name}-{baseline}"
-            baselines = [
-                (
-                    baseline_label,
-                    {"policy": "mcts", "simulations": params["simulations"]}
-                    if track == "nn_mcts"
-                    else {"policy": "random"},
-                )
-            ]
+            from r2048.workflows.assessment import load_assessment_profile
+
+            profile = config.get("assessment_profile", "P1000S64")
+            params = load_assessment_profile(profile)
             result = evaluate_group(
-                work / "eval", [(directory.name, config["checkpoint"], track)], baselines, params, job
+                work / "eval",
+                [(directory.name, config["checkpoint"], track)],
+                [],
+                params,
+                job,
+                profile=profile,
             )
             check_stop()
             result.update(
@@ -219,7 +233,9 @@ def run_request(directory: Path, request: dict) -> dict:
                     work,
                     list(result["jsonl"].values()),
                     initialize={
-                        "search" if track == "nn_mcts" else "pure": baseline_label,
+                        "search": next(
+                            label for label in result["jsonl"] if label.endswith(f"-mcts{params['simulations']}")
+                        )
                     },
                 )
             )

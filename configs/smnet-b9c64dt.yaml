@@ -20,7 +20,8 @@ train:
   batch_size: 4096
   lr: 3.0e-4
   val_fraction: 0.05
-  seed: 20261007
+  seed: -1
+  split_seed: -1
   device: cuda
   log_every: 200
 # datasets: 首轮留空——只有这一轮新产出的数据。

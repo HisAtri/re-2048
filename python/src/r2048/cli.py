@@ -416,7 +416,7 @@ def _build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--rollout-policy", choices=("greedy", "uniform"), default="greedy")
     benchmark.add_argument("--batches", default="512,1024,4096", help="评测或训练的候选批大小")
     benchmark.add_argument("--track", choices=("nn_mcts", "nn_policy", "nn_value"), default="nn_mcts")
-    benchmark.add_argument("--config", default="configs/double-tower.yaml")
+    benchmark.add_argument("--config", default="configs/smnet-b9c64dt.yaml")
     benchmark.add_argument("--data", default="")
     benchmark.add_argument("--mode", choices=("value", "policy", "dual"), default="value")
     benchmark.add_argument("--freeze-value", action="store_true")

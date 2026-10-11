@@ -37,7 +37,16 @@ def train_dual(
     train_params["datasets"] = datasets
     if on_progress is not None:
         train_params["on_progress"] = on_progress
-    seed = int(train_params.get("seed", 0))
+    from r2048.randomness import persist_seeds
+
+    seeds = persist_seeds(
+        run_root / "seeds.json",
+        {"seed": int(train_params.get("seed", -1)), "split_seed": int(train_params.get("split_seed", -1))},
+        ("seed", "split_seed"),
+    )
+    seed = seeds["seed"]
+    # 两个头必须共享整局划分，否则价值验证局可能进入策略训练集。
+    train_params["split_seed"] = seeds["split_seed"]
     if "batch_size" not in train_params:
         from r2048.performance import resolve
 

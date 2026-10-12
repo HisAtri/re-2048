@@ -21,7 +21,8 @@ from pathlib import Path
 
 from r2048.fileio import save_torch_atomic
 from r2048.nn.lineage import file_sha256, lineage_fields, make_lineage, merge_lineages, resolve_lineage
-from r2048.nn.model import canonical_id, read_checkpoint_payload
+from r2048.nn.model import read_checkpoint_payload
+from r2048.nn.registry import canonical_id
 
 # 策略路径的参数名前缀。与 `nn/model.py` 的命名一致：合并就是把"属于价值路径的"
 # 与"属于策略路径的"按名字分开，不做任何形状推断。

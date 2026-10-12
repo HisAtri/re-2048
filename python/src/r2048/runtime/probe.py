@@ -17,7 +17,6 @@ import numpy as np
 import r2048_core
 import torch
 
-from r2048.nn.encode import encode_boards
 from r2048.nn.model import load_checkpoint
 
 DIRECTION_NAMES = ("上", "右", "下", "左")  # 顺序 = C++ 的动作顺序契约 kUp/kRight/kDown/kLeft
@@ -93,7 +92,7 @@ def probe_position(
         scores.append(int(outcome["score"]))
 
     with torch.no_grad():
-        value, logits = model(encode_boards(torch.from_numpy(np.stack(rows)).to(torch.long).to(target)))
+        value, logits = model(torch.from_numpy(np.stack(rows)).to(target))
     afterstate_values = (value[1:] * scale).tolist()
     logits = logits[0].float().cpu()
     masked = torch.where(

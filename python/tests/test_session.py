@@ -29,7 +29,8 @@ from r2048.session_io import SessionClient, SessionError, SessionServer, _split_
 
 def _tiny_checkpoint(path: Path) -> str:
     """一个极小但真实可加载的 checkpoint：CPU 上跑几十次模拟只要毫秒级。"""
-    from r2048.nn.model import build, save_checkpoint
+    from r2048.nn.model import save_checkpoint
+    from r2048.nn.registry import build
 
     model = build("sh-s6c64", {"channels": 8, "blocks": 1, "head_width": 16, "groups": 2})
     save_checkpoint(str(path), model, model.metadata("tiny-test"))

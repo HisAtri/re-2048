@@ -97,8 +97,9 @@ def validate_request(request: dict, root: Path):
 
         params = train_section_payload("WebUI 配方", config["recipe"].get("train", {}))
         if request["kind"] in ("train", "iterate"):
+            from r2048.nn.metadata import default_params
             from r2048.nn.model import architecture_conflict
-            from r2048.nn.models import default_params, resolve
+            from r2048.nn.registry import resolve
 
             if config.get("checkpoint"):
                 conflict = architecture_conflict(

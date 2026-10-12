@@ -14,11 +14,9 @@ import numpy as np
 import r2048_core
 import torch
 
-from r2048.nn.encode import encode_boards
-
 
 class ForwardModel(Protocol):
-    def __call__(self, encoded: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: ...
+    def __call__(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 class BatchedEvaluator:
@@ -38,7 +36,7 @@ class BatchedEvaluator:
         # 分相位计时。**GPU 执行时间单独用 CUDA event 量**：Python 侧的 forward 调用是
         # 异步的（只是把核函数排进流），墙钟量到的是"排队"而不是"算"，唯一能说明
         # "GPU 忙了多久"的是 event。这两个数放在一起才能回答"到底谁在等谁"。
-        self.seconds = {"encode": 0.0, "forward": 0.0, "collect": 0.0}
+        self.seconds = {"transfer": 0.0, "forward": 0.0, "collect": 0.0}
         self.gpu_seconds = 0.0
 
     def evaluate(self, kinds: np.ndarray, boards: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -52,8 +50,8 @@ class BatchedEvaluator:
 
         rows = boards.shape[0]
         started = time.monotonic()
-        encoded = encode_boards(torch.from_numpy(np.ascontiguousarray(boards)).to(torch.long).to(self.device))
-        self.seconds["encode"] += time.monotonic() - started
+        inputs = torch.from_numpy(np.ascontiguousarray(boards)).to(self.device)
+        self.seconds["transfer"] += time.monotonic() - started
 
         started = time.monotonic()
         # event 只在 CUDA 上能用；CPU 后端就没有"GPU 执行时间"这回事，记 0。
@@ -63,7 +61,7 @@ class BatchedEvaluator:
             begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             begin.record()
         with torch.no_grad():
-            value, logits = self.model(encoded)
+            value, logits = self.model(inputs)
         if use_event:
             end.record()
         self.seconds["forward"] += time.monotonic() - started

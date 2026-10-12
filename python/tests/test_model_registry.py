@@ -1,6 +1,6 @@
 """模型定义的注册表与加载闸门。
 
-这里守的是"模型迭代的解耦"：加一个新版本应当只动 `nn/models/` 里的东西，而**不会**
+这里守的是"模型迭代的解耦"：加一个新版本只需新增定义并在 `nn/registry.py` 登记，而**不会**
 悄悄影响到训练、自对弈、评测或旧产物。所以判据围绕三件事：
 
 * 每个登记在册的定义都能**自己往返**（构造 → metadata → 重建 → 前向）；
@@ -12,32 +12,60 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import subprocess
+import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
 from r2048.config import build_train_config
-from r2048.nn.encode import INPUT_CHANNELS
+from r2048.nn.metadata import default_params, instance_params
 from r2048.nn.model import (
     SHARED_ARCHITECTURE,
-    UnknownModelDefinition,
     create_model,
     load_checkpoint,
-    supported_ids,
 )
-from r2048.nn.models import REGISTRY, build, default_params, instance_params
+from r2048.nn.registry import REGISTRY, UnknownModelDefinition, build, supported_ids
 
 
-def encoded_batch(count: int = 3) -> torch.Tensor:
-    return torch.zeros(count, INPUT_CHANNELS, 4, 4)
+def test_tools_and_definition_package_import_without_registration() -> None:
+    """工具应能单独使用；导入包也不应隐式加载整网或触发注册，防止依赖方向倒置。"""
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib
+import sys
+for name in (
+    'r2048.nn.components.blocks',
+    'r2048.nn.components.exponent_one_hot',
+    'r2048.nn.metadata',
+    'r2048.nn.models',
+):
+    importlib.import_module(name)
+    for forbidden in (
+        'r2048.nn.registry', 'r2048.nn.model', 'r2048.nn.training',
+        'r2048.nn.models.shared_resnet', 'r2048.nn.models.dual_tower',
+    ):
+        assert forbidden not in sys.modules, (name, forbidden)
+""",
+        ],
+        check=True,
+    )
+
+
+def board_batch(count: int = 3) -> torch.Tensor:
+    return torch.arange(count * 16, dtype=torch.uint8).reshape(count, 16)
 
 
 @pytest.mark.parametrize("version_id", sorted(REGISTRY))
 def test_every_definition_round_trips(version_id: str) -> None:
     """在册的每个定义：构造 → metadata → 用 metadata 重建 → 前向。
 
-    这条测试对**将来新增的定义自动生效**，是"加架构只动 nn/models/"的守卫：
+    这条测试对**将来新增的定义自动生效**，守住"加架构只新增定义和登记"的边界：
     漏记超参（用默认值重建出另一个网络）、前向形状不对、metadata 字段不全，
     都会在这里失败，而不是等到训练出问题才发现。
     """
@@ -55,7 +83,7 @@ def test_every_definition_round_trips(version_id: str) -> None:
     rebuilt.load_state_dict(model.state_dict())
 
     with torch.no_grad():  # 前向不带梯度：这里只关心形状与量纲
-        value, logits = rebuilt(encoded_batch())
+        value, logits = rebuilt(board_batch())
     assert value.shape == (3,) and logits.shape == (3, 4)
     assert torch.isfinite(value).all() and torch.isfinite(logits).all()
     # 本项目的值语义：价值是**归一化**的分数（score / score_scale），不是原始分数。
@@ -73,7 +101,7 @@ def test_hyperparameters_are_recorded_not_inferred() -> None:
         assert signature, f"{version_id} 没有可记录的构造超参（定义必须把超参写在 __init__ 签名里）"
         assert "head_width" in signature, "head_width 也必须进参数表，否则重建时静默回落默认值"
         assert "groups" in signature and signature["groups"] == 8, "分组数必须可记录且默认值不变"
-        # 定义必须把每个超参存成同名属性（contract.instance_params 靠它读回来）。
+        # 定义必须把每个超参存成同名属性（metadata.instance_params 靠它读回来）。
         model = build(version_id)
         for name in signature:
             assert getattr(model, name) == signature[name]
@@ -131,7 +159,7 @@ def test_names_are_only_lookup_keys(tmp_path: Path) -> None:
     但注册表里没有这份定义 → 必须报错。反过来，只要有定义，任何名字（含测试版日期号、
     旧 ID、正式别名）都指向同一份定义。
     """
-    from r2048.nn.models import canonical_id, known_names, resolve
+    from r2048.nn.registry import canonical_id, known_names, resolve
 
     with pytest.raises(UnknownModelDefinition):
         create_model({"architecture": "dt-s9p9v9c999"})
@@ -201,7 +229,7 @@ def test_architecture_conflict_is_precise() -> None:
 
     # 同一份定义的两个名字（历史产物记旧名、配置里写正式别名）不是冲突——这是改名之后
     # 最容易误报的一处：字符串不同但指向同一个类。
-    from r2048.nn.models import known_names
+    from r2048.nn.registry import known_names
 
     old_name = next(name for name, canonical in known_names().items() if canonical == SHARED_ARCHITECTURE)
     assert architecture_conflict(SHARED_ARCHITECTURE, {}, {"architecture": old_name}) is None
@@ -236,3 +264,116 @@ def test_architecture_params_reach_the_model_from_config(tmp_path: Path) -> None
     assert model.channels == 96 and model.shared_blocks == 2 and model.tower_blocks == 4
     # 参数表里没提的字段回落到签名默认值，而不是报错或变成 0。
     assert model.head_width == 256 and model.groups == 8
+
+
+@pytest.mark.parametrize("version_id", sorted(REGISTRY))
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_raw_board_forward_preserves_legacy_outputs(version_id, channels_last, tmp_path) -> None:
+    """用旧版编码公式与网络路径作判据，确保接口迁移没有改变旧权重的含义。"""
+    model = build(version_id, {"channels": 8, "head_width": 8})
+    if channels_last:
+        model.to(memory_format=torch.channels_last)
+    boards = board_batch()
+    boards[0, :4] = torch.tensor([0, 23, 24, 255], dtype=torch.uint8)
+    values = boards.long().reshape(-1, 4, 4)
+    encoded = torch.cat(
+        (
+            torch.nn.functional.one_hot(values.clamp(0, 23), 24).permute(0, 3, 1, 2).float(),
+            values.float().unsqueeze(1) / 23,
+        ),
+        dim=1,
+    )
+    if channels_last:
+        encoded = encoded.contiguous(memory_format=torch.channels_last)
+    with torch.no_grad():
+        if hasattr(model, "trunk"):
+            features = model.trunk(model.stem(encoded))
+            expected = model.value_head(features).squeeze(-1), model.policy_head(features)
+        else:
+            features = model.shared(model.stem(encoded))
+            expected = (
+                model.value_head(model.value_tower(features)).squeeze(-1),
+                model.policy_head(model.policy_tower(features)),
+            )
+        actual = model(boards)
+    assert all(torch.equal(before, after) for before, after in zip(expected, actual))
+
+    # 重构不引入编码器参数前缀；历史权重按原键名 strict 加载，并保留旧编码标识。
+    metadata = model.metadata("legacy")
+    assert metadata["input_encoding"] == "24 clipped exponent one-hot + exponent/23"
+    path = tmp_path / "legacy.pt"
+    torch.save({"model": model.state_dict(), "metadata": metadata}, path)
+    restored, _ = load_checkpoint(str(path), torch.device("cpu"))
+    if channels_last:
+        restored.to(memory_format=torch.channels_last)
+    with torch.no_grad():
+        reloaded = restored(boards)
+    assert all(torch.equal(before, after) for before, after in zip(actual, reloaded))
+
+
+def test_alternative_encoding_passes_all_callers(monkeypatch, tmp_path) -> None:
+    """登记一版不用 one-hot 的模型，验证调用端与加载器没有暗中固定特征形式。"""
+    from r2048.nn.metadata import definition_metadata
+    from r2048.nn.model import forward_boards
+    from r2048.nn.training import _forward
+    from r2048.runtime.inference import BatchedEvaluator
+    from r2048.runtime.probe import probe_position
+
+    class RawSumModel(torch.nn.Module):
+        VERSION_ID = "test-raw-sum"
+
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, boards):
+            assert boards.ndim == 2 and boards.shape[1] == 16
+            assert boards.dtype == torch.uint8
+            value = boards.float().sum(dim=1) / 255 * self.scale
+            return value, value[:, None].expand(-1, 4)
+
+        def metadata(self, model_id, parent=""):
+            return definition_metadata(self, self.VERSION_ID, model_id, parent)
+
+    monkeypatch.setitem(REGISTRY, RawSumModel.VERSION_ID, RawSumModel)
+    model = build(RawSumModel.VERSION_ID)
+    path = tmp_path / "raw.pt"
+    metadata = model.metadata("raw")
+    assert not hasattr(model, "INPUT_ENCODING"), "模型接口不要求额外的编码声明"
+    torch.save({"model": model.state_dict(), "metadata": metadata}, path)
+    model, _ = load_checkpoint(str(path), torch.device("cpu"))
+    boards = board_batch()
+    value, logits = _forward(model, boards, None)
+    value.sum().backward()
+    assert model.scale.grad is not None
+    predicted = forward_boards(model, boards.numpy(), torch.device("cpu"))
+    assert torch.equal(value, predicted[0]) and torch.equal(logits, predicted[1])
+    evaluator = BatchedEvaluator(model, torch.device("cpu"))
+    evaluated = evaluator.evaluate(np.zeros(len(boards), dtype=np.uint8), boards.numpy())
+    np.testing.assert_array_equal(evaluated[0], value.detach().numpy())
+    np.testing.assert_array_equal(evaluated[1], logits.detach().numpy())
+    result = probe_position(str(path), board=np.zeros(16, dtype=np.uint8), device="cpu")
+    assert result.afterstate_values == [0.0] * 4
+
+    metadata["input_encoding"] = "incorrect legacy encoding"
+    torch.save({"model": model.state_dict(), "metadata": metadata}, path)
+    with pytest.raises(ValueError, match="输入编码"):
+        load_checkpoint(str(path), torch.device("cpu"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA 验证 AMP 与编译路径")
+@pytest.mark.parametrize("compiled", [False, True])
+def test_internal_encoding_cuda_amp_and_compile(compiled) -> None:
+    """编码移入 forward 后仍能在实际 CUDA 编译、混合精度与通道布局下反向传播。"""
+    from r2048.nn.training import _forward
+
+    model = build("smnet-b9c64dt", {"channels": 8, "head_width": 8})
+    model = model.cuda().to(memory_format=torch.channels_last)
+    if compiled:
+        model = torch.compile(model)
+    boards = board_batch().cuda()
+    value, logits = _forward(model, boards, torch.bfloat16)
+    loss = value.float().square().mean() + logits.float().square().mean()
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)

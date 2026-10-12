@@ -147,7 +147,7 @@ def phase_summary(phases: dict, evaluator: BatchedEvaluator, elapsed: float, thr
         "gpu_busy_rate": round(evaluator.gpu_seconds / total, 3),
         "search_busy_rate": round(phases.get("search_busy", phases["advance"]) / (total * threads), 3),
         "threads": threads,
-        "encode_seconds": round(evaluator.seconds["encode"], 3),
+        "transfer_seconds": round(evaluator.seconds["transfer"], 3),
         "forward_launch_seconds": round(evaluator.seconds["forward"], 3),
         "collect_seconds": round(evaluator.seconds["collect"], 3),
     }

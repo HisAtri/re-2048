@@ -59,6 +59,8 @@ ADR 解释为什么整体是这个形状。
 | [0051](0051-machine-performance-profiles.md) | CLI、迭代与 WebUI 统一加载本机实测性能画像 | 已采纳 |
 | [0052](0052-assessment-profiles-and-random-seeds.md) | 固定测评配置、共享基线与自动随机种子 | 已采纳 |
 | [0053](0053-value-supervision-d4-augmentation.md) | 补齐候选与树内价值监督的 D4 增强 | 已采纳 |
+| [0054](0054-model-owned-input-encoding.md) | 模型定义内部编码与原始棋盘输入契约 | 已采纳 |
+| [0055](0055-neural-network-module-layers.md) | 网络定义、复用组件、元数据与注册管理分层 | 已采纳 |
 
 新增 ADR 时复制 [template.md](template.md)，编号递增，不要覆盖历史记录：
 即使后来的决定推翻了前面的，也只把前面的状态标成“已废弃（被 NNNN 取代）”。

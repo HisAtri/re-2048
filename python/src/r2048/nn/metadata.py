@@ -1,7 +1,7 @@
-"""定义契约的机械部分：超参怎么读、metadata 怎么写全。
+"""模型超参与产物元数据工具，不导入网络定义或注册表。
 
-单独成模块是为了让定义模块只依赖契约、不依赖注册表（否则 `models/__init__` 与各定义
-互相导入）。这里没有任何网络结构知识，只有三条约定：
+单独成模块是为了让定义只依赖元数据工具，不反向依赖注册与加载流程。这里没有网络结构，
+仅保留现有的超参记录方式：
 
 1. **超参写在 `__init__` 签名里**（都有默认值），所以 `default_params()` 能读出来；
 2. **每个超参存成同名实例属性**，所以 `instance_params()` 能读回来——漏存会在构造时
@@ -17,7 +17,8 @@ from typing import Any
 
 from torch import nn
 
-from r2048.nn.encode import INPUT_ENCODING
+# 历史产物字段保持原值；它不参与模型构造，也不是模型必须声明的接口。
+INPUT_ENCODING = "24 clipped exponent one-hot + exponent/23"
 
 # 与 cpp/core/version.h 的 kScoreScale 同源：写进 metadata 并在加载时校验。
 SCORE_SCALE = 1024.0

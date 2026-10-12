@@ -6,7 +6,7 @@
 `value_tower` / `policy_tower` 是两座塔。
 
 **位置编码、注意力这类"定义内部的实现"就加在这里**（放进编码器或塔内部），
-外部只认 `forward(encoded) -> (value, logits)`，所以传参不变（ADR 0024）。
+外部只认 `forward(boards) -> (value, logits)`，编码也由本定义负责（ADR 0054）。
 
 两座塔目前只有**深度**可以各自不同（`tower_blocks` 是一个数、宽度共享）。要非对称到
 宽度或层内结构时，就在这个模块里加参数——这正是"一版一模块"要保护的自由度；
@@ -18,9 +18,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from r2048.nn.encode import INPUT_CHANNELS
-from r2048.nn.models.blocks import ResidualBlock, check_groups
-from r2048.nn.models.contract import definition_metadata
+from r2048.nn.components.blocks import ResidualBlock, check_groups
+from r2048.nn.components.exponent_one_hot import INPUT_CHANNELS, encode_boards
+from r2048.nn.metadata import definition_metadata
 
 # 正式版别名：b9 表示总共 9 个残差块，c64 表示通道数，dt 表示双塔（ADR 0047）。
 # **它只是名字**：代码不解析它、也不据此推导结构（结构只在 architecture_params 里，ADR 0026）。
@@ -67,7 +67,11 @@ class DualTowerResNet(nn.Module):
             nn.Flatten(), nn.Linear(flat, head_width), nn.ReLU(), nn.Linear(head_width, 4)
         )
 
-    def forward(self, encoded: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        encoded = encode_boards(boards)
+        # 编码特征的内存布局属于卷积定义内部，外部不必知道特征的维度和通道数。
+        if self.stem[0].weight.is_contiguous(memory_format=torch.channels_last):
+            encoded = encoded.contiguous(memory_format=torch.channels_last)
         shared = self.shared(self.stem(encoded))
         value = self.value_head(self.value_tower(shared)).squeeze(-1)
         logits = self.policy_head(self.policy_tower(shared))

@@ -17,7 +17,9 @@ from r2048 import paths
 from r2048.fileio import write_json_atomic
 from r2048.identity import allocate_id
 from r2048.nn.lineage import file_sha256, lineage_fields, resolve_lineage
-from r2048.nn.model import canonical_id, default_params, load_checkpoint, resolve
+from r2048.nn.metadata import default_params
+from r2048.nn.model import load_checkpoint
+from r2048.nn.registry import canonical_id, resolve
 
 
 @dataclass(frozen=True)

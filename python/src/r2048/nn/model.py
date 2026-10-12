@@ -25,23 +25,13 @@ import torch
 from torch import nn
 
 from r2048.fileio import save_torch_atomic
-from r2048.nn.encode import INPUT_ENCODING, encode_boards
-from r2048.nn.models import (  # noqa: F401 - 转出注册表 API 与常量，保持既有 import 路径可用
-    SCORE_SCALE,
-    WEIGHTS_DTYPE,
-    UnknownModelDefinition,
-    build,
-    canonical_id,
-    default_params,
-    known_names,
-    resolve,
-    supported_ids,
-)
+from r2048.nn.metadata import INPUT_ENCODING, SCORE_SCALE, WEIGHTS_DTYPE, default_params
 
 # 结构名从定义模块转出：既有代码（training.py、CLI 帮助、测试）从这里 import，
 # 所以这里的名字对外是一个契约，不能因为"本文件用不到"就删掉。
 from r2048.nn.models.dual_tower import VERSION_ID as DUAL_TOWER_ARCHITECTURE  # noqa: F401
 from r2048.nn.models.shared_resnet import VERSION_ID as SHARED_ARCHITECTURE
+from r2048.nn.registry import build, canonical_id, resolve
 
 # 默认定义：没有 metadata（随机初始化、链路自检）时用它。
 ARCHITECTURE = SHARED_ARCHITECTURE
@@ -183,16 +173,16 @@ def load_checkpoint(path: str, device: torch.device) -> tuple[nn.Module, dict[st
     return model, metadata
 
 
-def encode_and_forward(
+def forward_boards(
     model: nn.Module, boards, device: torch.device, policy_mask: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """把 (N,16) 棋盘一次前向，返回 (value, logits)。
 
     policy_mask 非空时把非法方向的 logits 置为 -inf，避免它们进入 softmax。
     """
-    encoded = encode_boards(torch.as_tensor(boards, dtype=torch.long).to(device))
+    inputs = torch.as_tensor(boards, device=device)
     with torch.no_grad():
-        value, logits = model(encoded)
+        value, logits = model(inputs)
         if policy_mask is not None:
             logits = logits.masked_fill(~policy_mask.to(device), float("-inf"))
     return value, logits

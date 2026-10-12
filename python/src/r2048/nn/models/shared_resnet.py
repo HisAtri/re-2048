@@ -10,9 +10,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from r2048.nn.encode import INPUT_CHANNELS
-from r2048.nn.models.blocks import ResidualBlock, check_groups
-from r2048.nn.models.contract import definition_metadata
+from r2048.nn.components.blocks import ResidualBlock, check_groups
+from r2048.nn.components.exponent_one_hot import INPUT_CHANNELS, encode_boards
+from r2048.nn.metadata import definition_metadata
 
 # 正式版别名：形状代号（sh = 全共享主干，s6 = 6 个共享块，c64 = 64 通道）。
 # **它只是名字**：代码不解析它、也不据此推导结构（ADR 0026）。
@@ -28,7 +28,7 @@ class DualHeadResNet(nn.Module):
     def __init__(self, channels: int = 64, blocks: int = 6, head_width: int = 256, groups: int = 8) -> None:
         super().__init__()
         check_groups(channels, groups)
-        # 每个超参都存成同名属性：metadata 与重建靠它自动完成（见 models/__init__ 的契约）。
+        # 每个超参存成同名属性，元数据工具才能记录实际配置而不是静默写入默认值。
         self.channels = channels
         self.blocks = blocks
         self.head_width = head_width
@@ -48,12 +48,16 @@ class DualHeadResNet(nn.Module):
             nn.Flatten(), nn.Linear(flat, head_width), nn.ReLU(), nn.Linear(head_width, 4)
         )
 
-    def forward(self, encoded: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """返回 (归一化价值, 四方向 logits)。
 
         两个头在同一批数据上一起算：搜索里同一个批次的请求既有价值请求也有策略请求，
         分开算等于把前向次数翻倍。
         """
+        encoded = encode_boards(boards)
+        # 原始棋盘没有通道布局；跟随卷积权重的布局，保持训练器选择的 channels_last 优化。
+        if self.stem[0].weight.is_contiguous(memory_format=torch.channels_last):
+            encoded = encoded.contiguous(memory_format=torch.channels_last)
         features = self.trunk(self.stem(encoded))
         value = self.value_head(features).squeeze(-1)
         logits = self.policy_head(features)

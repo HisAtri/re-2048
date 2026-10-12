@@ -30,7 +30,8 @@ from r2048.webui.app import AppState, render_analysis, render_board, render_stat
 
 @pytest.fixture(scope="module")
 def checkpoint(tmp_path_factory: pytest.TempPathFactory) -> str:
-    from r2048.nn.model import build, save_checkpoint
+    from r2048.nn.model import save_checkpoint
+    from r2048.nn.registry import build
 
     path = tmp_path_factory.mktemp("webui") / "tiny.pt"
     model = build("sh-s6c64", {"channels": 8, "blocks": 1, "head_width": 16, "groups": 2})
@@ -182,7 +183,8 @@ def test_analysis_without_result_is_not_an_error() -> None:
 
 def _fake_root(tmp_path: Path) -> Path:
     """造一个"输出根"：一个模型、一批数据、两份棋谱（其中一份是坏的）。"""
-    from r2048.nn.model import build, save_checkpoint
+    from r2048.nn.model import save_checkpoint
+    from r2048.nn.registry import build
 
     root = tmp_path / "output"
     (root / "data" / "batch-A").mkdir(parents=True)
@@ -256,7 +258,8 @@ def test_inventory_labels_carry_the_run_and_hide_resume_points(tmp_path: Path) -
 
 def test_default_model_prefers_a_complete_one(tmp_path: Path) -> None:
     """默认值往往就是用户直接点的那一个，所以它得是**完整模型**而不是恰好排在前面的半模型。"""
-    from r2048.nn.model import build, save_checkpoint
+    from r2048.nn.model import save_checkpoint
+    from r2048.nn.registry import build
 
     root = _fake_root(tmp_path)
     half = root / "runs" / "aaa-first" / "value"

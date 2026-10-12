@@ -818,7 +818,7 @@ def test_epoch_augments_all_value_inputs(monkeypatch, mode, value_target, nodes,
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1) if training else None
     inputs = []
 
-    def forward(model, rows, amp_dtype, channels_last):
+    def forward(model, rows, amp_dtype):
         inputs.append(rows.clone())
         # 保留真实损失与反向路径，只替换网络以直接观察未经编码的前向棋盘。
         values = model(rows.float().mean(dim=1, keepdim=True)).squeeze(1)

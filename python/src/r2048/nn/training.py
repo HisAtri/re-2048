@@ -45,8 +45,7 @@ from r2048.data.shards import CANDIDATE_TARGET_DEFINITION
 from r2048.fileio import read_json, save_torch_atomic, write_json_atomic
 from r2048.identity import allocate_id, file_lock
 from r2048.jobs import finish_console, progress_payload
-from r2048.nn.augment import augment_joint, augment_policy, augment_value
-from r2048.nn.encode import BOARD_CELLS, encode_boards
+from r2048.nn.augment import BOARD_CELLS, augment_joint, augment_policy, augment_value
 from r2048.nn.lineage import lineage_fields, make_lineage, resolve_lineage, sources_from_training
 from r2048.nn.model import (
     DUAL_TOWER_ARCHITECTURE,
@@ -627,17 +626,11 @@ def _forward(
     model: torch.nn.Module,
     boards: torch.Tensor,
     amp_dtype: torch.dtype | None,
-    channels_last: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    encoded = encode_boards(boards.to(dtype=torch.long))
-    if channels_last:
-        # 卷积网络在通道最后的内存布局下通常更快；这里只对编码后的 4D 特征做转换，
-        # 棋盘本身是 (N,16) 的二维索引张量，没有“通道最后”的概念。
-        encoded = encoded.contiguous(memory_format=torch.channels_last)
     if amp_dtype is not None:
-        with torch.autocast(device_type=encoded.device.type, dtype=amp_dtype):
-            return model(encoded)
-    return model(encoded)
+        with torch.autocast(device_type=boards.device.type, dtype=amp_dtype):
+            return model(boards)
+    return model(boards)
 
 
 def _value_loss(
@@ -895,7 +888,7 @@ def _run_epoch(
             if config.mode in JOINT_MODES:
                 # 一次前向覆盖两种行：决策局面喂策略头、候选 afterstate 喂价值头。
                 rows = torch.cat([batch.decision, value_rows], dim=0)
-                values, logits = _forward(model, rows, amp_dtype, config.channels_last)
+                values, logits = _forward(model, rows, amp_dtype)
                 values = values.float()
                 logits = logits.float()
                 if want_value:
@@ -923,7 +916,7 @@ def _run_epoch(
                         metrics.add_policy(stats)
             else:
                 boards = value_rows if want_value else batch.decision
-                values, logits = _forward(model, boards, amp_dtype, config.channels_last)
+                values, logits = _forward(model, boards, amp_dtype)
                 values = values.float()
                 logits = logits.float()
                 if want_value:

@@ -5,6 +5,10 @@
 
 > safetensors 发布与加载待办已由 [ADR 0047](0047-local-model-publication.md) 落实。
 
+> 决策 6 的已编码输入边界已由 [ADR 0054](0054-model-owned-input-encoding.md) 替代，模型改为接收原始指数棋盘并自行编码。
+
+> 目录与导入职责由 [ADR 0055](0055-neural-network-module-layers.md) 订正：注册表独立于定义包，组件与元数据工具不再混入 models/。
+
 ## 背景
 
 架构迭代的路线已经定下来了：通道数与深度要改、价值塔与策略塔要往非对称走、

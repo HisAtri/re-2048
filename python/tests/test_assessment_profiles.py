@@ -76,7 +76,8 @@ def test_concurrent_tasks_share_completed_baselines(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(not os.environ.get("R2048_CLI"), reason="需要 WSL C++ CLI")
 def test_assessment_worker_uses_profile_and_reuses_baselines(tmp_path, monkeypatch):
-    from r2048.nn.model import build, save_checkpoint
+    from r2048.nn.model import save_checkpoint
+    from r2048.nn.registry import build
     from r2048.webui.worker import run_request, validate_request
 
     monkeypatch.setenv("R2048_OUTPUT_DIR", str(tmp_path))

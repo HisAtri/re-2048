@@ -77,7 +77,8 @@ def workload(stage, settings, checkpoint="", recipe=None):
         model = {**model, "architecture": default_architecture(settings.get("mode", "value"))}
     shape = {key: model.get(key) for key in ("architecture", "architecture_params")}
     if shape["architecture"]:
-        from r2048.nn.models import REGISTRY, canonical_id, default_params
+        from r2048.nn.metadata import default_params
+        from r2048.nn.registry import REGISTRY, canonical_id
 
         shape["architecture"] = canonical_id(shape["architecture"])
         shape["architecture_params"] = {
